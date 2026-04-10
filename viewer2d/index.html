@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>muDM 2D Viewer</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <link rel="stylesheet" href="css/style.css" />
+</head>
+<body>
+    <div id="map"></div>
+
+    <!-- Dataset selector -->
+    <div id="dataset-selector">
+        <select id="dataset-select"></select>
+    </div>
+
+    <!-- Layer panel -->
+    <div id="layer-panel">
+        <div class="panel-title">Layers</div>
+        <div id="layer-toggles"></div>
+        <div class="panel-divider"></div>
+        <div class="panel-title">Gene Filter</div>
+        <select id="gene-filter">
+            <option value="">All genes</option>
+        </select>
+        <div id="color-legend"></div>
+    </div>
+
+    <!-- Info panel -->
+    <div id="info-panel">
+        <div class="panel-title">Feature Info</div>
+        <div id="info-content">
+            <span class="info-placeholder">Hover over a feature</span>
+        </div>
+    </div>
+
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script src="js/Leaflet.VectorGrid.bundled.js"></script>
+    <script type="module" src="js/main.js?v=18"></script>
+</body>
+</html>

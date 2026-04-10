@@ -1,0 +1,33 @@
+{
+    "type": "FeatureCollection",
+    "features": [
+      {
+        "type": "Feature",
+        "geometry": {
+          "type": "Polygon",
+          "subtype": "Rectangle",
+          "coordinates": [[[0.0, 0.0], [0.0, 50.0], [50.0, 50.0], [50.0, 0.0], [0.0, 0.0]]]
+        },
+        "properties": {
+            "well": "A1",
+            "imagename": "image1",
+            "cellCount": 5,
+            "ratioInfectivity": [0.1, 0.2, 0.3, 0.4, 0.5]
+        }
+      },
+      {
+        "type": "Feature",
+        "geometry": {
+          "type": "Polygon",
+          "subtype": "Rectangle",
+          "coordinates": [[[50.0, 0.0], [50.0, 50.0], [100.0, 50.0], [100.0, 0.0], [50.0, 0.0]]]
+        },
+        "properties": {
+            "well": "A2",
+            "imagename": "image2",
+            "cellCount": 10,
+            "ratioInfectivity": [0.6, 0.7, 0.8, 0.9, 1.0, 0.6, 0.7, 0.8, 0.9, 1.0]
+        }
+      }
+    ]
+  }

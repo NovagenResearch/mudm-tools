@@ -1,0 +1,518 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>muDM 3D Tiles Viewer</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { overflow: hidden; background: #1a1a2e; font-family: system-ui, sans-serif; }
+
+  #canvas { display: block; position: absolute; top: 0; left: 0; }
+
+  /* Sidebar */
+  #sidebar {
+    position: fixed; top: 0; left: 0;
+    width: 300px; height: 100vh;
+    background: #16162a; color: #ddd;
+    display: flex; flex-direction: column;
+    border-right: 1px solid rgba(255,255,255,0.08);
+    z-index: 20;
+  }
+  #sidebar h2 {
+    padding: 14px 16px 10px; flex-shrink: 0;
+    font-size: 14px; color: #6fdfaf;
+    border-bottom: 1px solid rgba(255,255,255,0.08);
+  }
+  #pyramid-selector {
+    flex-shrink: 0;
+    padding: 10px 12px;
+    border-bottom: 1px solid rgba(255,255,255,0.08);
+  }
+  #pyramid-selector select:focus { border-color: #6fdfaf; outline: none; }
+
+  #feature-selector {
+    display: flex; flex-direction: column;
+    flex: 1; min-height: 0;  /* critical: allows flex child to scroll */
+  }
+
+  .feature-search {
+    width: calc(100% - 24px); margin: 10px 12px 6px; flex-shrink: 0;
+    padding: 7px 10px; border-radius: 5px;
+    border: 1px solid rgba(255,255,255,0.15);
+    background: rgba(255,255,255,0.06); color: #eee;
+    font-size: 13px; outline: none;
+  }
+  .feature-search::placeholder { color: #777; }
+  .feature-search:focus { border-color: #6fdfaf; }
+
+  .feature-toolbar {
+    display: flex; align-items: center; gap: 6px; flex-shrink: 0;
+    padding: 4px 12px 8px; font-size: 12px; color: #999;
+  }
+  .feature-toolbar button {
+    padding: 3px 10px; border-radius: 4px;
+    border: 1px solid rgba(255,255,255,0.15);
+    background: rgba(255,255,255,0.06); color: #ccc;
+    font-size: 11px; cursor: pointer;
+  }
+  .feature-toolbar button:hover { background: rgba(255,255,255,0.12); }
+  .feature-count { flex: 1; }
+
+  .feature-list {
+    flex: 1; overflow-y: auto;
+    padding: 0 4px;
+  }
+  .feature-list::-webkit-scrollbar { width: 6px; }
+  .feature-list::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.15); border-radius: 3px; }
+
+  .feature-item {
+    display: flex; align-items: center; gap: 6px;
+    padding: 4px 8px; cursor: pointer;
+    font-size: 12px; border-radius: 4px;
+  }
+  .feature-item:hover { background: rgba(255,255,255,0.06); }
+  .feature-item input[type="checkbox"] { flex-shrink: 0; accent-color: #6fdfaf; }
+
+  .feature-swatch {
+    display: inline-block; width: 10px; height: 10px;
+    border-radius: 2px; flex-shrink: 0;
+    border: 1px solid rgba(255,255,255,0.2);
+  }
+  .feature-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+  .feature-filter-row {
+    padding: 4px 12px 6px; flex-shrink: 0;
+  }
+  .feature-filter-select {
+    width: 100%; padding: 4px 8px; border-radius: 4px;
+    border: 1px solid rgba(255,255,255,0.15);
+    background: rgba(255,255,255,0.06); color: #eee;
+    font-size: 12px; cursor: pointer; outline: none;
+  }
+  .feature-filter-select:focus { border-color: #6fdfaf; }
+  .feature-filter-values {
+    margin-top: 4px;
+  }
+  .filter-value-item {
+    display: flex; align-items: center; gap: 3px;
+    font-size: 11px; color: #ccc; cursor: pointer;
+    white-space: nowrap;
+  }
+  .filter-value-item input[type="checkbox"] { accent-color: #6fdfaf; }
+  .filter-value-search {
+    width: 100%; padding: 3px 6px; border-radius: 3px; margin-bottom: 4px;
+    border: 1px solid rgba(255,255,255,0.15);
+    background: rgba(255,255,255,0.06); color: #eee;
+    font-size: 11px; outline: none;
+  }
+  .filter-value-search:focus { border-color: #6fdfaf; }
+  .filter-value-search::placeholder { color: #666; }
+  .filter-btn-row {
+    display: flex; gap: 6px; margin-bottom: 4px;
+  }
+  .filter-toggle-btn {
+    padding: 2px 10px; border-radius: 3px;
+    border: 1px solid rgba(255,255,255,0.15);
+    background: rgba(255,255,255,0.06); color: #ccc;
+    font-size: 10px; cursor: pointer;
+  }
+  .filter-toggle-btn:hover { background: rgba(255,255,255,0.12); }
+  .filter-value-list {
+    display: flex; flex-wrap: wrap; gap: 2px 8px;
+    max-height: 80px; overflow-y: auto;
+  }
+  .filter-value-list::-webkit-scrollbar { width: 4px; }
+  .filter-value-list::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.15); border-radius: 2px; }
+
+  .filter-numeric-row {
+    display: flex; align-items: center; gap: 4px; margin-top: 4px;
+  }
+  .filter-numeric-label {
+    color: #999; font-size: 13px; flex-shrink: 0;
+  }
+  .filter-numeric-input {
+    width: 80px; padding: 3px 6px; border-radius: 3px;
+    border: 1px solid rgba(255,255,255,0.15);
+    background: rgba(255,255,255,0.06); color: #eee;
+    font-size: 11px; outline: none;
+  }
+  .filter-numeric-input:focus { border-color: #6fdfaf; }
+  .filter-numeric-input::placeholder { color: #666; }
+  .filter-range-hint {
+    color: #666; font-size: 10px; margin-top: 2px;
+  }
+
+  /* Color By Controls */
+  #color-by-controls {
+    flex-shrink: 0;
+    padding: 10px 12px;
+    border-top: 1px solid rgba(255,255,255,0.08);
+    font-size: 12px;
+  }
+  #color-by-controls h3 {
+    font-size: 11px; color: #999; text-transform: uppercase;
+    letter-spacing: 0.5px; margin-bottom: 8px;
+  }
+  #color-by-select {
+    width: 100%; padding: 5px 8px; border-radius: 4px;
+    border: 1px solid rgba(255,255,255,0.15);
+    background: rgba(255,255,255,0.06); color: #eee;
+    font-size: 12px; cursor: pointer; outline: none;
+  }
+  #color-by-select:focus { border-color: #6fdfaf; }
+  #sidebar select option { background: #1e1e3a; color: #eee; }
+
+  /* Color Legend */
+  #color-legend {
+    position: fixed; top: 12px; left: 312px;
+    background: rgba(0,0,0,0.75); color: #ddd;
+    padding: 10px 14px; border-radius: 6px;
+    font-size: 11px; line-height: 1.6;
+    z-index: 10; display: none;
+    max-height: 50vh; overflow-y: auto;
+    min-width: 140px; max-width: 260px;
+    border: 1px solid rgba(255,255,255,0.1);
+  }
+  #color-legend::-webkit-scrollbar { width: 4px; }
+  #color-legend::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.2); border-radius: 2px; }
+  #color-legend h4 {
+    font-size: 11px; color: #999; text-transform: uppercase;
+    letter-spacing: 0.5px; margin-bottom: 6px;
+  }
+  .legend-item {
+    display: flex; align-items: center; gap: 6px;
+    padding: 1px 0; white-space: nowrap;
+    overflow: hidden; text-overflow: ellipsis;
+  }
+  .legend-swatch {
+    display: inline-block; width: 10px; height: 10px;
+    border-radius: 2px; flex-shrink: 0;
+    border: 1px solid rgba(255,255,255,0.2);
+  }
+  .legend-label { overflow: hidden; text-overflow: ellipsis; }
+
+  /* Background Controls */
+  #bg-controls {
+    flex-shrink: 0;
+    padding: 6px 12px;
+    border-top: 1px solid rgba(255,255,255,0.08);
+    font-size: 12px;
+  }
+  #bg-controls h3 {
+    font-size: 11px; color: #999; text-transform: uppercase;
+    letter-spacing: 0.5px; margin-bottom: 6px;
+  }
+  .bg-options {
+    display: flex; gap: 12px;
+  }
+  .bg-options label {
+    display: flex; align-items: center; gap: 4px; cursor: pointer; color: #ccc;
+  }
+  .bg-options input[type="radio"] { accent-color: #6fdfaf; }
+
+  /* Screenshot Controls */
+  #screenshot-controls {
+    flex-shrink: 0;
+    padding: 6px 12px;
+    border-top: 1px solid rgba(255,255,255,0.08);
+  }
+  #screenshot-btn {
+    width: 100%; padding: 6px 10px; border-radius: 4px;
+    border: 1px solid rgba(255,255,255,0.15);
+    background: rgba(255,255,255,0.06); color: #ccc;
+    font-size: 12px; cursor: pointer;
+    transition: background 0.15s;
+  }
+  #screenshot-btn:hover { background: rgba(111, 223, 175, 0.15); color: #6fdfaf; }
+
+  /* Slice Controls */
+  #slice-controls {
+    flex-shrink: 0;
+    padding: 10px 12px;
+    border-top: 1px solid rgba(255,255,255,0.08);
+    font-size: 12px;
+  }
+  #slice-controls h3 {
+    font-size: 11px; color: #999; text-transform: uppercase;
+    letter-spacing: 0.5px; margin-bottom: 8px;
+  }
+
+  /* LOD Controls */
+  #lod-controls {
+    flex-shrink: 0;
+    padding: 10px 12px;
+    border-top: 1px solid rgba(255,255,255,0.08);
+    font-size: 12px;
+  }
+  #lod-controls h3 {
+    font-size: 11px; color: #999; text-transform: uppercase;
+    letter-spacing: 0.5px; margin-bottom: 8px;
+  }
+  .lod-mode-row {
+    display: flex; gap: 14px; margin-bottom: 8px;
+  }
+  .lod-mode-row label {
+    display: flex; align-items: center; gap: 4px; cursor: pointer; color: #ccc;
+  }
+  .lod-mode-row input[type="radio"] { accent-color: #6fdfaf; }
+  #zoom-slider-row {
+    display: flex; align-items: center; gap: 8px;
+  }
+  #zoom-slider-row .label { color: #999; }
+  #zoom-slider {
+    flex: 1; height: 4px; accent-color: #6fdfaf; cursor: pointer;
+  }
+  #zoom-slider:disabled {
+    opacity: 0.3; cursor: not-allowed;
+  }
+  #zoom-label { color: #6fdfaf; font-weight: 600; min-width: 16px; }
+  #zoom-distribution {
+    margin-top: 6px; color: #777; font-size: 11px;
+  }
+
+  /* Stats */
+  #stats {
+    position: fixed; bottom: 12px; left: 312px;
+    background: rgba(0,0,0,0.75); color: #ccc;
+    padding: 8px 12px; border-radius: 6px;
+    font-size: 12px; line-height: 1.6;
+    z-index: 10;
+    font-variant-numeric: tabular-nums;
+  }
+  #stats .val { color: #6fdfaf; font-weight: 600; }
+  #gpu-budget-row {
+    display: flex; align-items: center; gap: 6px; margin-top: 4px;
+  }
+  #gpu-budget-slider {
+    width: 120px; height: 4px; accent-color: #6fdfaf;
+    cursor: pointer;
+  }
+
+  /* Info panel */
+  #info-panel {
+    position: fixed; top: 12px; right: 12px;
+    background: rgba(0,0,0,0.85); color: #eee;
+    padding: 14px 18px; border-radius: 8px;
+    min-width: 240px; max-width: 340px;
+    font-size: 13px; line-height: 1.5;
+    display: none; z-index: 10;
+    border: 1px solid rgba(255,255,255,0.1);
+  }
+  #info-panel h3 {
+    margin-bottom: 8px; font-size: 15px; color: #fff;
+    border-bottom: 1px solid rgba(255,255,255,0.15);
+    padding-bottom: 6px;
+  }
+  #info-panel table { width: 100%; }
+  #info-panel td { padding: 2px 0; vertical-align: top; }
+  #info-panel td:first-child { color: #999; padding-right: 12px; white-space: nowrap; }
+  #info-panel .color-swatch {
+    display: inline-block; width: 14px; height: 14px;
+    border-radius: 3px; vertical-align: middle;
+    margin-right: 6px; border: 1px solid rgba(255,255,255,0.3);
+  }
+
+  /* Scale bar */
+  #scale-bar {
+    position: fixed; bottom: 100px; left: 312px;
+    z-index: 10; pointer-events: none;
+  }
+  .scale-bar-line {
+    height: 3px; background: rgba(255,255,255,0.85);
+    border-left: 2px solid rgba(255,255,255,0.85);
+    border-right: 2px solid rgba(255,255,255,0.85);
+    min-width: 20px;
+  }
+  .scale-bar-label {
+    color: rgba(255,255,255,0.85); font-size: 11px;
+    margin-top: 3px; text-align: center;
+    text-shadow: 0 1px 3px rgba(0,0,0,0.8);
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* Loading */
+  #loading {
+    position: fixed; top: 50%; left: calc(150px + 50%);
+    transform: translate(-50%, -50%);
+    color: #6fdfaf; font-size: 16px; z-index: 20;
+  }
+
+  /* Overview Controls */
+  #overview-controls {
+    flex-shrink: 0;
+    padding: 10px 12px;
+    border-top: 1px solid rgba(255,255,255,0.08);
+    font-size: 12px;
+  }
+  #overview-controls h3 {
+    font-size: 11px; color: #999; text-transform: uppercase;
+    letter-spacing: 0.5px; margin-bottom: 8px;
+  }
+
+  /* Overview Container (right side) */
+  #overview-container {
+    position: fixed; top: 0; right: 0;
+    width: 350px; height: 100vh;
+    background: #12121f;
+    border-left: 1px solid rgba(255,255,255,0.08);
+    display: flex; flex-direction: column;
+    z-index: 15;
+  }
+  .overview-panel-wrapper {
+    flex: 1; position: relative; min-height: 0;
+    border-bottom: 1px solid rgba(255,255,255,0.08);
+  }
+  .overview-panel-wrapper canvas {
+    display: block; width: 100%; height: 100%;
+  }
+  .overview-panel-label {
+    position: absolute; top: 6px; left: 8px;
+    color: rgba(111, 223, 175, 0.7); font-size: 11px;
+    font-weight: 600; z-index: 1; pointer-events: none;
+    text-transform: uppercase; letter-spacing: 0.5px;
+  }
+  .overview-axis-indicator {
+    position: absolute; bottom: 8px; right: 8px;
+    z-index: 1; pointer-events: none;
+  }
+  .overview-axis-indicator canvas {
+    display: block;
+  }
+  .overview-scale-bar {
+    position: absolute; bottom: 8px; left: 8px;
+    z-index: 1; pointer-events: none;
+  }
+  .overview-scale-bar .scale-bar-line {
+    height: 2px; background: rgba(255,255,255,0.7);
+    border-left: 1px solid rgba(255,255,255,0.7);
+    border-right: 1px solid rgba(255,255,255,0.7);
+    min-width: 10px;
+  }
+  .overview-scale-bar .scale-bar-label {
+    color: rgba(255,255,255,0.7); font-size: 10px;
+    margin-top: 2px; text-align: center;
+    text-shadow: 0 1px 2px rgba(0,0,0,0.9);
+  }
+</style>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.171.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.171.0/examples/jsm/"
+  }
+}
+</script>
+</head>
+<body>
+
+<div id="sidebar">
+  <h2>muDM 3D Viewer</h2>
+  <div id="pyramid-selector" style="padding:10px 12px;flex-shrink:0;border-bottom:1px solid rgba(255,255,255,0.08);"></div>
+  <div id="feature-selector"></div>
+  <div id="color-by-controls">
+    <h3>Color By</h3>
+    <select id="color-by-select"><option value="">Original</option></select>
+    <div id="color-by-range" style="display:none;margin-top:6px;"></div>
+  </div>
+  <div id="screenshot-controls">
+    <button id="screenshot-btn" title="Save screenshot (S)">Screenshot (S)</button>
+  </div>
+  <div id="bg-controls">
+    <h3>Background</h3>
+    <div class="bg-options">
+      <label><input type="radio" name="bg-color" value="dark" checked> Dark</label>
+      <label><input type="radio" name="bg-color" value="light"> Light</label>
+      <label><input type="radio" name="bg-color" value="white"> White</label>
+    </div>
+  </div>
+  <div id="slice-controls"></div>
+  <div id="lod-controls">
+    <h3>Level of Detail</h3>
+    <div class="lod-mode-row">
+      <label><input type="radio" name="lod-mode" value="dynamic" checked> Dynamic</label>
+      <label><input type="radio" name="lod-mode" value="forced"> Force Zoom</label>
+    </div>
+    <div id="zoom-slider-row">
+      <span class="label">Zoom:</span>
+      <input type="range" id="zoom-slider" min="0" max="3" step="1" value="3" disabled>
+      <span id="zoom-label">3</span>
+    </div>
+    <div id="zoom-distribution"></div>
+  </div>
+  <div id="overview-controls">
+    <h3>Overview</h3>
+    <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;">
+      <input type="checkbox" id="overview-toggle" style="accent-color:#6fdfaf;">
+      <label for="overview-toggle" style="cursor:pointer;color:#ccc;">Enable overview</label>
+    </div>
+    <div id="overview-options" style="display:none;">
+      <div style="display:flex;gap:10px;margin-bottom:8px;flex-wrap:wrap;">
+        <label style="display:flex;align-items:center;gap:4px;cursor:pointer;color:#ccc;">
+          <input type="radio" name="overview-axes" value="xy-xz" checked style="accent-color:#6fdfaf;"> XY+XZ
+        </label>
+        <label style="display:flex;align-items:center;gap:4px;cursor:pointer;color:#ccc;">
+          <input type="radio" name="overview-axes" value="xy-yz" style="accent-color:#6fdfaf;"> XY+YZ
+        </label>
+        <label style="display:flex;align-items:center;gap:4px;cursor:pointer;color:#ccc;">
+          <input type="radio" name="overview-axes" value="xz-yz" style="accent-color:#6fdfaf;"> XZ+YZ
+        </label>
+      </div>
+      <div style="display:flex;align-items:center;gap:8px;">
+        <span style="color:#999;font-size:12px;">Neighbors:</span>
+        <input type="range" id="overview-ring-slider" min="0" max="2" step="1" value="0"
+          style="flex:1;height:4px;accent-color:#6fdfaf;cursor:pointer;">
+        <span id="overview-ring-label" style="color:#6fdfaf;font-weight:600;min-width:16px;">0</span>
+      </div>
+    </div>
+  </div>
+</div>
+
+<canvas id="canvas"></canvas>
+
+<div id="overview-container" style="display:none;">
+  <div class="overview-panel-wrapper">
+    <span class="overview-panel-label" id="overview-label-0">XY</span>
+    <div class="overview-scale-bar" id="overview-scale-0">
+      <div class="scale-bar-line"></div>
+      <div class="scale-bar-label"></div>
+    </div>
+    <div class="overview-axis-indicator" id="overview-axis-0"><canvas width="60" height="60"></canvas></div>
+    <canvas id="overview-canvas-0"></canvas>
+  </div>
+  <div class="overview-panel-wrapper">
+    <span class="overview-panel-label" id="overview-label-1">XZ</span>
+    <div class="overview-scale-bar" id="overview-scale-1">
+      <div class="scale-bar-line"></div>
+      <div class="scale-bar-label"></div>
+    </div>
+    <div class="overview-axis-indicator" id="overview-axis-1"><canvas width="60" height="60"></canvas></div>
+    <canvas id="overview-canvas-1"></canvas>
+  </div>
+</div>
+
+<div id="loading">Loading feature index...</div>
+
+<div id="stats">
+  Tiles: <span class="val" id="stat-loaded">0</span> loaded,
+  meshes: <span class="val" id="stat-visible">0</span> visible |
+  FPS: <span class="val" id="stat-fps">0</span><br>
+  GPU: ~<span class="val" id="stat-memory">0</span> MB
+  <div id="gpu-budget-row">
+    Budget: <input type="range" id="gpu-budget-slider"
+      min="256" max="16384" step="256" value="4096">
+    <span class="val" id="gpu-budget-label">4096</span> MB
+  </div>
+</div>
+
+<div id="color-legend"></div>
+
+<div id="info-panel">
+  <h3 id="info-title">Region</h3>
+  <table id="info-table"><tbody></tbody></table>
+</div>
+
+<script type="module" src="js/main.js"></script>
+</body>
+</html>

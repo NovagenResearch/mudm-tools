@@ -1,0 +1,78 @@
+syntax = "proto3";
+
+package mudm.tile3d;
+
+option optimize_for = LITE_RUNTIME;
+
+message Tile {
+
+  enum GeomType {
+    UNKNOWN = 0;
+    POINT3D = 1;
+    LINESTRING3D = 2;
+    POLYGON3D = 3;
+    POLYHEDRALSURFACE = 4;
+    TIN = 5;
+  }
+
+  message Value {
+    oneof kind {
+      string string_value = 1;
+      float float_value = 2;
+      double double_value = 3;
+      int64 int_value = 4;
+      uint64 uint_value = 5;
+      sint64 sint_value = 6;
+      bool bool_value = 7;
+    }
+  }
+
+  message Feature {
+    uint64 id = 1;
+
+    // Key/value tag pairs (indices into Layer.keys / Layer.values)
+    repeated uint32 tags = 2 [packed = true];
+
+    // Geometry type
+    GeomType type = 3;
+
+    // XY geometry commands (delta-encoded, zigzag)
+    repeated uint32 geometry = 4 [packed = true];
+
+    // Z coordinates (delta-encoded, zigzag) — parallel to geometry vertices
+    repeated sint32 geometry_z = 5 [packed = true];
+
+    // Per-vertex radii (for tube/sphere representations)
+    repeated float radii = 6 [packed = true];
+
+    // Indexed mesh encoding (TIN/PolyhedralSurface only)
+    // Raw float32 LE bytes: [x,y,z, x,y,z, ...] in tile-local float space
+    bytes mesh_positions = 7;
+    // Raw uint32 LE bytes: [i0,i1,i2, i0,i1,i2, ...]
+    bytes mesh_indices = 8;
+  }
+
+  message Layer {
+    // Version of this layer specification (3 = 3D extension)
+    uint32 version = 15;
+
+    string name = 1;
+
+    // Features in this layer
+    repeated Feature features = 2;
+
+    // Dictionary-encoded keys
+    repeated string keys = 3;
+
+    // Dictionary-encoded values
+    repeated Value values = 4;
+
+    // XY tile extent (default 4096, set in code)
+    uint32 extent = 5;
+
+    // Z tile extent (default 4096, set in code)
+    uint32 extent_z = 6;
+  }
+
+  repeated Layer layers = 3;
+}

@@ -1,0 +1,24 @@
+[package]
+name = "microjson-tiling3d"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "_rs"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.23", features = ["extension-module"] }
+rayon = "1.10"
+ahash = "0.8"
+byteorder = "1.5"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+memmap2 = "0.9"
+numpy = "0.23"
+draco-oxide = "0.1.0-alpha.4"
+meshopt = "0.6"
+zstd = "0.13"
+dashmap = "6"
+parquet = { version = "54", features = ["default"] }
+arrow = { version = "54", features = ["default"] }
