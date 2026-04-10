@@ -76,7 +76,7 @@ jobs:
         shell: bash
         run: |
           uv venv --python=${{ matrix.python }}
-          uv pip install dist/*.whl
+          uv pip install $(find dist -name '*.whl')
 
       - name: Run smoke test with Rust
         shell: bash
