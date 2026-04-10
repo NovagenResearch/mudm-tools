@@ -83,7 +83,12 @@ jobs:
 
       - name: Run smoke test with Rust
         shell: bash
-        run: .venv/bin/python scripts/smoke_test.py --require-rust
+        run: |
+          if [ -f .venv/bin/python ]; then
+            .venv/bin/python scripts/smoke_test.py --require-rust
+          else
+            .venv/Scripts/python.exe scripts/smoke_test.py --require-rust
+          fi
 
   publish:
     name: Publish to PyPI
