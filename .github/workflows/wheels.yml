@@ -79,7 +79,7 @@ jobs:
       - name: Create venv and install wheel
         run: |
           uv venv --python=${{ matrix.python }}
-          uv pip install mudm-tools --no-index --find-links dist/
+          uv pip install mudm-tools --find-links dist/
 
       - name: Run smoke test with Rust
         shell: bash
