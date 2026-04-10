@@ -72,14 +72,14 @@ jobs:
           name: wheels-${{ matrix.os }}-py${{ matrix.python }}
           path: dist
 
-      - name: Create venv and install wheel
+      - name: List downloaded wheels
+        run: ls dist/
         shell: bash
+
+      - name: Create venv and install wheel
         run: |
           uv venv --python=${{ matrix.python }}
-          ls dist/
-          for whl in dist/*.whl; do
-            uv pip install "$whl"
-          done
+          uv pip install mudm-tools --no-index --find-links dist/
 
       - name: Run smoke test with Rust
         shell: bash
