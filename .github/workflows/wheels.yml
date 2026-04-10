@@ -72,13 +72,14 @@ jobs:
           name: wheels-${{ matrix.os }}-py${{ matrix.python }}
           path: dist
 
-      - name: Create venv and install
+      - name: Create venv and install wheel
         run: |
           uv venv --python=${{ matrix.python }}
           uv pip install dist/*.whl
 
       - name: Run smoke test with Rust
-        run: uv run python scripts/smoke_test.py --require-rust
+        run: .venv/bin/python scripts/smoke_test.py --require-rust
+        shell: bash
 
   publish:
     name: Publish to PyPI
