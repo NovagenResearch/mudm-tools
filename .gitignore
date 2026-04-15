@@ -6,3 +6,6 @@ __pycache__/
 *.so
 .venv/
 rust/target/
+
+# Private Claude Code context (managed as separate subrepo)
+.claude/
