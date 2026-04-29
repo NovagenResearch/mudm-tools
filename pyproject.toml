@@ -60,3 +60,9 @@ where = ["src"]
 [tool.pytest.ini_options]
 testpaths = ["tests/"]
 pythonpath = ["src/", "scripts/"]
+
+[dependency-groups]
+dev = [
+    "maturin>=1.13.1",
+    "pytest>=9.0.3",
+]

@@ -132,13 +132,13 @@ def _parse_swc(swc_path: str) -> NeuronMorphology:
                 continue
             samples.append(
                 SWCSample(
-                    id=int(parts[0]),
-                    type=int(parts[1]),
+                    id=int(float(parts[0])),
+                    type=int(float(parts[1])),
                     x=float(parts[2]),
                     y=float(parts[3]),
                     z=float(parts[4]),
                     r=float(parts[5]),
-                    parent=int(parts[6]),
+                    parent=int(float(parts[6])),
                 )
             )
     return NeuronMorphology(type="NeuronMorphology", tree=samples)

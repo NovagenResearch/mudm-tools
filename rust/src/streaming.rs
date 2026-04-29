@@ -2387,6 +2387,10 @@ fn parquet_tin_direct(
 // PyO3 helpers: extract features and tags from Python dicts
 // ---------------------------------------------------------------------------
 
+// Shared by both 2D (streaming2d.rs) and 3D ingestion. The reserved-key
+// promotion block below therefore covers both pipelines; no duplicate
+// exists in streaming2d.rs (which imports this function via
+// `use crate::streaming::extract_tags`).
 pub(crate) fn extract_tags(feat: &Bound<'_, PyDict>) -> PyResult<Vec<(String, TagValue)>> {
     let tags_obj = feat.get_item("tags")?;
     let mut result = Vec::new();
@@ -2414,6 +2418,31 @@ pub(crate) fn extract_tags(feat: &Bound<'_, PyDict>) -> PyResult<Vec<(String, Ta
                     result.push((key, TagValue::Int(i)));
                 }
             }
+        }
+    }
+
+    // Promote muDM-native top-level fields into the tags map under
+    // reserved keys so they round-trip through tiling to Parquet/GLB/etc.
+    // This repairs the pre-existing gap where MuDMFeature.parentId was
+    // documented in the Pydantic model but silently dropped by Rust.
+    for (src_key, dst_key) in [
+        ("parentId",     "_parent_id"),
+        ("ref",          "_ref"),
+        ("id",           "_id"),
+        ("featureClass", "_feature_class"),
+    ] {
+        if let Some(v) = feat.get_item(src_key)? {
+            if v.is_none() {
+                continue;
+            }
+            if v.is_instance_of::<PyString>() {
+                let s: String = v.extract()?;
+                result.push((dst_key.into(), TagValue::Str(s)));
+            } else if v.is_instance_of::<PyInt>() {
+                let i: i64 = v.extract()?;
+                result.push((dst_key.into(), TagValue::Int(i)));
+            }
+            // Non-string/non-int values silently skipped (e.g. lists).
         }
     }
 

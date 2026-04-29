@@ -9,3 +9,6 @@ rust/target/
 
 # Private Claude Code context (managed as separate subrepo)
 .claude/
+data
+.DS_Store
+uv.lock

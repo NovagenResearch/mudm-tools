@@ -1207,3 +1207,27 @@ class TestRepartitionParquet:
         f.write_text("hi")
         with pytest.raises(NotADirectoryError):
             repartition_parquet(f)
+
+
+def test_parentid_survives_parquet(tmp_path):
+    """Top-level MuDMFeature.parentId must round-trip into Parquet tags as _parent_id."""
+    feat = _make_tin_feature(
+        [0.1, 0.1, 0.2, 0.1, 0.2, 0.2],
+        [0.1, 0.1, 0.1],
+        [3],
+        tags={"color": "red"},
+    )
+    # Add the top-level muDM field that the Rust extractor should promote.
+    feat["parentId"] = "neuron_17"
+
+    gen, _ = _build_generator_with_features([feat])
+    out = tmp_path / "neurons.parquet"
+    generate_parquet(gen, out, WORLD_BOUNDS)
+
+    table = pq.read_table(str(out))
+    tags_col = table.column("tags").to_pylist()
+    assert len(tags_col) > 0
+    for tags in tags_col:
+        kv = {k: v for k, v in tags}
+        assert kv.get("_parent_id") == "neuron_17", f"got {kv}"
+        assert kv.get("color") == "red"

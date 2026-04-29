@@ -274,3 +274,17 @@ class TestSWCToFeatureCollection:
         glb_bytes = to_glb(coll)
         assert len(glb_bytes) > 0
         assert glb_bytes[:4] == b"glTF"
+
+
+class TestFloatFormattedIds:
+    def test_parse_float_ids(self):
+        """SWCs with '1.000000'-style integer columns must parse (cnn-nmo convention)."""
+        from mudm_tools.swc import _parse_swc
+        fixture = Path(__file__).parent / "fixtures" / "sample_neuron_float_ids.swc"
+        morph = _parse_swc(str(fixture))
+        assert len(morph.tree) == 3
+        assert morph.tree[0].id == 1
+        assert morph.tree[0].type == 1
+        assert morph.tree[0].parent == -1
+        assert morph.tree[1].id == 2
+        assert morph.tree[1].parent == 1

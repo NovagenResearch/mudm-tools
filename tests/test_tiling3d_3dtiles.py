@@ -486,3 +486,56 @@ class TestFormatComparison:
 
         assert len(list(tmp_path.rglob("*.pbf3"))) >= 1
         assert len(list(tmp_path.rglob("*.glb"))) == 0
+
+
+# ===========================================================================
+# GLB extras — parentId round-trip into node.extras._parent_id
+# ===========================================================================
+
+
+def test_parentid_extras_in_glb(tmp_path):
+    """MuDMFeature.parentId must appear as _parent_id in GLB node extras.
+
+    Task 2 promotes top-level muDM fields (parentId/ref/id/featureClass) into
+    the tags map as reserved `_`-prefixed keys. Task 4 verifies those tags
+    land on each GLB node's `extras` object unchanged.
+    """
+    import struct
+    pytest.importorskip("mudm_tools._rs")
+    from mudm_tools._rs import StreamingTileGenerator
+
+    gen = StreamingTileGenerator(min_zoom=0, max_zoom=0)
+    # Triangle in normalized [0,1]^3 space (same pattern as test_tiling3d_rust.py).
+    feat = {
+        "geometry": [0.2, 0.3, 0.4, 0.5, 0.3, 0.7],
+        "geometry_z": [0.1, 0.4, 0.6],
+        "ring_lengths": [3],
+        "type": 5,  # TIN
+        "tags": {"compartment": "axon"},
+        "parentId": "neuron_17",
+        "minX": 0.2, "minY": 0.3, "minZ": 0.1,
+        "maxX": 0.4, "maxY": 0.7, "maxZ": 0.6,
+    }
+    gen.add_feature(feat)
+
+    out = str(tmp_path / "tiles")
+    gen.generate_3dtiles(out, (0.0, 0.0, 0.0, 100.0, 100.0, 100.0))
+
+    glbs = list(Path(tmp_path).rglob("*.glb"))
+    assert glbs, "no GLB produced"
+
+    glb = glbs[0].read_bytes()
+    assert glb[:4] == b"glTF"
+
+    # Parse GLB: 12-byte header, then JSON chunk (length u32, type u32, payload).
+    json_len = struct.unpack("<I", glb[12:16])[0]
+    json_bytes = glb[20:20 + json_len]
+    gltf = json.loads(json_bytes)
+    nodes = gltf.get("nodes", [])
+    assert nodes, f"no nodes in gltf; got {gltf}"
+    assert any(
+        n.get("extras", {}).get("_parent_id") == "neuron_17" for n in nodes
+    ), f"no node carries _parent_id; got nodes={nodes}"
+    assert any(
+        n.get("extras", {}).get("compartment") == "axon" for n in nodes
+    ), f"no node carries compartment tag; got nodes={nodes}"
