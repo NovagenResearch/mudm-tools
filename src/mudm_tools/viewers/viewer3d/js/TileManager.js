@@ -329,9 +329,17 @@ export class TileManager {
                 const color = this._getFeatureColor(name);
                 if (!color) continue;
                 for (const mesh of meshes) {
-                    if (mesh.material) {
-                        mesh.material.color.set(color);
+                    if (!mesh.material) continue;
+                    // Clone once so per-mesh coloring doesn't mutate a
+                    // material shared across multiple meshes in the same
+                    // tile (as happens when the source GLB declares a
+                    // single material and every primitive references it).
+                    // Mirrors the clone already done in _loadTile.
+                    if (!mesh.userData._styled) {
+                        mesh.material = mesh.material.clone();
+                        mesh.userData._styled = true;
                     }
+                    mesh.material.color.set(color);
                 }
             }
         }
@@ -679,9 +687,15 @@ export class TileManager {
 
                 // Color: use palette if color-by is active, otherwise original
                 const color = this._getFeatureColor(name) || props.color;
-                if (color) {
+                const opacity = this.featureIndex[name]?.opacity;
+                if (color || opacity !== undefined) {
                     child.material = child.material.clone();
-                    child.material.color.set(color);
+                    child.userData._styled = true;
+                    if (color) child.material.color.set(color);
+                    if (opacity !== undefined && opacity < 1.0) {
+                        child.material.transparent = true;
+                        child.material.opacity = opacity;
+                    }
                 }
 
                 // GPU accounting

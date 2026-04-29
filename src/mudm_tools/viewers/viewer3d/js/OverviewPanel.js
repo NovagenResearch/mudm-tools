@@ -114,6 +114,11 @@ export class OverviewPanel {
 
         // Scene with its own lighting
         this._scene = new THREE.Scene();
+        // Match the main viewer's dorsal-up reorientation (see main.js).
+        // Remap point (x, y, z) → (x, z, -y) via a single rotation so that
+        // in the overview's orthographic views, "up on screen" is always
+        // the dorsal direction (CCF -y), consistent with the main 3D view.
+        this._scene.rotation.x = -Math.PI / 2;
         this._scene.background = new THREE.Color(0x12121f);
         this._scene.add(new THREE.AmbientLight(0xffffff, 0.6));
         const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);

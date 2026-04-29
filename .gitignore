@@ -12,3 +12,6 @@ rust/target/
 data
 .DS_Store
 uv.lock
+
+# Generated viewer assets (fetched on demand via scripts/fetch_ccf_cortex_mesh.py)
+src/mudm_tools/viewers/viewer3d/isocortex.obj

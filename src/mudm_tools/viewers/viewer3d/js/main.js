@@ -5,6 +5,7 @@
  */
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { OBJLoader } from 'three/addons/loaders/OBJLoader.js';
 import { TileManager } from './TileManager.js';
 import { FeatureSelector } from './FeatureSelector.js';
 import { InfoPanel } from './InfoPanel.js';
@@ -23,6 +24,22 @@ renderer.outputColorSpace = THREE.SRGBColorSpace;
 
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x1a1a2e);
+
+// Reorient CCF coordinates into a dorsal-up view.
+//
+// cnn-nmo data is in Allen CCF v3 µm: x=AP (anterior-posterior),
+// y=DV (dorsal-ventral, +y is ventral), z=ML (medial-lateral).
+// The viewer is Z-up, so without correction, CCF's ML axis renders
+// vertically — the brain looks on-its-side.
+//
+// Rotation.x = -π/2 remaps a point (x_ccf, y_ccf, z_ccf) to
+// (x_ccf, z_ccf, -y_ccf). Result in screen space:
+//   screen UP   = -CCF.y = dorsal
+//   screen right = CCF.z = lateral
+//   screen depth = CCF.x = AP
+// All scene children (tiles, cortex overlay, overview feature index)
+// ride the same rotation, so relative alignment is preserved.
+scene.rotation.x = -Math.PI / 2;
 
 // --- Camera (Z-up) ---
 const camera = new THREE.PerspectiveCamera(50, 1, 1, 2000000);
@@ -46,6 +63,36 @@ const dirLight2 = new THREE.DirectionalLight(0xffffff, 0.3);
 dirLight2.position.set(-1, 0.5, -0.5).normalize();
 scene.add(dirLight2);
 
+// --- Atlas overlay (cnn-nmo): CCF isocortex mesh loaded directly, not through
+// the tileset. Prevents the cortex surface from being fragmented across the
+// octree tiles. Fetch is best-effort: any 404 / parse error is non-fatal.
+// The file is expected at ./isocortex.obj under the viewer dir.
+(async () => {
+    try {
+        const loader = new OBJLoader();
+        const cortex = await loader.loadAsync('./isocortex.obj');
+        const mat = new THREE.MeshStandardMaterial({
+            color: 0xa8b5c4,
+            transparent: true,
+            opacity: 0.2,
+            depthWrite: false,
+            side: THREE.DoubleSide,
+        });
+        cortex.traverse((child) => {
+            if (child.isMesh) {
+                child.material = mat;
+                child.userData.name = 'CCF Isocortex';
+                child.userData._isAtlasOverlay = true;
+            }
+        });
+        cortex.renderOrder = 1000; // render after opaque neurons
+        scene.add(cortex);
+        console.log('[atlas] CCF Isocortex overlay loaded');
+    } catch (err) {
+        console.warn('[atlas] CCF cortex overlay not loaded:', err?.message || err);
+    }
+})();
+
 // --- Scale Bar ---
 const scaleBar = new ScaleBar(canvas);
 
@@ -62,6 +109,9 @@ const slicePlanePanel = new SlicePlanePanel(sliceContainer, { renderer, scene })
 // --- Info Panel ---
 const infoPanel = new InfoPanel(camera, scene, canvas);
 infoPanel.slicePanel = slicePlanePanel;
+// Enrich clicked-feature info with sidecar (features.json) properties.
+// No-op for older deployments where tileManager.featureIndex is empty.
+infoPanel.featureLookup = (name) => tileManager?.featureIndex?.[name];
 
 // --- Overview Panel ---
 const overviewPanel = new OverviewPanel({

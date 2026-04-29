@@ -9,14 +9,26 @@ import * as THREE from 'three';
 const DISPLAY_FIELDS = [
     ['name', 'Name'],
     ['acronym', 'Acronym'],
+    ['neuron_name', 'Neuron'],
+    ['neuron_id', 'Neuron ID'],
+    ['compartment', 'Compartment'],
+    ['source', 'Source'],
+    ['archive', 'Archive'],
+    ['species', 'Species'],
+    ['brain_region', 'Brain Region'],
+    ['brain_regions', 'Brain Regions'],
     ['cell_type', 'Cell Type'],
     ['body_id', 'Body ID'],
-    ['brain_regions', 'Brain Regions'],
     ['pre', 'Pre-synapses'],
     ['post', 'Post-synapses'],
     ['status', 'Status'],
     ['status_label', 'Status Label'],
     ['soma_radius', 'Soma Radius'],
+    ['surface_m', 'Surface (µm²)'],
+    ['volume_m', 'Volume (µm³)'],
+    ['length', 'Length (µm)'],
+    ['n_bifs', 'Bifurcations'],
+    ['n_branch', 'Branches'],
     ['size_voxels', 'Size (voxels)'],
     ['ccf_id', 'CCF ID'],
     ['parent_name', 'Parent'],
@@ -32,6 +44,11 @@ export class InfoPanel {
         this.raycaster = new THREE.Raycaster();
         this.mouse = new THREE.Vector2();
         this.slicePanel = null;  // set from main.js
+        // Optional lookup: (name) => {...props from features.json} | undefined
+        // set by main.js so clicks can show richer per-feature metadata than
+        // what's baked into GLB node.extras. Leaves existing deployments
+        // (mouselight etc.) unchanged when no lookup is wired.
+        this.featureLookup = null;
 
         this.panel = document.getElementById('info-panel');
         this.title = document.getElementById('info-title');
@@ -57,11 +74,31 @@ export class InfoPanel {
             if (!hit.object.visible) continue;
             // Skip the slice plane helper mesh
             if (hit.object.userData?._isSliceHelper) continue;
+            // Skip the atlas overlay (CCF isocortex) — it's foreground
+            // chrome, not selectable. Walk up so a hit on any descendant
+            // mesh of the overlay group is skipped, since `_isAtlasOverlay`
+            // is set on the leaf meshes during traversal in main.js.
+            let _ovr = hit.object;
+            while (_ovr) {
+                if (_ovr.userData?._isAtlasOverlay) break;
+                _ovr = _ovr.parent;
+            }
+            if (_ovr) continue;
             // Skip hits behind the clip plane (clipped geometry)
             if (this.slicePanel?.enabled && this.slicePanel.clipPlane.distanceToPoint(hit.point) < 0) continue;
             const props = this._findProperties(hit.object);
             if (props) {
-                this._showPanel(props);
+                // Merge per-feature sidecar props if a lookup is wired up.
+                let merged = props;
+                if (this.featureLookup) {
+                    const extra = this.featureLookup(props.name || props.acronym);
+                    if (extra && typeof extra === 'object') {
+                        // userData fields take precedence (they're mesh-accurate);
+                        // features.json fills in the rest.
+                        merged = { ...extra, ...props };
+                    }
+                }
+                this._showPanel(merged);
                 return;
             }
         }
