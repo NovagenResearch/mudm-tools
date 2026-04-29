@@ -22,3 +22,4 @@ zstd = "0.13"
 dashmap = "6"
 parquet = { version = "54", features = ["default"] }
 arrow = { version = "54", features = ["default"] }
+gltf = { version = "1.4", features = ["import", "utils"] }

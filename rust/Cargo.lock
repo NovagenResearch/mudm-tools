@@ -1618,6 +1618,7 @@ dependencies = [
  "byteorder",
  "dashmap",
  "draco-oxide",
+ "gltf",
  "memmap2",
  "meshopt",
  "numpy",

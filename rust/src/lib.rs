@@ -22,6 +22,7 @@ mod simplify2d;
 mod streaming2d;
 mod encoder_mvt;
 mod decoder_mvt;
+mod gltf_decode;
 
 /// The main Python module implemented in Rust.
 #[pymodule]
@@ -56,6 +57,9 @@ fn _rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     // MVT PBF reader
     m.add_function(wrap_pyfunction!(decoder_mvt::read_pbf, m)?)?;
+
+    // glTF decoder (head-to-head with pygltflib)
+    m.add_function(wrap_pyfunction!(gltf_decode::decode_glb_buffer, m)?)?;
 
     Ok(())
 }
