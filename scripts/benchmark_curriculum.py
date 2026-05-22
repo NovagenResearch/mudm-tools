@@ -27,12 +27,17 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
+import shutil
 import sys
+import tempfile
 import time
 from pathlib import Path
 
 import numpy as np
+import pyarrow as pa
+import pyarrow.parquet as pq
 import torch
 import torch.nn as nn
 from sklearn.metrics import f1_score
@@ -47,8 +52,10 @@ from benchmark_hemibrain_ml import (  # noqa: E402
     ParquetMeshDataset,
     PointNet,
     _build_label_map_and_splits,
+    _sample_and_normalise,
     convert_parquet_to_arrow_ipc,
 )
+from mudm_tools.spatial_batching import SpatiallyCoherentLoader  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Curriculum phases
@@ -251,6 +258,242 @@ def train_curriculum(
 # ---------------------------------------------------------------------------
 
 
+def _write_train_only_parquet_view(
+    *,
+    source_parquet_dir: Path,
+    train_id_set: set[str],
+    zoom: int,
+) -> Path:
+    """Materialise a temporary hive-partitioned Parquet directory containing
+    only rows whose ``tags["body_id"]`` is in ``train_id_set``.
+
+    The output preserves the source's
+    ``zoom={N}/tile_x={X}/tile_y={Y}/tile_d={D}/part-0.parquet`` layout so a
+    ``SpatiallyCoherentLoader`` pointed at the result discovers the same tile
+    keys (minus tiles that lose all their rows).  The non-partition columns
+    are kept verbatim, so the loader's row dicts have the same shape as when
+    it reads the source directly.
+
+    The caller owns cleanup (e.g. wrap in ``contextlib.ExitStack`` or
+    ``tempfile.TemporaryDirectory``).
+
+    Why this exists: the spatial-batch arm of ``benchmark_curriculum.py`` must
+    feed the loader train-only data so its mini-batches stay full-size of
+    train rows -- matching the baseline arm's pre-filtered-dataset semantics.
+    Filtering inside ``_rows_to_tensor_batch`` shrinks mixed-split tiles'
+    effective batch size and skews the comparison.
+    """
+    out_dir = Path(tempfile.mkdtemp(prefix="mudm_spatial_train_"))
+    zoom_dir_in = source_parquet_dir / f"zoom={zoom}"
+    if not zoom_dir_in.is_dir():
+        return out_dir
+
+    zoom_dir_out = out_dir / f"zoom={zoom}"
+    for tx_dir in sorted(zoom_dir_in.glob("tile_x=*")):
+        tx_name = tx_dir.name
+        for ty_dir in sorted(tx_dir.glob("tile_y=*")):
+            ty_name = ty_dir.name
+            for td_dir in sorted(ty_dir.glob("tile_d=*")):
+                td_name = td_dir.name
+                table = pq.read_table(td_dir)
+                if table.num_rows == 0:
+                    continue
+                # ``tags`` may surface as either a struct or a map<string,string>
+                # depending on how the source Parquet was written; handle both.
+                tags_col = table.column("tags").to_pylist()
+                mask: list[bool] = []
+                for tags_val in tags_col:
+                    if tags_val is None:
+                        mask.append(False)
+                        continue
+                    tags_dict = (
+                        dict(tags_val) if isinstance(tags_val, list) else tags_val
+                    )
+                    bid = tags_dict.get("body_id")
+                    mask.append(bid is not None and bid in train_id_set)
+                filtered = table.filter(pa.array(mask, type=pa.bool_()))
+                if filtered.num_rows == 0:
+                    continue
+                out_td = zoom_dir_out / tx_name / ty_name / td_name
+                out_td.mkdir(parents=True, exist_ok=True)
+                pq.write_table(filtered, out_td / "part-0.parquet")
+    return out_dir
+
+
+def _rows_to_tensor_batch(
+    rows: list[dict],
+    n_points: int,
+    label_map: dict[str, int],
+    feature_id_set: set[str],
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Aggregate a list of tile rows into a (points, labels) tensor batch.
+
+    Each row carries a packed ``positions`` blob and a ``tags`` dict containing
+    ``body_id`` and ``cell_type``.  Rows belonging to the same neuron (same
+    ``body_id``) are concatenated, then sampled/normalised to ``n_points`` and
+    stacked into a (B, n_points, 3) tensor.  Rows whose body_id is not in
+    ``feature_id_set`` or whose cell_type is not in ``label_map`` are skipped.
+    Returns ``None`` if no usable neurons remain.
+    """
+    by_body: dict[str, list[np.ndarray]] = {}
+    label_by_body: dict[str, int] = {}
+    for row in rows:
+        tags_val = row.get("tags")
+        pos_bytes = row.get("positions")
+        if tags_val is None or pos_bytes is None:
+            continue
+        tags_dict = dict(tags_val) if isinstance(tags_val, list) else tags_val
+        body_id = tags_dict.get("body_id")
+        if body_id is None or body_id not in feature_id_set:
+            continue
+        cell_type = tags_dict.get("cell_type")
+        if cell_type is None or cell_type not in label_map:
+            continue
+        positions = np.frombuffer(pos_bytes, dtype=np.float32).reshape(-1, 3)
+        if len(positions) == 0:
+            continue
+        by_body.setdefault(body_id, []).append(positions)
+        label_by_body[body_id] = label_map[cell_type]
+
+    if not by_body:
+        return None
+
+    pts_list: list[torch.Tensor] = []
+    label_list: list[int] = []
+    for body_id, frags in by_body.items():
+        merged = np.concatenate(frags, axis=0)
+        pts_list.append(_sample_and_normalise(merged, n_points))
+        label_list.append(label_by_body[body_id])
+    return torch.stack(pts_list, dim=0), torch.tensor(label_list, dtype=torch.long)
+
+
+def train_spatial_batch(
+    parquet_dir: Path,
+    label_map: dict[str, int],
+    train_ids: list[str],
+    val_ids: list[str],
+    test_ids: list[str],
+    n_points: int,
+    batch_size: int,
+    device: torch.device,
+    *,
+    seed: int,
+    use_arrow: bool = False,
+    arrow_dir: Path | None = None,
+) -> dict:
+    """Run spatially-coherent batching: each mini-batch comes from a single
+    octree tile (with carry-merging when a tile is undersized).
+
+    Mirrors the baseline arm exactly except for the sampler: same model, same
+    optimizer, same epoch count.  Validation and test loaders are unchanged
+    (random-shuffled at full resolution) so test-set metrics are comparable.
+    """
+    num_classes = len(label_map)
+    model = PointNet(num_classes).to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    criterion = nn.CrossEntropyLoss()
+
+    train_id_set = set(train_ids)
+
+    # Materialise a train-only view of the partitioned Parquet directory so
+    # the spatially-coherent loader yields full-size batches of train rows --
+    # matching the baseline arm, whose ``ParquetMeshDataset`` is itself
+    # constructed with ``feature_ids=train_ids`` and therefore filters
+    # *before* batching (see ``ParquetMeshDataset.__init__`` in
+    # ``benchmark_hemibrain_ml.py``).  Without this, mixed-split tiles would
+    # produce shrunken batches and skew the comparison.
+    val_loader = _make_loader(
+        parquet_dir, zoom=BASELINE_ZOOM, n_points=n_points,
+        label_map=label_map, feature_ids=val_ids,
+        batch_size=batch_size, shuffle=False,
+        use_arrow=use_arrow, arrow_dir=arrow_dir,
+    )
+
+    history: list[dict] = []
+    t_start = time.perf_counter()
+
+    with contextlib.ExitStack() as stack:
+        train_only_dir = _write_train_only_parquet_view(
+            source_parquet_dir=parquet_dir,
+            train_id_set=train_id_set,
+            zoom=BASELINE_ZOOM,
+        )
+        stack.callback(lambda: shutil.rmtree(train_only_dir, ignore_errors=True))
+
+        train_loader = SpatiallyCoherentLoader(
+            parquet_dir=train_only_dir,
+            zoom=BASELINE_ZOOM,
+            batch_size=batch_size,
+            shuffle=True,
+            seed=seed,
+        )
+
+        print(f"\n--- Spatial batch: zoom={BASELINE_ZOOM}, {TOTAL_EPOCHS} epochs ---")
+        print(f"  Tiles discovered (train-only view): {len(train_loader.tile_keys)}")
+
+        for epoch in range(1, TOTAL_EPOCHS + 1):
+            model.train()
+            train_loss_sum = 0.0
+            train_count = 0
+
+            for tile_rows in train_loader:
+                # ``train_id_set`` is still passed defensively, but the loader
+                # is now reading from a train-only view so every row already
+                # has ``body_id in train_id_set`` -- this filter is a no-op for
+                # the body_id check and only enforces ``cell_type in label_map``.
+                batch = _rows_to_tensor_batch(tile_rows, n_points, label_map, train_id_set)
+                if batch is None:
+                    continue
+                points, labels = batch
+                points = points.to(device, dtype=torch.float32)
+                labels = labels.to(device, dtype=torch.long)
+
+                optimizer.zero_grad()
+                logits = model(points)
+                loss = criterion(logits, labels)
+                loss.backward()
+                optimizer.step()
+
+                train_loss_sum += loss.item() * labels.size(0)
+                train_count += labels.size(0)
+
+            train_loss = train_loss_sum / max(train_count, 1)
+            val_loss, val_acc = _evaluate(model, val_loader, criterion, device)
+
+            history.append({
+                "epoch": epoch,
+                "val_accuracy": round(val_acc, 5),
+                "val_loss": round(val_loss, 5),
+                "train_loss": round(train_loss, 5),
+            })
+
+            print(
+                f"  Epoch {epoch:3d}/{TOTAL_EPOCHS}  "
+                f"train_loss={train_loss:.4f}  "
+                f"val_acc={val_acc:.4f}",
+                flush=True,
+            )
+
+    total_time = time.perf_counter() - t_start
+
+    test_loader = _make_loader(
+        parquet_dir, zoom=BASELINE_ZOOM, n_points=n_points,
+        label_map=label_map, feature_ids=test_ids,
+        batch_size=batch_size, shuffle=False,
+        use_arrow=use_arrow, arrow_dir=arrow_dir,
+    )
+    test_acc, test_f1 = _test_metrics(model, test_loader, device)
+
+    return {
+        "zoom": BASELINE_ZOOM,
+        "epochs": TOTAL_EPOCHS,
+        "test_accuracy": round(test_acc, 5),
+        "test_f1_macro": round(test_f1, 5),
+        "total_time_s": round(total_time, 2),
+        "history": history,
+    }
+
+
 def train_baseline(
     parquet_dir: Path,
     label_map: dict[str, int],
@@ -367,26 +610,36 @@ def plot_results(aggregated: dict, plot_path: Path) -> None:
 
     epochs = list(range(1, TOTAL_EPOCHS + 1))
 
-    if "curriculum_mean" in aggregated:
-        cur_mean = np.array(aggregated["curriculum_mean"])
-        cur_std = np.array(aggregated["curriculum_std"])
-        base_mean = np.array(aggregated["baseline_mean"])
-        base_std = np.array(aggregated["baseline_std"])
+    def _plot_arm(prefix: str, marker: str, label: str) -> None:
+        mean = aggregated.get(f"{prefix}_mean")
+        std = aggregated.get(f"{prefix}_std")
+        if not mean:
+            return
+        mean_arr = np.array(mean)
+        std_arr = np.array(std) if std else np.zeros_like(mean_arr)
+        ax.plot(epochs, mean_arr, f"{marker}-", markersize=3, label=label)
+        ax.fill_between(epochs, mean_arr - std_arr, mean_arr + std_arr, alpha=0.2)
 
-        ax.plot(epochs, cur_mean, "o-", markersize=3, label="Curriculum (zoom 0→3)")
-        ax.fill_between(epochs, cur_mean - cur_std, cur_mean + cur_std, alpha=0.2)
-        ax.plot(epochs, base_mean, "s-", markersize=3, label="Baseline (zoom 3 only)")
-        ax.fill_between(epochs, base_mean - base_std, base_mean + base_std, alpha=0.2)
+    if (
+        "curriculum_mean" in aggregated
+        or "baseline_mean" in aggregated
+        or "spatial_batch_mean" in aggregated
+    ):
+        _plot_arm("curriculum", "o", "Curriculum (zoom 0→3)")
+        _plot_arm("baseline", "s", "Baseline (zoom 3 only)")
+        _plot_arm("spatial_batch", "^", "Spatial batch (single-tile)")
     else:
         # Single-seed fallback
-        curriculum = aggregated["curriculum"]
-        baseline = aggregated["baseline"]
-        cur_epochs = [h["epoch"] for h in curriculum["history"]]
-        cur_acc = [h["val_accuracy"] for h in curriculum["history"]]
-        ax.plot(cur_epochs, cur_acc, "o-", markersize=3, label="Curriculum (zoom 0→3)")
-        base_epochs = [h["epoch"] for h in baseline["history"]]
-        base_acc = [h["val_accuracy"] for h in baseline["history"]]
-        ax.plot(base_epochs, base_acc, "s-", markersize=3, label="Baseline (zoom 3 only)")
+        curriculum = aggregated.get("curriculum")
+        baseline = aggregated.get("baseline")
+        if curriculum is not None:
+            cur_epochs = [h["epoch"] for h in curriculum["history"]]
+            cur_acc = [h["val_accuracy"] for h in curriculum["history"]]
+            ax.plot(cur_epochs, cur_acc, "o-", markersize=3, label="Curriculum (zoom 0→3)")
+        if baseline is not None:
+            base_epochs = [h["epoch"] for h in baseline["history"]]
+            base_acc = [h["val_accuracy"] for h in baseline["history"]]
+            ax.plot(base_epochs, base_acc, "s-", markersize=3, label="Baseline (zoom 3 only)")
 
     # Shade curriculum phases
     colors = ["#e0f0ff", "#c0e0ff", "#a0d0ff", "#80c0ff"]
@@ -474,6 +727,19 @@ def main() -> None:
         help="Use Arrow IPC (Feather v2) instead of Parquet for data loading",
     )
     parser.add_argument(
+        "--arms",
+        type=str,
+        default="curriculum,baseline",
+        help=(
+            "Comma-separated list of arms to run. "
+            "Available arms: 'curriculum' (zoom 0->3 progression), "
+            "'baseline' (zoom=3 only with random sampler), "
+            "'spatial_batch' (zoom=3, mini-batches drawn from a single octree "
+            "tile via SpatiallyCoherentLoader -- otherwise identical to "
+            "baseline). Default: curriculum,baseline."
+        ),
+    )
+    parser.add_argument(
         "--output",
         type=str,
         default="results/curriculum_benchmark.json",
@@ -499,11 +765,22 @@ def main() -> None:
     else:
         seeds = [args.seed]
 
+    # --- Resolve arm list ---
+    valid_arms = {"curriculum", "baseline", "spatial_batch"}
+    arms = [a.strip() for a in args.arms.split(",") if a.strip()]
+    unknown = set(arms) - valid_arms
+    if unknown:
+        parser.error(
+            f"Unknown arm(s): {sorted(unknown)}. "
+            f"Valid arms: {sorted(valid_arms)}"
+        )
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     loader_name = "Arrow IPC" if args.use_arrow else "Parquet"
     print(f"Device: {device}")
     print(f"Data loader: {loader_name}")
     print(f"Seeds: {seeds}")
+    print(f"Arms: {arms}")
     print(f"Curriculum phases: {CURRICULUM_PHASES}")
     print(f"Baseline: {TOTAL_EPOCHS} epochs on zoom={BASELINE_ZOOM}")
 
@@ -524,6 +801,7 @@ def main() -> None:
     # --- Per-seed results ---
     all_curriculum: list[dict] = []
     all_baseline: list[dict] = []
+    all_spatial_batch: list[dict] = []
 
     for si, seed in enumerate(seeds):
         print(f"\n{'#'*60}")
@@ -542,67 +820,105 @@ def main() -> None:
             )
 
         # --- Curriculum ---
-        _set_seeds(seed)
-        print(f"\n{'='*60}")
-        print("CURRICULUM TRAINING")
-        print(f"{'='*60}")
-        cur = train_curriculum(
-            parquet_dir, label_map, train_ids, val_ids, test_ids,
-            n_points=args.n_points, batch_size=args.batch_size, device=device,
-            use_arrow=args.use_arrow, arrow_dir=arrow_dir,
-        )
-        cur["seed"] = seed
-        all_curriculum.append(cur)
+        if "curriculum" in arms:
+            _set_seeds(seed)
+            print(f"\n{'='*60}")
+            print("CURRICULUM TRAINING")
+            print(f"{'='*60}")
+            cur = train_curriculum(
+                parquet_dir, label_map, train_ids, val_ids, test_ids,
+                n_points=args.n_points, batch_size=args.batch_size, device=device,
+                use_arrow=args.use_arrow, arrow_dir=arrow_dir,
+            )
+            cur["seed"] = seed
+            all_curriculum.append(cur)
 
         # --- Baseline ---
-        _set_seeds(seed)
-        print(f"\n{'='*60}")
-        print("BASELINE TRAINING")
-        print(f"{'='*60}")
-        base = train_baseline(
-            parquet_dir, label_map, train_ids, val_ids, test_ids,
-            n_points=args.n_points, batch_size=args.batch_size, device=device,
-            use_arrow=args.use_arrow, arrow_dir=arrow_dir,
-        )
-        base["seed"] = seed
-        all_baseline.append(base)
+        if "baseline" in arms:
+            _set_seeds(seed)
+            print(f"\n{'='*60}")
+            print("BASELINE TRAINING")
+            print(f"{'='*60}")
+            base = train_baseline(
+                parquet_dir, label_map, train_ids, val_ids, test_ids,
+                n_points=args.n_points, batch_size=args.batch_size, device=device,
+                use_arrow=args.use_arrow, arrow_dir=arrow_dir,
+            )
+            base["seed"] = seed
+            all_baseline.append(base)
+
+        # --- Spatial batch ---
+        if "spatial_batch" in arms:
+            # Mirrors the baseline arm but uses SpatiallyCoherentLoader instead
+            # of PyTorch's default random sampler. All other settings (epochs,
+            # model, optimizer, evaluation) are identical to baseline.
+            _set_seeds(seed)
+            print(f"\n{'='*60}")
+            print("SPATIAL BATCH TRAINING")
+            print(f"{'='*60}")
+            spat = train_spatial_batch(
+                parquet_dir, label_map, train_ids, val_ids, test_ids,
+                n_points=args.n_points, batch_size=args.batch_size, device=device,
+                seed=seed,
+                use_arrow=args.use_arrow, arrow_dir=arrow_dir,
+            )
+            spat["seed"] = seed
+            all_spatial_batch.append(spat)
 
     # --- Aggregate ---
-    cur_accs = [r["test_accuracy"] for r in all_curriculum]
-    cur_f1s = [r["test_f1_macro"] for r in all_curriculum]
-    base_accs = [r["test_accuracy"] for r in all_baseline]
-    base_f1s = [r["test_f1_macro"] for r in all_baseline]
+    def _agg_block(records: list[dict], prefix: str) -> dict:
+        if not records:
+            return {}
+        accs = [r["test_accuracy"] for r in records]
+        f1s = [r["test_f1_macro"] for r in records]
+        return {
+            f"{prefix}_test_accuracy_mean": round(float(np.mean(accs)), 5),
+            f"{prefix}_test_accuracy_std": round(float(np.std(accs)), 5),
+            f"{prefix}_test_f1_mean": round(float(np.mean(f1s)), 5),
+            f"{prefix}_test_f1_std": round(float(np.std(f1s)), 5),
+        }
 
-    # Per-epoch val accuracy arrays (seeds x epochs)
-    cur_val_matrix = np.array([
-        [h["val_accuracy"] for h in r["history"]] for r in all_curriculum
-    ])
-    base_val_matrix = np.array([
-        [h["val_accuracy"] for h in r["history"]] for r in all_baseline
-    ])
+    def _per_epoch_arrays(records: list[dict]) -> tuple[list[float], list[float]]:
+        if not records:
+            return [], []
+        matrix = np.array([
+            [h["val_accuracy"] for h in r["history"]] for r in records
+        ])
+        return (
+            np.mean(matrix, axis=0).round(5).tolist(),
+            np.std(matrix, axis=0).round(5).tolist(),
+        )
+
+    aggregate: dict = {}
+    aggregate.update(_agg_block(all_curriculum, "curriculum"))
+    aggregate.update(_agg_block(all_baseline, "baseline"))
+    aggregate.update(_agg_block(all_spatial_batch, "spatial_batch"))
+
+    cur_mean, cur_std = _per_epoch_arrays(all_curriculum)
+    base_mean, base_std = _per_epoch_arrays(all_baseline)
+    spat_mean, spat_std = _per_epoch_arrays(all_spatial_batch)
+
+    per_seed: dict = {}
+    if all_curriculum:
+        per_seed["curriculum"] = all_curriculum
+    if all_baseline:
+        per_seed["baseline"] = all_baseline
+    if all_spatial_batch:
+        per_seed["spatial_batch"] = all_spatial_batch
 
     results = {
         "seeds": seeds,
+        "arms": arms,
         "loader": loader_name,
-        "per_seed": {
-            "curriculum": all_curriculum,
-            "baseline": all_baseline,
-        },
-        "aggregate": {
-            "curriculum_test_accuracy_mean": round(float(np.mean(cur_accs)), 5),
-            "curriculum_test_accuracy_std": round(float(np.std(cur_accs)), 5),
-            "curriculum_test_f1_mean": round(float(np.mean(cur_f1s)), 5),
-            "curriculum_test_f1_std": round(float(np.std(cur_f1s)), 5),
-            "baseline_test_accuracy_mean": round(float(np.mean(base_accs)), 5),
-            "baseline_test_accuracy_std": round(float(np.std(base_accs)), 5),
-            "baseline_test_f1_mean": round(float(np.mean(base_f1s)), 5),
-            "baseline_test_f1_std": round(float(np.std(base_f1s)), 5),
-        },
+        "per_seed": per_seed,
+        "aggregate": aggregate,
         # Per-epoch mean/std for plotting
-        "curriculum_mean": np.mean(cur_val_matrix, axis=0).round(5).tolist(),
-        "curriculum_std": np.std(cur_val_matrix, axis=0).round(5).tolist(),
-        "baseline_mean": np.mean(base_val_matrix, axis=0).round(5).tolist(),
-        "baseline_std": np.std(base_val_matrix, axis=0).round(5).tolist(),
+        "curriculum_mean": cur_mean,
+        "curriculum_std": cur_std,
+        "baseline_mean": base_mean,
+        "baseline_std": base_std,
+        "spatial_batch_mean": spat_mean,
+        "spatial_batch_std": spat_std,
     }
 
     output_path = Path(args.output)
@@ -619,11 +935,26 @@ def main() -> None:
     print(f"\n{'='*60}")
     print(f"SUMMARY ({len(seeds)} seed{'s' if len(seeds) > 1 else ''})")
     print(f"{'='*60}")
-    print(f"  Curriculum test accuracy:  {agg['curriculum_test_accuracy_mean']:.4f} ± {agg['curriculum_test_accuracy_std']:.4f}")
-    print(f"  Curriculum test F1 (macro):{agg['curriculum_test_f1_mean']:.4f} ± {agg['curriculum_test_f1_std']:.4f}")
-    print()
-    print(f"  Baseline test accuracy:    {agg['baseline_test_accuracy_mean']:.4f} ± {agg['baseline_test_accuracy_std']:.4f}")
-    print(f"  Baseline test F1 (macro):  {agg['baseline_test_f1_mean']:.4f} ± {agg['baseline_test_f1_std']:.4f}")
+    arm_labels = {
+        "curriculum": "Curriculum",
+        "baseline": "Baseline  ",
+        "spatial_batch": "SpatialBatch",
+    }
+    for arm in arms:
+        prefix = arm
+        label = arm_labels.get(arm, arm)
+        if f"{prefix}_test_accuracy_mean" in agg:
+            print(
+                f"  {label} test accuracy:  "
+                f"{agg[prefix + '_test_accuracy_mean']:.4f} ± "
+                f"{agg[prefix + '_test_accuracy_std']:.4f}"
+            )
+            print(
+                f"  {label} test F1 (macro):"
+                f"{agg[prefix + '_test_f1_mean']:.4f} ± "
+                f"{agg[prefix + '_test_f1_std']:.4f}"
+            )
+            print()
 
 
 if __name__ == "__main__":
