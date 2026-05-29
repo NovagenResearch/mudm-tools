@@ -30,7 +30,10 @@ import json
 import os
 import sys
 import time
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
+
+import numpy as np
 
 sys.stdout.reconfigure(line_buffering=True)  # type: ignore[attr-defined]
 
@@ -260,63 +263,75 @@ def update_metadata(mesh_dir: Path, meta_path: Path, token: str) -> None:
 # Step 2: Download meshes via CloudVolume
 # ---------------------------------------------------------------------------
 
+_WORKER_CV = None
+
+
+def _dl_init_worker() -> None:
+    """Process-pool initializer: one CloudVolume per worker process."""
+    global _WORKER_CV
+    from cloudvolume import CloudVolume
+    _WORKER_CV = CloudVolume(_HEMIBRAIN_SEG, use_https=True, progress=False)
+
+
+def _dl_one(task: tuple[int, str, bool]) -> tuple[int, str, int]:
+    """Download one mesh to OBJ. Returns ``(body_id, status, n_verts)``.
+
+    Writes to a temp file then atomically renames, so an interrupted run never
+    leaves a partial ``.obj`` that ``skip_existing`` would later treat as done.
+    """
+    body_id, out_dir, skip_existing = task
+    obj_path = Path(out_dir) / f"{body_id}.obj"
+    if skip_existing and obj_path.exists():
+        return (body_id, "skip", 0)
+    try:
+        mesh = _WORKER_CV.mesh.get(body_id, lod=0)[body_id]
+        verts = np.asarray(mesh.vertices, dtype=np.float64)
+        faces = np.asarray(mesh.faces, dtype=np.int64).reshape(-1, 3) + 1
+        tmp = obj_path.with_suffix(".obj.tmp")
+        with open(tmp, "w") as f:
+            np.savetxt(f, verts, fmt="v %.7g %.7g %.7g")
+            np.savetxt(f, faces, fmt="f %d %d %d")
+        tmp.rename(obj_path)
+        return (body_id, "ok", int(len(verts)))
+    except Exception as e:  # noqa: BLE001
+        return (body_id, f"err:{type(e).__name__}:{e}", 0)
+
+
 def download_meshes(
     body_ids: list[int],
     output_dir: Path,
     *,
     skip_existing: bool = True,
+    workers: int | None = None,
 ) -> int:
-    """Download neuron meshes as OBJ files via CloudVolume.
+    """Download neuron meshes as OBJ files via CloudVolume, in parallel.
 
-    Returns number of successfully downloaded meshes.
+    Uses a process pool (default ``min(16, cpu_count)``) so the network fetch
+    and OBJ writing for different neurons run concurrently. Returns the number
+    of successfully downloaded (or already-present) meshes.
     """
-    from cloudvolume import CloudVolume
-
     output_dir.mkdir(parents=True, exist_ok=True)
-
-    cv = CloudVolume(
-        _HEMIBRAIN_SEG,
-        use_https=True,
-        progress=False,
-    )
-
-    downloaded = 0
-    errors = 0
-    for i, body_id in enumerate(body_ids, 1):
-        obj_path = output_dir / f"{body_id}.obj"
-        if skip_existing and obj_path.exists():
-            downloaded += 1
-            if i % 100 == 0:
-                print(f"  [{i}/{len(body_ids)}] {body_id} — exists, skipping")
-            continue
-
-        try:
-            mesh = cv.mesh.get(body_id, lod=0)[body_id]
-            vertices = mesh.vertices
-            faces = mesh.faces.reshape(-1, 3)
-
-            # Write OBJ
-            with open(obj_path, "w") as f:
-                for v in vertices:
-                    f.write(f"v {v[0]} {v[1]} {v[2]}\n")
-                for face in faces:
-                    f.write(f"f {face[0]+1} {face[1]+1} {face[2]+1}\n")
-
-            downloaded += 1
-            if i % 10 == 0 or i == len(body_ids):
-                print(
-                    f"  [{i}/{len(body_ids)}] {body_id} — "
-                    f"{len(vertices):,} verts, {len(faces):,} faces"
-                )
-        except Exception as e:
-            errors += 1
-            if errors <= 5:
-                print(f"  [{i}/{len(body_ids)}] {body_id} — ERROR: {e}")
-            elif errors == 6:
-                print("  (suppressing further errors)")
-
-    print(f"  Downloaded {downloaded}/{len(body_ids)} meshes ({errors} errors)")
-    return downloaded
+    n_workers = workers or min(16, (os.cpu_count() or 8))
+    tasks = [(int(b), str(output_dir), skip_existing) for b in body_ids]
+    total = len(tasks)
+    done = errors = 0
+    print(f"  Downloading {total} meshes with {n_workers} workers...", flush=True)
+    with ProcessPoolExecutor(
+        max_workers=n_workers, initializer=_dl_init_worker
+    ) as ex:
+        for i, (body_id, status, _n) in enumerate(
+            ex.map(_dl_one, tasks, chunksize=1), 1
+        ):
+            if status in ("ok", "skip"):
+                done += 1
+            else:
+                errors += 1
+                if errors <= 5:
+                    print(f"  {body_id} — ERROR: {status}", flush=True)
+            if i % 25 == 0 or i == total:
+                print(f"  [{i}/{total}] ok={done} err={errors}", flush=True)
+    print(f"  Downloaded {done}/{total} meshes ({errors} errors)")
+    return done
 
 
 # ---------------------------------------------------------------------------
@@ -537,8 +552,11 @@ def tile_streaming(
 
     from mudm_tools._rs import StreamingTileGenerator, scan_obj_bounds
 
-    # Size threshold for serial vs parallel ingest (500 MB)
-    _GIANT_THRESHOLD = 500 * 1024 * 1024
+    # Size threshold for serial vs parallel ingest. Raised to 5 GB so all
+    # meshes in this dataset (largest ~1.3 GB) go through the parallel rayon
+    # batch instead of the serial giant path. Memory-safe: rayon bounds
+    # concurrency and frags stream to TMPDIR on disk; the box has 772 GB RAM.
+    _GIANT_THRESHOLD = 5 * 1024 * 1024 * 1024
 
     obj_paths = sorted(mesh_dir.glob("*.obj"))
     if not obj_paths:
@@ -562,19 +580,13 @@ def tile_streaming(
         bounds = tuple(json.loads(bounds_cache.read_text()))
         print(f"Using cached bounds from {bounds_cache}", flush=True)
     else:
-        print(f"Pass 1: Scanning {len(obj_paths)} OBJ vertex bounds...", flush=True)
+        print(f"Pass 1: Scanning {len(obj_paths)} OBJ vertex bounds "
+              f"(parallel rayon)...", flush=True)
         t0 = time.perf_counter()
-        gmin = [float("inf")] * 3
-        gmax = [float("-inf")] * 3
-        for i, p in enumerate(path_strs, 1):
-            b = scan_obj_bounds([p])
-            for ax in range(3):
-                if b[ax] < gmin[ax]:
-                    gmin[ax] = b[ax]
-                if b[ax + 3] > gmax[ax]:
-                    gmax[ax] = b[ax + 3]
-            print(f"  [{i}/{len(obj_paths)}] {obj_paths[i-1].name}", flush=True)
-        bounds = (gmin[0], gmin[1], gmin[2], gmax[0], gmax[1], gmax[2])
+        # scan_obj_bounds() rayon-parallelizes across the whole list internally
+        # (streaming.rs:scan_bounds_parallel, GIL released). One call uses all
+        # cores; the old per-file loop pinned it to one core.
+        bounds = tuple(scan_obj_bounds(path_strs))
         bounds_cache.write_text(json.dumps(list(bounds)))
         print(f"  Bounds: x=[{bounds[0]:.0f}, {bounds[3]:.0f}] "
               f"y=[{bounds[1]:.0f}, {bounds[4]:.0f}] "
@@ -698,55 +710,57 @@ def tile_streaming(
             check=True,
         )
 
-    # --- feature-centric PBF3 ---
-    feat_pbf3_dir = pyramid_dir / "mudm_feature_pbf3"
-    if feat_pbf3_dir.exists():
-        shutil.rmtree(feat_pbf3_dir)
-    feat_pbf3_dir.mkdir(parents=True, exist_ok=True)
+    # --- feature-centric PBF3 (gated: it is a pbf3 variant) ---
+    if not skip_pbf3:
+        feat_pbf3_dir = pyramid_dir / "mudm_feature_pbf3"
+        if feat_pbf3_dir.exists():
+            shutil.rmtree(feat_pbf3_dir)
+        feat_pbf3_dir.mkdir(parents=True, exist_ok=True)
 
-    gen_fpbf3 = StreamingTileGenerator(min_zoom=0, max_zoom=max_zoom, base_cells=100)
-    print(f"\nStreaming feature-centric PBF3 ingest (zoom 0-{max_zoom}, base_cells=100)...")
-    t_index_fpbf3 = _ingest_chunked(gen_fpbf3)
+        gen_fpbf3 = StreamingTileGenerator(min_zoom=0, max_zoom=max_zoom, base_cells=100)
+        print(f"\nStreaming feature-centric PBF3 ingest (zoom 0-{max_zoom}, base_cells=100)...")
+        t_index_fpbf3 = _ingest_chunked(gen_fpbf3)
 
-    t0 = time.perf_counter()
-    n_feat_pbf3 = gen_fpbf3.generate_feature_pbf3(str(feat_pbf3_dir), bounds)
-    t_gen_fpbf3 = time.perf_counter() - t0
-    del gen_fpbf3
+        t0 = time.perf_counter()
+        n_feat_pbf3 = gen_fpbf3.generate_feature_pbf3(str(feat_pbf3_dir), bounds)
+        t_gen_fpbf3 = time.perf_counter() - t0
+        del gen_fpbf3
 
-    feat_pbf3_size = sum(f.stat().st_size for f in feat_pbf3_dir.rglob("*") if f.is_file())
-    results["feature_pbf3_features"] = n_feat_pbf3
-    results["feature_pbf3_index_time"] = t_index_fpbf3
-    results["feature_pbf3_gen_time"] = t_gen_fpbf3
-    results["feature_pbf3_size_raw"] = feat_pbf3_size
-    results["feature_pbf3_dir"] = feat_pbf3_dir
+        feat_pbf3_size = sum(f.stat().st_size for f in feat_pbf3_dir.rglob("*") if f.is_file())
+        results["feature_pbf3_features"] = n_feat_pbf3
+        results["feature_pbf3_index_time"] = t_index_fpbf3
+        results["feature_pbf3_gen_time"] = t_gen_fpbf3
+        results["feature_pbf3_size_raw"] = feat_pbf3_size
+        results["feature_pbf3_dir"] = feat_pbf3_dir
 
-    print(f"  {n_feat_pbf3} features in {_fmt_time(t_gen_fpbf3)}")
-    print(f"  Size: {_fmt_bytes(feat_pbf3_size)} raw")
+        print(f"  {n_feat_pbf3} features in {_fmt_time(t_gen_fpbf3)}")
+        print(f"  Size: {_fmt_bytes(feat_pbf3_size)} raw")
 
-    # --- neuroglancer ---
-    ng_dir = pyramid_dir / "neuroglancer"
-    if ng_dir.exists():
-        shutil.rmtree(ng_dir)
-    ng_dir.mkdir(parents=True, exist_ok=True)
+    # --- neuroglancer (gated: viewer format, not needed for ML Parquet) ---
+    if not skip_3dtiles:
+        ng_dir = pyramid_dir / "neuroglancer"
+        if ng_dir.exists():
+            shutil.rmtree(ng_dir)
+        ng_dir.mkdir(parents=True, exist_ok=True)
 
-    gen_ng = StreamingTileGenerator(min_zoom=0, max_zoom=max_zoom, base_cells=100)
-    print(f"\nStreaming Neuroglancer ingest (zoom 0-{max_zoom}, base_cells=100)...")
-    t_index_ng = _ingest_chunked(gen_ng)
+        gen_ng = StreamingTileGenerator(min_zoom=0, max_zoom=max_zoom, base_cells=100)
+        print(f"\nStreaming Neuroglancer ingest (zoom 0-{max_zoom}, base_cells=100)...")
+        t_index_ng = _ingest_chunked(gen_ng)
 
-    t0 = time.perf_counter()
-    n_feat_ng = gen_ng.generate_neuroglancer_multilod(str(ng_dir), bounds)
-    t_gen_ng = time.perf_counter() - t0
-    del gen_ng
+        t0 = time.perf_counter()
+        n_feat_ng = gen_ng.generate_neuroglancer_multilod(str(ng_dir), bounds)
+        t_gen_ng = time.perf_counter() - t0
+        del gen_ng
 
-    ng_size = sum(f.stat().st_size for f in ng_dir.rglob("*") if f.is_file())
-    results["neuroglancer_features"] = n_feat_ng
-    results["neuroglancer_index_time"] = t_index_ng
-    results["neuroglancer_gen_time"] = t_gen_ng
-    results["neuroglancer_size_raw"] = ng_size
-    results["neuroglancer_dir"] = ng_dir
+        ng_size = sum(f.stat().st_size for f in ng_dir.rglob("*") if f.is_file())
+        results["neuroglancer_features"] = n_feat_ng
+        results["neuroglancer_index_time"] = t_index_ng
+        results["neuroglancer_gen_time"] = t_gen_ng
+        results["neuroglancer_size_raw"] = ng_size
+        results["neuroglancer_dir"] = ng_dir
 
-    print(f"  {n_feat_ng} features in {_fmt_time(t_gen_ng)}")
-    print(f"  Size: {_fmt_bytes(ng_size)} raw")
+        print(f"  {n_feat_ng} features in {_fmt_time(t_gen_ng)}")
+        print(f"  Size: {_fmt_bytes(ng_size)} raw")
 
     # --- parquet ---
     from mudm_tools.tiling3d.parquet_writer import generate_parquet as _gen_pq
@@ -938,7 +952,7 @@ def main() -> None:
         body_ids = [n["bodyId"] for n in neurons]
         print(f"\nDownloading {len(body_ids)} neuron meshes...")
         t0 = time.perf_counter()
-        downloaded = download_meshes(body_ids, mesh_dir)
+        downloaded = download_meshes(body_ids, mesh_dir, workers=args.workers)
         dl_time = time.perf_counter() - t0
         print(f"  Download time: {_fmt_time(dl_time)}")
 

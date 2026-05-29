@@ -170,7 +170,8 @@ class ParquetCellDataset(Dataset):
             tags_val = table.column("tags")[i].as_py()
             if tags_val is None:
                 continue
-            cell_type = tags_val.get("cell_type")
+            tags_dict = dict(tags_val) if isinstance(tags_val, list) else tags_val
+            cell_type = tags_dict.get("cell_type")
             if cell_type is None or cell_type not in label_map:
                 continue
 
@@ -327,6 +328,7 @@ def _train_and_evaluate(
     batch_size: int,
     lr: float = 1e-3,
     patience: int = 10,
+    num_workers: int = 0,
     device: torch.device | None = None,
 ) -> dict:
     """Train PointNet-2D and return metrics dict."""
@@ -335,13 +337,13 @@ def _train_and_evaluate(
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     train_loader = DataLoader(
-        train_dataset, batch_size=batch_size, shuffle=True, num_workers=0,
+        train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers, persistent_workers=num_workers > 0,
     )
     val_loader = DataLoader(
-        val_dataset, batch_size=batch_size, shuffle=False, num_workers=0,
+        val_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, persistent_workers=num_workers > 0,
     )
     test_loader = DataLoader(
-        test_dataset, batch_size=batch_size, shuffle=False, num_workers=0,
+        test_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, persistent_workers=num_workers > 0,
     )
 
     # Time to first batch
@@ -472,12 +474,14 @@ def _build_label_map_and_splits(
     geojson_dir: Path,
     min_instances: int = 5,
     seed: int = 42,
+    label_names: set[str] | None = None,
 ) -> tuple[dict[str, int], list[int], list[int], list[int], list[int]]:
     """Build label map and 80/10/10 stratified splits.
 
     Returns:
         (label_map, all_fids, train_fids, val_fids, test_fids)
     """
+    names = label_names if label_names is not None else set(LABEL_NAMES)
     gj_files = sorted(geojson_dir.glob("*.geojson"))
 
     # Collect all features with global feature IDs
@@ -488,7 +492,7 @@ def _build_label_map_and_splits(
         data = json.loads(gj_path.read_text())
         for feat in data.get("features", []):
             ct = feat.get("properties", {}).get("cell_type")
-            if ct and ct in LABEL_NAMES:
+            if ct and ct in names:
                 fid_to_type[global_fid] = ct
             global_fid += 1
 
@@ -528,13 +532,14 @@ def run_benchmark(args: argparse.Namespace) -> dict:
     parquet_path = Path(args.parquet_path)
     geojson_dir = Path(args.geojson_dir)
     seed = args.seed
+    label_names = {s.strip() for s in args.label_names.split(",") if s.strip()}
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
     # Build label map and splits
     label_map, all_fids, train_fids, val_fids, test_fids = _build_label_map_and_splits(
-        geojson_dir, min_instances=5, seed=seed,
+        geojson_dir, min_instances=5, seed=seed, label_names=label_names,
     )
     num_classes = len(label_map)
     print(f"Classes: {num_classes} — {list(label_map.keys())}")
@@ -582,7 +587,8 @@ def run_benchmark(args: argparse.Namespace) -> dict:
         torch.manual_seed(seed)
         parquet_metrics = _train_and_evaluate(
             train_pq, val_pq, test_pq, num_classes,
-            epochs=args.epochs, batch_size=args.batch_size, device=device,
+            epochs=args.epochs, batch_size=args.batch_size,
+            num_workers=args.num_workers, device=device,
         )
         parquet_metrics["dataset_load_time_s"] = round(load_time, 4)
 
@@ -617,7 +623,8 @@ def run_benchmark(args: argparse.Namespace) -> dict:
     torch.manual_seed(seed)
     geojson_metrics = _train_and_evaluate(
         train_gj, val_gj, test_gj, num_classes,
-        epochs=args.epochs, batch_size=args.batch_size, device=device,
+        epochs=args.epochs, batch_size=args.batch_size,
+        num_workers=args.num_workers, device=device,
     )
     geojson_metrics["dataset_load_time_s"] = round(load_time, 4)
 
@@ -628,8 +635,7 @@ def run_benchmark(args: argparse.Namespace) -> dict:
     )
 
     results = {
-        "dataset": "CoNSeP",
-        "reference": "Graham et al., Medical Image Analysis 2019",
+        "dataset": args.dataset,
         "num_cells": len(all_fids),
         "num_classes": num_classes,
         "class_names": list(label_map.keys()),
@@ -663,10 +669,20 @@ def main() -> None:
         default="data/consep/geojson",
         help="Path to directory of GeoJSON files",
     )
+    parser.add_argument(
+        "--label-names", type=str,
+        default="inflammatory,epithelial,dysplastic_malignant,fibroblast,muscle,endothelial",
+        help="Comma-separated cell-type names to classify (dataset-specific)",
+    )
+    parser.add_argument("--dataset", type=str, default="CoNSeP", help="Dataset name for output")
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--n-points", type=int, default=64)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--num-workers", type=int, default=0,
+        help="DataLoader workers (applied to both loaders; comparison stays fair)",
+    )
     parser.add_argument(
         "--output", type=str,
         default="results/consep_ml_benchmark.json",
