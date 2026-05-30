@@ -766,6 +766,158 @@ class TestParquetStreamingAPI:
         with pytest.raises(RuntimeError):
             gen._next_parquet_batch(100, WORLD_BOUNDS)
 
+    # --- Parallel batch read equivalence ---
+
+    @staticmethod
+    def _canonical_rows(rows):
+        """Sort rows on the 5-key canonical order for order-insensitive compare."""
+        return sorted(
+            rows,
+            key=lambda r: (
+                r["zoom"], r["tile_x"], r["tile_y"], r["tile_d"], r["feature_id"]
+            ),
+        )
+
+    @staticmethod
+    def _multi_shard_features():
+        """A multi-feature fixture spread across many tiles (multiple shards)."""
+        feats = []
+        # Several dense TINs placed in different regions of [0,1]^3 so they
+        # land in distinct tiles across zoom levels -> multiple shards/tiles.
+        for i in range(6):
+            base = 0.1 + 0.12 * i
+            xy = []
+            z = []
+            ring_lengths = []
+            for j in range(8):
+                cx = base + 0.01 * j
+                cy = 0.15 + 0.09 * i + 0.005 * j
+                cz = 0.2 + 0.08 * ((i + j) % 5)
+                d = 0.02
+                xy.extend([cx - d, cy - d, cx + d, cy - d, cx, cy + d])
+                z.extend([cz - d, cz + d, cz])
+                ring_lengths.append(3)
+            feats.append(
+                _make_tin_feature(xy, z, ring_lengths, tags={"name": f"f{i}"})
+            )
+        return feats
+
+    @pytest.mark.parametrize("partitioned", [False, True])
+    def test_parallel_batch_matches_serial(self, tmp_path, partitioned):
+        """parallel=True produces byte-identical positions/indices (mod row order)."""
+        feats = self._multi_shard_features()
+
+        gen_s, _ = _build_generator_with_features(feats, min_zoom=0, max_zoom=2)
+        gen_p, _ = _build_generator_with_features(feats, min_zoom=0, max_zoom=2)
+
+        out_s = tmp_path / ("serial_dir" if partitioned else "serial.parquet")
+        out_p = tmp_path / ("parallel_dir" if partitioned else "parallel.parquet")
+
+        n_s = generate_parquet(
+            gen_s, out_s, WORLD_BOUNDS,
+            partitioned=partitioned, batch_size=4, parallel=False,
+        )
+        n_p = generate_parquet(
+            gen_p, out_p, WORLD_BOUNDS,
+            partitioned=partitioned, batch_size=4, parallel=True,
+        )
+
+        assert n_s == n_p
+        assert n_s > 0  # fixture must actually produce rows
+
+        rows_s = self._canonical_rows(read_parquet(out_s))
+        rows_p = self._canonical_rows(read_parquet(out_p))
+
+        assert len(rows_s) == len(rows_p)
+        # Must exercise multiple tiles to be a meaningful crux test.
+        assert len({(r["zoom"], r["tile_x"], r["tile_y"], r["tile_d"]) for r in rows_s}) > 1
+
+        for rs, rp in zip(rows_s, rows_p):
+            assert rs["zoom"] == rp["zoom"]
+            assert rs["tile_x"] == rp["tile_x"]
+            assert rs["tile_y"] == rp["tile_y"]
+            assert rs["tile_d"] == rp["tile_d"]
+            assert rs["feature_id"] == rp["feature_id"]
+            np.testing.assert_array_equal(rs["positions"], rp["positions"])
+            np.testing.assert_array_equal(rs["indices"], rp["indices"])
+
+    def test_parallel_empty(self, tmp_path):
+        """Empty generator -> both paths produce empty, equal output."""
+        gen_s, _ = _build_generator_with_features([], min_zoom=0, max_zoom=1)
+        gen_p, _ = _build_generator_with_features([], min_zoom=0, max_zoom=1)
+
+        out_s = tmp_path / "empty_serial.parquet"
+        out_p = tmp_path / "empty_parallel.parquet"
+
+        n_s = generate_parquet(gen_s, out_s, WORLD_BOUNDS, parallel=False)
+        n_p = generate_parquet(gen_p, out_p, WORLD_BOUNDS, parallel=True)
+
+        assert n_s == 0
+        assert n_p == 0
+        assert read_parquet(out_s) == []
+        assert read_parquet(out_p) == []
+
+    def test_parallel_single_shard(self, tmp_path):
+        """A single small feature (one shard) matches between serial and parallel."""
+        feats = [
+            _make_tin_feature(
+                [0.1, 0.2, 0.3, 0.4, 0.5, 0.6],
+                [0.1, 0.2, 0.3],
+                [3],
+                tags={"name": "single"},
+            ),
+        ]
+        gen_s, _ = _build_generator_with_features(feats, min_zoom=0, max_zoom=1)
+        gen_p, _ = _build_generator_with_features(feats, min_zoom=0, max_zoom=1)
+
+        out_s = tmp_path / "one_serial.parquet"
+        out_p = tmp_path / "one_parallel.parquet"
+
+        n_s = generate_parquet(gen_s, out_s, WORLD_BOUNDS, parallel=False)
+        n_p = generate_parquet(gen_p, out_p, WORLD_BOUNDS, parallel=True)
+
+        assert n_s == n_p
+        assert n_s > 0
+
+        rows_s = self._canonical_rows(read_parquet(out_s))
+        rows_p = self._canonical_rows(read_parquet(out_p))
+        assert len(rows_s) == len(rows_p)
+        for rs, rp in zip(rows_s, rows_p):
+            np.testing.assert_array_equal(rs["positions"], rp["positions"])
+            np.testing.assert_array_equal(rs["indices"], rp["indices"])
+
+    def test_parallel_io_threads_one_equals_serial(self, tmp_path):
+        """MUDM_IO_THREADS=1 (serial fallback inside the parallel path) matches serial."""
+        import os
+
+        feats = self._multi_shard_features()
+
+        gen_s, _ = _build_generator_with_features(feats, min_zoom=0, max_zoom=2)
+        out_s = tmp_path / "ser.parquet"
+        n_s = generate_parquet(gen_s, out_s, WORLD_BOUNDS, batch_size=4, parallel=False)
+
+        prev = os.environ.get("MUDM_IO_THREADS")
+        os.environ["MUDM_IO_THREADS"] = "1"
+        try:
+            gen_p, _ = _build_generator_with_features(feats, min_zoom=0, max_zoom=2)
+            out_p = tmp_path / "par.parquet"
+            n_p = generate_parquet(gen_p, out_p, WORLD_BOUNDS, batch_size=4, parallel=True)
+        finally:
+            if prev is None:
+                os.environ.pop("MUDM_IO_THREADS", None)
+            else:
+                os.environ["MUDM_IO_THREADS"] = prev
+
+        assert n_s == n_p
+        assert n_s > 0
+
+        rows_s = self._canonical_rows(read_parquet(out_s))
+        rows_p = self._canonical_rows(read_parquet(out_p))
+        assert len(rows_s) == len(rows_p)
+        for rs, rp in zip(rows_s, rows_p):
+            np.testing.assert_array_equal(rs["positions"], rp["positions"])
+            np.testing.assert_array_equal(rs["indices"], rp["indices"])
+
 
 # ---------------------------------------------------------------------------
 # Prime / Deprime tests
@@ -983,9 +1135,14 @@ class TestParquetFileSplitting:
         features = [_make_dense_tin_feature(50)]
         gen, _ = _build_generator_with_features(features, min_zoom=0, max_zoom=2)
         out_dir = tmp_path / "split"
+        # Writer-rotation test: pin parallel=False so the reader yields fine-grained
+        # batch_size-driven batches (many write() calls -> rotation). The parallel
+        # reader chunks by max_batch_bytes (coarse byte-budget batches), which yields
+        # the same rows but different part-file split points.
         generate_parquet(
             gen, out_dir, WORLD_BOUNDS,
             partitioned=True, batch_size=5, max_file_bytes=1,  # 1 byte → always rotate
+            parallel=False,
         )
 
         # At least one zoom level should have >1 part file
@@ -1003,6 +1160,7 @@ class TestParquetFileSplitting:
         generate_parquet(
             gen, out_dir, WORLD_BOUNDS,
             partitioned=True, batch_size=5, max_file_bytes=1,
+            parallel=False,  # writer-rotation test; see test_rotation_creates_multiple_parts
         )
 
         import re

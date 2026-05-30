@@ -2383,6 +2383,148 @@ fn parquet_tin_direct(
     (positions, indices)
 }
 
+/// Build the 9-column (+`row_count`) Python dict for one Parquet batch.
+///
+/// Factored out of `_next_parquet_batch` so the serial and parallel batch
+/// methods emit a byte-identical column layout. Callers run `collect_parquet_rows`
+/// (GIL-released) first, then call this with the GIL held to materialise the dict.
+fn build_batch_dict(
+    py: Python<'_>,
+    rows: &[ParquetRow],
+    tags_registry: &HashMap<u32, Vec<(String, TagValue)>>,
+) -> PyResult<PyObject> {
+    let n = rows.len();
+
+    let zoom_list = pyo3::types::PyList::empty(py);
+    let tx_list = pyo3::types::PyList::empty(py);
+    let ty_list = pyo3::types::PyList::empty(py);
+    let td_list = pyo3::types::PyList::empty(py);
+    let fid_list = pyo3::types::PyList::empty(py);
+    let gt_list = pyo3::types::PyList::empty(py);
+    let pos_list = pyo3::types::PyList::empty(py);
+    let idx_list = pyo3::types::PyList::empty(py);
+    let tags_list = pyo3::types::PyList::empty(py);
+
+    for row in rows {
+        zoom_list.append(row.zoom)?;
+        tx_list.append(row.tile_x)?;
+        ty_list.append(row.tile_y)?;
+        td_list.append(row.tile_d)?;
+        fid_list.append(row.feature_id)?;
+        gt_list.append(row.geom_type)?;
+        pos_list.append(pyo3::types::PyBytes::new(py, &row.positions))?;
+        idx_list.append(pyo3::types::PyBytes::new(py, &row.indices))?;
+
+        let tag_pairs = pyo3::types::PyList::empty(py);
+        if let Some(tags) = tags_registry.get(&row.feature_id) {
+            for (k, v) in tags {
+                let vs = match v {
+                    TagValue::Str(s) => s.clone(),
+                    TagValue::Int(i) => i.to_string(),
+                    TagValue::Float(f) => f.to_string(),
+                    TagValue::Bool(b) => b.to_string(),
+                };
+                tag_pairs.append((k.as_str(), vs.as_str()))?;
+            }
+        }
+        tags_list.append(tag_pairs)?;
+    }
+
+    let dict = pyo3::types::PyDict::new(py);
+    dict.set_item("zoom", zoom_list)?;
+    dict.set_item("tile_x", tx_list)?;
+    dict.set_item("tile_y", ty_list)?;
+    dict.set_item("tile_d", td_list)?;
+    dict.set_item("feature_id", fid_list)?;
+    dict.set_item("geom_type", gt_list)?;
+    dict.set_item("positions", pos_list)?;
+    dict.set_item("indices", idx_list)?;
+    dict.set_item("tags", tags_list)?;
+    dict.set_item("row_count", n)?;
+
+    Ok(dict.into())
+}
+
+/// Build an Arrow `RecordBatch` for one Parquet batch ENTIRELY in Rust — no GIL,
+/// no per-row Python calls, and `positions`/`indices` written straight into Arrow
+/// `LargeBinary` buffers (eliminating the `PyBytes` + `pa.array(list)` copies of
+/// the dict bridge). Schema matches the Python `_parquet_schema()`: zoom u8,
+/// tile_x/y/d u16, feature_id u32, geom_type u8, positions/indices LargeBinary,
+/// tags Map(entries{key:utf8, value:utf8}). Map child field names are
+/// `entries/key/value` to match pyarrow's `pa.map_(utf8,utf8)` default (NOT
+/// arrow-rs's `entries/keys/values`). Tag stringification is identical to
+/// `build_batch_dict`, so output is byte-identical modulo row order.
+fn build_batch_recordbatch(
+    rows: &[ParquetRow],
+    tags_registry: &HashMap<u32, Vec<(String, TagValue)>>,
+) -> Result<arrow::record_batch::RecordBatch, String> {
+    use arrow::array::*;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use std::sync::Arc;
+
+    let zoom: UInt8Array = rows.iter().map(|r| Some(r.zoom)).collect();
+    let tile_x: UInt16Array = rows.iter().map(|r| Some(r.tile_x)).collect();
+    let tile_y: UInt16Array = rows.iter().map(|r| Some(r.tile_y)).collect();
+    let tile_d: UInt16Array = rows.iter().map(|r| Some(r.tile_d)).collect();
+    let feature_id: UInt32Array = rows.iter().map(|r| Some(r.feature_id)).collect();
+    let geom_type: UInt8Array = rows.iter().map(|r| Some(r.geom_type)).collect();
+    let positions: LargeBinaryArray = rows.iter().map(|r| Some(r.positions.as_slice())).collect();
+    let indices: LargeBinaryArray = rows.iter().map(|r| Some(r.indices.as_slice())).collect();
+
+    // Map child field names matching pyarrow's default (entries/key/value).
+    let field_names = MapFieldNames {
+        entry: "entries".to_string(),
+        key: "key".to_string(),
+        value: "value".to_string(),
+    };
+    let mut map_builder =
+        MapBuilder::new(Some(field_names), StringBuilder::new(), StringBuilder::new());
+    for row in rows {
+        if let Some(tags) = tags_registry.get(&row.feature_id) {
+            for (k, v) in tags {
+                map_builder.keys().append_value(k);
+                match v {
+                    TagValue::Str(s) => map_builder.values().append_value(s),
+                    TagValue::Int(i) => map_builder.values().append_value(i.to_string()),
+                    TagValue::Float(f) => map_builder.values().append_value(f.to_string()),
+                    TagValue::Bool(b) => map_builder.values().append_value(b.to_string()),
+                }
+            }
+        }
+        map_builder.append(true).map_err(|e| format!("map build: {}", e))?;
+    }
+    let tags_arr = map_builder.finish();
+
+    // Fields nullable=true to match pyarrow `pa.field` defaults; arrays are
+    // non-null which is valid under nullable fields. tags DataType is taken
+    // from the built array so schema and array always agree.
+    let schema = Schema::new(vec![
+        Field::new("zoom", DataType::UInt8, true),
+        Field::new("tile_x", DataType::UInt16, true),
+        Field::new("tile_y", DataType::UInt16, true),
+        Field::new("tile_d", DataType::UInt16, true),
+        Field::new("feature_id", DataType::UInt32, true),
+        Field::new("geom_type", DataType::UInt8, true),
+        Field::new("positions", DataType::LargeBinary, true),
+        Field::new("indices", DataType::LargeBinary, true),
+        Field::new("tags", tags_arr.data_type().clone(), true),
+    ]);
+
+    let columns: Vec<ArrayRef> = vec![
+        Arc::new(zoom),
+        Arc::new(tile_x),
+        Arc::new(tile_y),
+        Arc::new(tile_d),
+        Arc::new(feature_id),
+        Arc::new(geom_type),
+        Arc::new(positions),
+        Arc::new(indices),
+        Arc::new(tags_arr),
+    ];
+    arrow::record_batch::RecordBatch::try_new(Arc::new(schema), columns)
+        .map_err(|e| format!("RecordBatch: {}", e))
+}
+
 // ---------------------------------------------------------------------------
 // PyO3 helpers: extract features and tags from Python dicts
 // ---------------------------------------------------------------------------
@@ -2505,6 +2647,32 @@ pub struct StreamingTileGenerator {
     tiles_written: u32,
     fragment_reader: Option<Fragment3DReader>,
     parquet_stream_active: bool,
+    /// Sorted snapshot of shard paths for the parallel read path.
+    /// Populated by `_init_parquet_stream`; empty until then.
+    shard_paths_snapshot: Vec<PathBuf>,
+    /// Cursor into `shard_paths_snapshot` for the chunked parallel reader.
+    parallel_shard_cursor: usize,
+    /// I/O concurrency for the parallel read path. 0 == use the global rayon
+    /// pool; 1 == serial; N>1 == a scoped pool of N threads. Auto-detected at
+    /// construction via `detect_io_threads()`; the Python layer may override
+    /// it with `_set_io_threads`.
+    io_threads: usize,
+}
+
+/// Detect the default I/O concurrency for the parallel read path.
+///
+/// Honors the `MUDM_IO_THREADS` env override (an explicit `1` selects the
+/// serial fallback); otherwise uses `available_parallelism()`, falling back to
+/// 8 when the platform can't report it.
+fn detect_io_threads() -> usize {
+    if let Ok(v) = std::env::var("MUDM_IO_THREADS") {
+        if let Ok(n) = v.parse::<usize>() {
+            return n; // 1 == serial fallback
+        }
+    }
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(8)
 }
 
 #[pymethods]
@@ -2563,6 +2731,9 @@ impl StreamingTileGenerator {
             tiles_written: 0,
             fragment_reader: None,
             parquet_stream_active: false,
+            shard_paths_snapshot: Vec::new(),
+            parallel_shard_cursor: 0,
+            io_threads: detect_io_threads(),
         })
     }
 
@@ -2912,6 +3083,16 @@ impl StreamingTileGenerator {
     // Streaming Parquet batch API — O(batch_size) memory
     // ------------------------------------------------------------------
 
+    /// Override the I/O concurrency used by the parallel read path.
+    ///
+    /// `n == 0` means "use the global rayon pool"; `n == 1` means serial;
+    /// `n > 1` sizes a scoped pool to `n` threads. Stored as-is so the caller
+    /// (the Python layer in Task 5) keeps full control; `0` is the documented
+    /// "global pool" sentinel rather than a "use detect default" request.
+    fn _set_io_threads(&mut self, n: usize) {
+        self.io_threads = n;
+    }
+
     /// Initialize the streaming Parquet iterator.
     ///
     /// Flushes the fragment writer and opens a Fragment3DReader for sequential
@@ -2929,11 +3110,24 @@ impl StreamingTileGenerator {
                 .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
         }
 
-        // Open reader
+        // Open reader (serial fallback — unchanged)
         let reader = Fragment3DReader::open_dir(&self.frag_dir)
             .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
         self.fragment_reader = Some(reader);
         self.parquet_stream_active = true;
+
+        // Snapshot the sorted shard paths for the parallel read path. Mirrors
+        // the discovery + lexical sort in `Fragment3DReader::open_dir` so both
+        // paths visit shards in the same order.
+        let mut snapshot: Vec<PathBuf> = std::fs::read_dir(&self.frag_dir)
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().map_or(false, |ext| ext == "mjf"))
+            .collect();
+        snapshot.sort(); // deterministic order — same lexical sort as open_dir
+        self.shard_paths_snapshot = snapshot;
+        self.parallel_shard_cursor = 0;
 
         Ok(())
     }
@@ -2996,57 +3190,165 @@ impl StreamingTileGenerator {
         });
 
         // Build Python dict (same format as _collect_parquet_data)
-        let tags_ref = &self.tags_registry;
-        let n = rows.len();
+        Ok(Some(build_batch_dict(py, &rows, &self.tags_registry)?))
+    }
 
-        let zoom_list = pyo3::types::PyList::empty(py);
-        let tx_list = pyo3::types::PyList::empty(py);
-        let ty_list = pyo3::types::PyList::empty(py);
-        let td_list = pyo3::types::PyList::empty(py);
-        let fid_list = pyo3::types::PyList::empty(py);
-        let gt_list = pyo3::types::PyList::empty(py);
-        let pos_list = pyo3::types::PyList::empty(py);
-        let idx_list = pyo3::types::PyList::empty(py);
-        let tags_list = pyo3::types::PyList::empty(py);
-
-        for row in &rows {
-            zoom_list.append(row.zoom)?;
-            tx_list.append(row.tile_x)?;
-            ty_list.append(row.tile_y)?;
-            td_list.append(row.tile_d)?;
-            fid_list.append(row.feature_id)?;
-            gt_list.append(row.geom_type)?;
-            pos_list.append(pyo3::types::PyBytes::new(py, &row.positions))?;
-            idx_list.append(pyo3::types::PyBytes::new(py, &row.indices))?;
-
-            let tag_pairs = pyo3::types::PyList::empty(py);
-            if let Some(tags) = tags_ref.get(&row.feature_id) {
-                for (k, v) in tags {
-                    let vs = match v {
-                        TagValue::Str(s) => s.clone(),
-                        TagValue::Int(i) => i.to_string(),
-                        TagValue::Float(f) => f.to_string(),
-                        TagValue::Bool(b) => b.to_string(),
-                    };
-                    tag_pairs.append((k.as_str(), vs.as_str()))?;
-                }
-            }
-            tags_list.append(tag_pairs)?;
+    /// Parallel sibling of `_next_parquet_batch` (same signature + behaviour
+    /// contract; output equals serial modulo row order).
+    ///
+    /// Instead of reading one shard at a time through a single decoder, this
+    /// chunks the snapshotted shard paths (`shard_paths_snapshot`, taken in
+    /// `_init_parquet_stream`) by estimated uncompressed bytes and reads each
+    /// chunk via `Fragment3DReader::read_all_grouped_parallel` (par_iter +
+    /// DashMap merge). The `collect_parquet_rows` transform is byte-identical to
+    /// the serial path; each tile's `Vec` is sorted by `feature_id` first to
+    /// remove the only theoretical (tile, feature_id) ordering ambiguity.
+    ///
+    /// `io_threads` is read from `self.io_threads` (NOT an argument). EOF returns
+    /// `Ok(None)`. Empty chunks are skipped iteratively (no recursion).
+    ///
+    /// Memory: O(chunk) — peak ≈ `max_batch_bytes` uncompressed plus the row
+    /// staging for one chunk, independent of the total dataset size.
+    #[pyo3(signature = (batch_size, world_bounds, max_batch_bytes=2_000_000_000))]
+    fn _next_parquet_batch_parallel(
+        &mut self,
+        py: Python<'_>,
+        batch_size: usize,
+        world_bounds: (f64, f64, f64, f64, f64, f64),
+        max_batch_bytes: usize,
+    ) -> PyResult<Option<PyObject>> {
+        let _ = batch_size; // chunking is byte-budget driven; arg kept for signature parity
+        if !self.parquet_stream_active {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "Parquet stream not active — call _init_parquet_stream() first",
+            ));
         }
 
-        let dict = pyo3::types::PyDict::new(py);
-        dict.set_item("zoom", zoom_list)?;
-        dict.set_item("tile_x", tx_list)?;
-        dict.set_item("tile_y", ty_list)?;
-        dict.set_item("tile_d", td_list)?;
-        dict.set_item("feature_id", fid_list)?;
-        dict.set_item("geom_type", gt_list)?;
-        dict.set_item("positions", pos_list)?;
-        dict.set_item("indices", idx_list)?;
-        dict.set_item("tags", tags_list)?;
-        dict.set_item("row_count", n)?;
+        let wb = world_bounds;
+        let max_zoom = self.max_zoom;
+        let base_cells = self.base_cells;
+        let io_threads = self.io_threads;
 
-        Ok(Some(dict.into()))
+        // Iterative loop to skip chunks that produce zero rows (no recursion).
+        loop {
+            let start = self.parallel_shard_cursor;
+            let total = self.shard_paths_snapshot.len();
+            if start >= total {
+                return Ok(None); // EOF
+            }
+
+            // Accumulate shard paths until the estimated uncompressed bytes
+            // (disk size × 3 — the same ZSTD ratio used elsewhere) reach the
+            // budget. Always take at least one shard so we make progress.
+            let mut end = start;
+            let mut est = 0usize;
+            while end < total && (end == start || est < max_batch_bytes) {
+                est += std::fs::metadata(&self.shard_paths_snapshot[end])
+                    .map(|m| m.len() as usize * 3)
+                    .unwrap_or(0);
+                end += 1;
+            }
+            let chunk: Vec<PathBuf> = self.shard_paths_snapshot[start..end].to_vec();
+            self.parallel_shard_cursor = end;
+
+            // GIL-released: parallel shard read + the (unchanged) transform.
+            // Shard-read errors are propagated (matching the serial path's `?`),
+            // NOT swallowed — a failed/corrupt shard must surface, never be
+            // silently skipped with the cursor advancing past it (data loss).
+            let rows = py
+                .allow_threads(|| -> std::io::Result<Vec<ParquetRow>> {
+                    let reader = Fragment3DReader::from_paths(chunk);
+                    let groups = reader.read_all_grouped_parallel(io_threads, true)?;
+                    // Determinism belt-and-suspenders: sort each tile's Vec by
+                    // feature_id before the transform (cheap, deterministic).
+                    let mut tiles: Vec<((u32, u32, u32, u32), Vec<Fragment3D>)> =
+                        groups.into_iter().collect();
+                    for (_k, v) in tiles.iter_mut() {
+                        v.sort_by_key(|f| f.feature_id);
+                    }
+                    Ok(collect_parquet_rows(&tiles, &wb, max_zoom, base_cells))
+                })
+                .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
+
+            // Skip empty chunks while shards remain; otherwise emit the batch.
+            if rows.is_empty() {
+                continue;
+            }
+
+            // Build the SAME 9-column dict as the serial path (GIL held).
+            return Ok(Some(build_batch_dict(py, &rows, &self.tags_registry)?));
+        }
+    }
+
+    /// Like `_next_parquet_batch_parallel`, but builds the Arrow `RecordBatch`
+    /// in Rust (GIL-released) and returns it via the Arrow C-Data interface —
+    /// eliminating the GIL-held per-row `build_batch_dict` (PyList/PyBytes) and
+    /// the Python-side `_dict_to_record_batch` (`pa.array(list(...))`) copies.
+    /// Output is byte-identical modulo within-tile row order to the dict path.
+    #[pyo3(signature = (batch_size, world_bounds, max_batch_bytes=2_000_000_000))]
+    fn _next_parquet_batch_arrow(
+        &mut self,
+        py: Python<'_>,
+        batch_size: usize,
+        world_bounds: (f64, f64, f64, f64, f64, f64),
+        max_batch_bytes: usize,
+    ) -> PyResult<Option<arrow::pyarrow::PyArrowType<arrow::record_batch::RecordBatch>>> {
+        let _ = batch_size; // chunking is byte-budget driven; arg kept for signature parity
+        if !self.parquet_stream_active {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "Parquet stream not active — call _init_parquet_stream() first",
+            ));
+        }
+
+        let wb = world_bounds;
+        let max_zoom = self.max_zoom;
+        let base_cells = self.base_cells;
+        let io_threads = self.io_threads;
+
+        loop {
+            let start = self.parallel_shard_cursor;
+            let total = self.shard_paths_snapshot.len();
+            if start >= total {
+                return Ok(None); // EOF
+            }
+
+            let mut end = start;
+            let mut est = 0usize;
+            while end < total && (end == start || est < max_batch_bytes) {
+                est += std::fs::metadata(&self.shard_paths_snapshot[end])
+                    .map(|m| m.len() as usize * 3)
+                    .unwrap_or(0);
+                end += 1;
+            }
+            let chunk: Vec<PathBuf> = self.shard_paths_snapshot[start..end].to_vec();
+            self.parallel_shard_cursor = end;
+
+            let tags = &self.tags_registry;
+            // Everything (read + transform + RecordBatch build) is GIL-released.
+            let batch = py
+                .allow_threads(|| -> Result<Option<arrow::record_batch::RecordBatch>, String> {
+                    let reader = Fragment3DReader::from_paths(chunk);
+                    let groups = reader
+                        .read_all_grouped_parallel(io_threads, true)
+                        .map_err(|e| e.to_string())?;
+                    let mut tiles: Vec<((u32, u32, u32, u32), Vec<Fragment3D>)> =
+                        groups.into_iter().collect();
+                    for (_k, v) in tiles.iter_mut() {
+                        v.sort_by_key(|f| f.feature_id);
+                    }
+                    let rows = collect_parquet_rows(&tiles, &wb, max_zoom, base_cells);
+                    if rows.is_empty() {
+                        return Ok(None);
+                    }
+                    Ok(Some(build_batch_recordbatch(&rows, tags)?))
+                })
+                .map_err(|e| pyo3::exceptions::PyIOError::new_err(e))?;
+
+            match batch {
+                None => continue, // empty chunk — skip while shards remain
+                Some(b) => return Ok(Some(arrow::pyarrow::PyArrowType(b))),
+            }
+        }
     }
 
     /// Close the streaming Parquet iterator and release resources.

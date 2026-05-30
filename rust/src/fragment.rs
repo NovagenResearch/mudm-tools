@@ -198,6 +198,60 @@ impl ShardReader3D {
     }
 }
 
+/// Best-effort OS prefetch hint for a shard file.
+///
+/// Additive, non-load-bearing readahead to overlap open()+decode. Hints are
+/// best-effort and silently ignored on filesystems that don't support them.
+/// On Linux, uses `posix_fadvise(SEQUENTIAL|WILLNEED)`; elsewhere, an
+/// `mmap` + `madvise(WILLNEED)`. The handle is dropped immediately after the
+/// hint is issued — the kernel hint persists past close.
+#[cfg(target_os = "linux")]
+fn prefetch_advise(path: &Path) {
+    use std::os::unix::io::AsRawFd;
+    if let Ok(f) = File::open(path) {
+        let fd = f.as_raw_fd();
+        // best-effort; ignore errors. (0, 0) = whole file.
+        unsafe {
+            libc::posix_fadvise(fd, 0, 0, libc::POSIX_FADV_SEQUENTIAL);
+            libc::posix_fadvise(fd, 0, 0, libc::POSIX_FADV_WILLNEED);
+        }
+        // f drops here; hint persists in the kernel after close.
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn prefetch_advise(path: &Path) {
+    if let Ok(f) = File::open(path) {
+        // Safety: file is opened read-only and the mapping is not aliased
+        // mutably; we only issue an advisory hint and drop the mapping.
+        if let Ok(m) = unsafe { memmap2::Mmap::map(&f) } {
+            let _ = m.advise(memmap2::Advice::WillNeed); // best-effort
+        }
+    }
+}
+
+/// Parse one shard into a tile-keyed local map.
+///
+/// Uses the same byte loop as `ShardReader3D::read_next`. Each call opens its
+/// OWN `ShardReader3D` (which is `!Sync`) so it is safe to invoke from many
+/// rayon workers concurrently — no decoder is ever shared across threads.
+fn parse_shard_grouped(
+    path: &Path,
+    fadvise: bool,
+) -> io::Result<ahash::AHashMap<(u32, u32, u32, u32), Vec<Fragment3D>>> {
+    use ahash::AHashMap;
+    if fadvise {
+        prefetch_advise(path);
+    }
+    let mut reader = ShardReader3D::open(path)?; // each worker owns its own decoder
+    let mut local: AHashMap<(u32, u32, u32, u32), Vec<Fragment3D>> = AHashMap::new();
+    while let Some(frag) = reader.read_next()? {
+        let key = (frag.tile_z, frag.tile_x, frag.tile_y, frag.tile_d);
+        local.entry(key).or_default().push(frag);
+    }
+    Ok(local)
+}
+
 /// Fragment3D reader — reads 3D fragments from one or more ZSTD-compressed shard files.
 ///
 /// Transparently iterates through all shards in order.
@@ -298,6 +352,160 @@ impl Fragment3DReader {
             self.current_shard = None;
         }
         Ok(())
+    }
+
+    /// Build a reader from an explicit list of shard paths WITHOUT opening any
+    /// shard up front (lazy). The serial cursor starts at the beginning; the
+    /// parallel read methods read only `self.paths` and never touch the cursor.
+    ///
+    /// Used by the chunked parallel Parquet path to construct a reader over a
+    /// slice of the shard snapshot.
+    pub fn from_paths(paths: Vec<PathBuf>) -> Self {
+        Self {
+            paths,
+            current_shard: None,
+            current_index: 0,
+        }
+    }
+
+    /// Parallel sibling of `read_all_grouped`.
+    ///
+    /// Reads ONLY the immutable `self.paths` slice — never touches
+    /// `current_shard`/`current_index`. Each rayon worker opens its own
+    /// `ShardReader3D` (which is `!Sync`) via `parse_shard_grouped`, builds a
+    /// thread-local `AHashMap`, then bulk-merges into a shared `DashMap`
+    /// (mirroring `read_group_simplify_encode` at `streaming.rs:2018-2054`).
+    ///
+    /// Output equals the serial `read_all_grouped` as a multiset (same key set;
+    /// per key the same multiset of fragments), modulo non-deterministic order.
+    ///
+    /// Per-shard errors are collected and surfaced as an `Err` (the serial path
+    /// propagates via `?`; this matches that contract — errors are NOT swallowed).
+    ///
+    /// `io_threads == 0` uses the global rayon pool; `io_threads > 0` sizes a
+    /// scoped pool to that count (the measured I/O knee, not nproc).
+    pub fn read_all_grouped_parallel(
+        &self,
+        io_threads: usize,
+        fadvise: bool,
+    ) -> io::Result<ahash::AHashMap<(u32, u32, u32, u32), Vec<Fragment3D>>> {
+        use dashmap::DashMap;
+        use std::sync::Mutex;
+        if self.paths.is_empty() {
+            return Ok(ahash::AHashMap::new());
+        }
+        let groups: DashMap<(u32, u32, u32, u32), Vec<Fragment3D>> = DashMap::new();
+        let errors: Mutex<Vec<String>> = Mutex::new(Vec::new());
+        let run = || {
+            use rayon::prelude::*;
+            self.paths.par_iter().with_min_len(1).for_each(|p| {
+                match parse_shard_grouped(p, fadvise) {
+                    Ok(local) => {
+                        for (k, mut v) in local {
+                            groups.entry(k).or_default().extend(v.drain(..));
+                        }
+                    }
+                    Err(e) => {
+                        errors
+                            .lock()
+                            .unwrap()
+                            .push(format!("{}: {}", p.display(), e));
+                    }
+                }
+            });
+        };
+        if io_threads > 0 {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(io_threads)
+                .build()
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            pool.install(run);
+        } else {
+            run(); // global pool
+        }
+        let errs = errors.into_inner().unwrap();
+        if !errs.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!("{} shard(s) failed to parse: {}", errs.len(), errs.join("; ")),
+            ));
+        }
+        Ok(groups.into_iter().collect())
+    }
+
+    /// Parallel sibling of `read_all_grouped_by_feature`.
+    ///
+    /// Same par_iter + thread-local-map + `DashMap` merge pattern as
+    /// `read_all_grouped_parallel`, but keyed by `feature_id` (the
+    /// segment-centric grouping used by the Neuroglancer path). Reads ONLY
+    /// `self.paths`; collects and surfaces per-shard errors as `Err`.
+    pub fn read_all_grouped_by_feature_parallel(
+        &self,
+        io_threads: usize,
+        fadvise: bool,
+    ) -> io::Result<ahash::AHashMap<u32, Vec<Fragment3D>>> {
+        use ahash::AHashMap;
+        use dashmap::DashMap;
+        use std::sync::Mutex;
+        if self.paths.is_empty() {
+            return Ok(AHashMap::new());
+        }
+        let groups: DashMap<u32, Vec<Fragment3D>> = DashMap::new();
+        let errors: Mutex<Vec<String>> = Mutex::new(Vec::new());
+        let run = || {
+            use rayon::prelude::*;
+            self.paths.par_iter().with_min_len(1).for_each(|p| {
+                if fadvise {
+                    prefetch_advise(p);
+                }
+                let mut reader = match ShardReader3D::open(p) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        errors
+                            .lock()
+                            .unwrap()
+                            .push(format!("{}: {}", p.display(), e));
+                        return;
+                    }
+                };
+                let mut local: AHashMap<u32, Vec<Fragment3D>> = AHashMap::new();
+                loop {
+                    match reader.read_next() {
+                        Ok(Some(frag)) => {
+                            local.entry(frag.feature_id).or_default().push(frag);
+                        }
+                        Ok(None) => break,
+                        Err(e) => {
+                            errors
+                                .lock()
+                                .unwrap()
+                                .push(format!("{}: {}", p.display(), e));
+                            break;
+                        }
+                    }
+                }
+                for (k, mut v) in local {
+                    groups.entry(k).or_default().extend(v.drain(..));
+                }
+            });
+        };
+        if io_threads > 0 {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(io_threads)
+                .build()
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            pool.install(run);
+        } else {
+            run(); // global pool
+        }
+        let errs = errors.into_inner().unwrap();
+        if !errs.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!("{} shard(s) failed to parse: {}", errs.len(), errs.join("; ")),
+            ));
+        }
+        Ok(groups.into_iter().collect())
     }
 }
 
@@ -443,6 +651,207 @@ mod tests {
             let f = reader.read_next().unwrap().unwrap();
             assert_eq!(f.feature_id, 1);
         }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Canonicalise a tile-keyed group map into a comparable form: for each
+    /// key, the sorted multiset of feature_ids of its fragments. Order within
+    /// the parallel path is non-deterministic by design, so we sort.
+    fn canonical_grouped(
+        m: &ahash::AHashMap<(u32, u32, u32, u32), Vec<Fragment3D>>,
+    ) -> std::collections::BTreeMap<(u32, u32, u32, u32), Vec<u32>> {
+        let mut out: std::collections::BTreeMap<(u32, u32, u32, u32), Vec<u32>> =
+            std::collections::BTreeMap::new();
+        for (k, v) in m {
+            let mut fids: Vec<u32> = v.iter().map(|f| f.feature_id).collect();
+            fids.sort_unstable();
+            out.insert(*k, fids);
+        }
+        out
+    }
+
+    #[test]
+    fn test_read_all_grouped_parallel_matches_serial() {
+        let dir = std::env::temp_dir().join("test_frag_parallel_v2");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+
+        // Helper to build a fragment with a given feature/tile.
+        let mk = |feature_id: u32, tz: u32, tx: u32, ty: u32, td: u32| Fragment3D {
+            feature_id,
+            tile_z: tz,
+            tile_x: tx,
+            tile_y: ty,
+            tile_d: td,
+            geom_type: 5,
+            xy: vec![0.0f32, 0.0, 1.0, 0.0, 0.0, 1.0],
+            z: vec![0.0f32, 0.0, 0.0],
+            ring_lengths: vec![3],
+        };
+
+        // 3 shards with overlapping AND distinct tile keys so the merge path
+        // (entry().or_default().extend) is exercised across shards.
+        {
+            let mut w0 = Fragment3DWriter::new(&dir.join("shard_000.mjf")).unwrap();
+            w0.write(&mk(1, 0, 0, 0, 0)).unwrap();
+            w0.write(&mk(2, 0, 0, 0, 0)).unwrap(); // same tile as above (within shard)
+            w0.write(&mk(3, 1, 0, 0, 0)).unwrap();
+            w0.flush().unwrap();
+        }
+        {
+            let mut w1 = Fragment3DWriter::new(&dir.join("shard_001.mjf")).unwrap();
+            w1.write(&mk(4, 0, 0, 0, 0)).unwrap(); // shared tile (0,0,0,0) across shards
+            w1.write(&mk(5, 2, 1, 1, 0)).unwrap();
+            w1.flush().unwrap();
+        }
+        {
+            let mut w2 = Fragment3DWriter::new(&dir.join("shard_002.mjf")).unwrap();
+            w2.write(&mk(6, 1, 0, 0, 0)).unwrap(); // shared tile (1,0,0,0) across shards
+            w2.write(&mk(7, 3, 5, 5, 1)).unwrap();
+            w2.flush().unwrap();
+        }
+
+        // Serial baseline.
+        let mut serial_reader = Fragment3DReader::open_dir(&dir).unwrap();
+        let serial = serial_reader.read_all_grouped().unwrap();
+
+        // Parallel (io_threads=0 => global pool; fadvise off).
+        let par_reader = Fragment3DReader::open_dir(&dir).unwrap();
+        let parallel = par_reader.read_all_grouped_parallel(0, false).unwrap();
+
+        // Same key set + per-key same sorted multiset of feature_ids.
+        assert_eq!(canonical_grouped(&serial), canonical_grouped(&parallel));
+
+        // Also verify scoped-pool path (io_threads>0) and fadvise=true.
+        let par_reader2 = Fragment3DReader::open_dir(&dir).unwrap();
+        let parallel2 = par_reader2.read_all_grouped_parallel(4, true).unwrap();
+        assert_eq!(canonical_grouped(&serial), canonical_grouped(&parallel2));
+
+        // by_feature parallel matches serial by_feature.
+        let mut serial_feat_reader = Fragment3DReader::open_dir(&dir).unwrap();
+        let serial_feat = serial_feat_reader.read_all_grouped_by_feature().unwrap();
+        let par_feat_reader = Fragment3DReader::open_dir(&dir).unwrap();
+        let parallel_feat = par_feat_reader
+            .read_all_grouped_by_feature_parallel(0, false)
+            .unwrap();
+        let canon_feat = |m: &ahash::AHashMap<u32, Vec<Fragment3D>>| {
+            let mut out: std::collections::BTreeMap<u32, usize> =
+                std::collections::BTreeMap::new();
+            for (k, v) in m {
+                out.insert(*k, v.len());
+            }
+            out
+        };
+        assert_eq!(canon_feat(&serial_feat), canon_feat(&parallel_feat));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_read_all_grouped_parallel_single_shard() {
+        let dir = std::env::temp_dir().join("test_frag_parallel_single_v2");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+
+        let frag = Fragment3D {
+            feature_id: 99,
+            tile_z: 2,
+            tile_x: 3,
+            tile_y: 4,
+            tile_d: 0,
+            geom_type: 5,
+            xy: vec![0.1f32, 0.2, 0.3, 0.4, 0.5, 0.6],
+            z: vec![0.7f32, 0.8, 0.9],
+            ring_lengths: vec![3],
+        };
+        {
+            let mut w = Fragment3DWriter::new(&dir.join("only.mjf")).unwrap();
+            w.write(&frag).unwrap();
+            w.write(&frag).unwrap();
+            w.flush().unwrap();
+        }
+
+        let mut serial_reader = Fragment3DReader::open_dir(&dir).unwrap();
+        let serial = serial_reader.read_all_grouped().unwrap();
+        let par_reader = Fragment3DReader::open_dir(&dir).unwrap();
+        let parallel = par_reader.read_all_grouped_parallel(2, false).unwrap();
+
+        assert_eq!(parallel.len(), 1);
+        assert_eq!(parallel[&(2, 3, 4, 0)].len(), 2);
+        assert_eq!(canonical_grouped(&serial), canonical_grouped(&parallel));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_read_all_grouped_parallel_empty_dir() {
+        let dir = std::env::temp_dir().join("test_frag_parallel_empty_v2");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+
+        // open_dir on an empty dir => empty paths.
+        let reader = Fragment3DReader::open_dir(&dir).unwrap();
+        let parallel = reader.read_all_grouped_parallel(4, true).unwrap();
+        assert!(parallel.is_empty());
+
+        let parallel_feat = reader
+            .read_all_grouped_by_feature_parallel(0, false)
+            .unwrap();
+        assert!(parallel_feat.is_empty());
+
+        // from_paths with empty vec => empty map, no panic.
+        let empty_reader = Fragment3DReader::from_paths(Vec::new());
+        assert!(empty_reader
+            .read_all_grouped_parallel(0, false)
+            .unwrap()
+            .is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_read_all_grouped_parallel_propagates_shard_error() {
+        // A corrupt/truncated shard must surface as Err, never be silently
+        // skipped (matches the serial read_next `?` contract; guards against
+        // the parquet cursor advancing past a broken shard = silent data loss).
+        let dir = std::env::temp_dir().join("test_frag_parallel_corrupt_v2");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+
+        let frag = Fragment3D {
+            feature_id: 1,
+            tile_z: 0,
+            tile_x: 0,
+            tile_y: 0,
+            tile_d: 0,
+            geom_type: 5,
+            xy: vec![0.1f32, 0.2, 0.3, 0.4, 0.5, 0.6],
+            z: vec![0.7f32, 0.8, 0.9],
+            ring_lengths: vec![3],
+        };
+        {
+            let mut w = Fragment3DWriter::new(&dir.join("a_valid.mjf")).unwrap();
+            for _ in 0..3 {
+                w.write(&frag).unwrap();
+            }
+            w.flush().unwrap();
+        }
+        // A second .mjf that is NOT a valid ZSTD stream: the decoder fails on
+        // first read with a non-EOF error, which read_next propagates as Err
+        // (a clean trailing truncation, by contrast, decodes as graceful EOF).
+        std::fs::write(
+            dir.join("b_corrupt.mjf"),
+            b"NOT_A_VALID_ZSTD_FRAME________________________________",
+        )
+        .unwrap();
+
+        let reader = Fragment3DReader::open_dir(&dir).unwrap();
+        let res = reader.read_all_grouped_parallel(2, false);
+        assert!(
+            res.is_err(),
+            "a corrupt/truncated shard must produce Err, not be silently skipped"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
