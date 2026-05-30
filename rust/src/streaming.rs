@@ -2525,6 +2525,362 @@ fn build_batch_recordbatch(
         .map_err(|e| format!("RecordBatch: {}", e))
 }
 
+/// Like `build_batch_recordbatch` but WITHOUT the `zoom` column — for the
+/// partitioned writer where zoom is encoded in the `zoom=N/` directory name
+/// (matches Python `_parquet_schema_no_zoom()`). 8 columns; Map child names
+/// `entries/key/value`; nullable=true; identical tag stringification.
+fn build_batch_no_zoom(
+    rows: &[ParquetRow],
+    tags_registry: &HashMap<u32, Vec<(String, TagValue)>>,
+) -> Result<arrow::record_batch::RecordBatch, String> {
+    use arrow::array::*;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use std::sync::Arc;
+
+    let tile_x: UInt16Array = rows.iter().map(|r| Some(r.tile_x)).collect();
+    let tile_y: UInt16Array = rows.iter().map(|r| Some(r.tile_y)).collect();
+    let tile_d: UInt16Array = rows.iter().map(|r| Some(r.tile_d)).collect();
+    let feature_id: UInt32Array = rows.iter().map(|r| Some(r.feature_id)).collect();
+    let geom_type: UInt8Array = rows.iter().map(|r| Some(r.geom_type)).collect();
+    let positions: LargeBinaryArray = rows.iter().map(|r| Some(r.positions.as_slice())).collect();
+    let indices: LargeBinaryArray = rows.iter().map(|r| Some(r.indices.as_slice())).collect();
+
+    let field_names = MapFieldNames {
+        entry: "entries".to_string(),
+        key: "key".to_string(),
+        value: "value".to_string(),
+    };
+    let mut map_builder =
+        MapBuilder::new(Some(field_names), StringBuilder::new(), StringBuilder::new());
+    for row in rows {
+        if let Some(tags) = tags_registry.get(&row.feature_id) {
+            for (k, v) in tags {
+                map_builder.keys().append_value(k);
+                match v {
+                    TagValue::Str(s) => map_builder.values().append_value(s),
+                    TagValue::Int(i) => map_builder.values().append_value(i.to_string()),
+                    TagValue::Float(f) => map_builder.values().append_value(f.to_string()),
+                    TagValue::Bool(b) => map_builder.values().append_value(b.to_string()),
+                }
+            }
+        }
+        map_builder.append(true).map_err(|e| format!("map build: {}", e))?;
+    }
+    let tags_arr = map_builder.finish();
+
+    let schema = Schema::new(vec![
+        Field::new("tile_x", DataType::UInt16, true),
+        Field::new("tile_y", DataType::UInt16, true),
+        Field::new("tile_d", DataType::UInt16, true),
+        Field::new("feature_id", DataType::UInt32, true),
+        Field::new("geom_type", DataType::UInt8, true),
+        Field::new("positions", DataType::LargeBinary, true),
+        Field::new("indices", DataType::LargeBinary, true),
+        Field::new("tags", tags_arr.data_type().clone(), true),
+    ]);
+
+    let columns: Vec<ArrayRef> = vec![
+        Arc::new(tile_x),
+        Arc::new(tile_y),
+        Arc::new(tile_d),
+        Arc::new(feature_id),
+        Arc::new(geom_type),
+        Arc::new(positions),
+        Arc::new(indices),
+        Arc::new(tags_arr),
+    ];
+    arrow::record_batch::RecordBatch::try_new(Arc::new(schema), columns)
+        .map_err(|e| format!("RecordBatch: {}", e))
+}
+
+/// `WriterProperties` for the native partitioned writer. CRITICAL: parquet-rs
+/// `Compression::ZSTD(Default)` is level 1; the Python path uses level 3, so we
+/// set `ZstdLevel(3)` explicitly. Dictionary encoding is disabled on the raw
+/// geometry blobs (positions/indices) to bound writer memory and speed encode;
+/// it stays on (default) for the small int/tag columns.
+fn native_writer_props(
+    compression: &str,
+    compression_level: i32,
+) -> Result<parquet::file::properties::WriterProperties, String> {
+    use parquet::basic::{Compression, ZstdLevel};
+    use parquet::file::properties::WriterProperties;
+    use parquet::schema::types::ColumnPath;
+
+    let comp = match compression {
+        "zstd" => Compression::ZSTD(
+            ZstdLevel::try_new(compression_level).map_err(|e| format!("zstd level: {}", e))?,
+        ),
+        "lz4" => Compression::LZ4_RAW,
+        "snappy" => Compression::SNAPPY,
+        _ => Compression::UNCOMPRESSED,
+    };
+    Ok(WriterProperties::builder()
+        .set_compression(comp)
+        .set_column_dictionary_enabled(ColumnPath::from("positions"), false)
+        .set_column_dictionary_enabled(ColumnPath::from("indices"), false)
+        .build())
+}
+
+/// Rust analogue of Python `_RotatingWriter`: appends row batches to
+/// `{dir}/part_{idx:03}.parquet`, rotating to a new part when the current part's
+/// cumulative uncompressed-binary bytes would exceed `max_file_bytes`. State
+/// persists across shard chunks, so one part file may span multiple chunks.
+///
+/// NOTE: superseded by `run_native_partitioned`'s per-zoom part-splitting (which
+/// fans ZSTD across cores). Retained for a possible single-writer-per-zoom mode.
+#[allow(dead_code)]
+struct RotatingWriterRs {
+    dir: std::path::PathBuf,
+    schema: std::sync::Arc<arrow::datatypes::Schema>,
+    props: std::sync::Arc<parquet::file::properties::WriterProperties>,
+    max_file_bytes: u64,
+    idx: u32,
+    cum_bytes: u64,
+    writer: Option<parquet::arrow::ArrowWriter<std::fs::File>>,
+}
+
+impl RotatingWriterRs {
+    fn new(
+        dir: std::path::PathBuf,
+        schema: std::sync::Arc<arrow::datatypes::Schema>,
+        props: std::sync::Arc<parquet::file::properties::WriterProperties>,
+        max_file_bytes: u64,
+    ) -> Self {
+        Self { dir, schema, props, max_file_bytes, idx: 0, cum_bytes: 0, writer: None }
+    }
+
+    /// Write one zoom's rows for one chunk, rotating first if the current part
+    /// would exceed `max_file_bytes` (never rotates on the first write).
+    fn write(
+        &mut self,
+        rows: &[ParquetRow],
+        tags: &HashMap<u32, Vec<(String, TagValue)>>,
+    ) -> Result<(), String> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        // Uncompressed binary size (mirrors Python `_estimate_binary_bytes`).
+        let batch_bytes: u64 = rows
+            .iter()
+            .map(|r| (r.positions.len() + r.indices.len()) as u64)
+            .sum();
+
+        if self.writer.is_some()
+            && self.cum_bytes > 0
+            && self.cum_bytes + batch_bytes > self.max_file_bytes
+        {
+            if let Some(w) = self.writer.take() {
+                w.close().map_err(|e| format!("close part: {}", e))?;
+            }
+            self.idx += 1;
+            self.cum_bytes = 0;
+        }
+        if self.writer.is_none() {
+            std::fs::create_dir_all(&self.dir)
+                .map_err(|e| format!("mkdir {}: {}", self.dir.display(), e))?;
+            let path = self.dir.join(format!("part_{:03}.parquet", self.idx));
+            let file = std::fs::File::create(&path)
+                .map_err(|e| format!("create {}: {}", path.display(), e))?;
+            let w = parquet::arrow::ArrowWriter::try_new(
+                file,
+                self.schema.clone(),
+                Some((*self.props).clone()),
+            )
+            .map_err(|e| format!("ArrowWriter: {}", e))?;
+            self.writer = Some(w);
+        }
+
+        // Split into sub-batches under the 1.5 GB Arrow LargeBinary offset guard.
+        const SUB_LIMIT: u64 = 1_500_000_000;
+        let w = self.writer.as_mut().unwrap();
+        let mut start = 0usize;
+        let mut acc = 0u64;
+        for i in 0..rows.len() {
+            let rb = (rows[i].positions.len() + rows[i].indices.len()) as u64;
+            if acc > 0 && acc + rb > SUB_LIMIT {
+                let batch = build_batch_no_zoom(&rows[start..i], tags)?;
+                w.write(&batch).map_err(|e| format!("write: {}", e))?;
+                start = i;
+                acc = 0;
+            }
+            acc += rb;
+        }
+        if start < rows.len() {
+            let batch = build_batch_no_zoom(&rows[start..], tags)?;
+            w.write(&batch).map_err(|e| format!("write: {}", e))?;
+        }
+        self.cum_bytes += batch_bytes;
+        Ok(())
+    }
+
+    fn close(&mut self) -> Result<(), String> {
+        if let Some(w) = self.writer.take() {
+            w.close().map_err(|e| format!("close: {}", e))?;
+        }
+        Ok(())
+    }
+}
+
+/// Drive the WHOLE partitioned consolidation in Rust (sequential chunks; Step 5
+/// adds internal read/write overlap). For each byte-budgeted shard chunk:
+/// parallel-read (`read_all_grouped_parallel`) → transform (`collect_parquet_rows`)
+/// → partition rows by zoom → write each zoom's rows to its persistent
+/// `RotatingWriterRs` in PARALLEL (lever-A: one ArrowWriter per zoom, moved onto
+/// a rayon task). Writers persist across chunks so part files span chunks.
+/// Returns total rows. Output: `{output_dir}/zoom=N/part_NNN.parquet`.
+fn run_native_partitioned(
+    shard_paths: Vec<PathBuf>,
+    output_dir: &str,
+    world_bounds: (f64, f64, f64, f64, f64, f64),
+    max_zoom: u32,
+    base_cells: u32,
+    io_threads: usize,
+    tags: &HashMap<u32, Vec<(String, TagValue)>>,
+    max_batch_bytes: usize,
+    max_file_bytes: u64,
+    props: std::sync::Arc<parquet::file::properties::WriterProperties>,
+) -> Result<u64, String> {
+    use rayon::prelude::*;
+    use std::collections::HashMap as StdHashMap;
+
+    let out = std::path::Path::new(output_dir);
+    std::fs::create_dir_all(out).map_err(|e| format!("mkdir {}: {}", output_dir, e))?;
+
+    // Schema (no zoom) derived from an empty batch so the writers' schema
+    // EXACTLY matches what `build_batch_no_zoom` produces for real batches.
+    let schema = build_batch_no_zoom(&[], tags)?.schema();
+
+    let mut part_counter: StdHashMap<u32, u32> = StdHashMap::new();
+    let mut total: u64 = 0;
+    let mut t_read = 0.0f64;
+    let mut t_xform = 0.0f64;
+    let mut t_write = 0.0f64;
+
+    let n = shard_paths.len();
+    let mut cursor = 0usize;
+    while cursor < n {
+        let start = cursor;
+        let mut est = 0usize;
+        let mut end = start;
+        while end < n && (end == start || est < max_batch_bytes) {
+            est += std::fs::metadata(&shard_paths[end])
+                .map(|m| m.len() as usize * 3)
+                .unwrap_or(0);
+            end += 1;
+        }
+        let chunk: Vec<PathBuf> = shard_paths[start..end].to_vec();
+        cursor = end;
+
+        // Parallel read + transform (rayon, GIL already released by the caller).
+        let _tr = std::time::Instant::now();
+        let reader = Fragment3DReader::from_paths(chunk);
+        let groups = reader
+            .read_all_grouped_parallel(io_threads, true)
+            .map_err(|e| e.to_string())?;
+        let mut tiles: Vec<((u32, u32, u32, u32), Vec<Fragment3D>)> =
+            groups.into_iter().collect();
+        for (_k, v) in tiles.iter_mut() {
+            v.sort_by_key(|f| f.feature_id);
+        }
+        t_read += _tr.elapsed().as_secs_f64();
+        let _tx = std::time::Instant::now();
+        let rows = collect_parquet_rows(&tiles, &world_bounds, max_zoom, base_cells);
+        t_xform += _tx.elapsed().as_secs_f64();
+        if rows.is_empty() {
+            continue;
+        }
+        let _tw = std::time::Instant::now();
+
+        // Partition rows by zoom, then split each zoom into ~cores parts so ZSTD
+        // parallelises at PART granularity (a single big zoom must NOT serialise
+        // the whole write — that was the regression). Each part is its own
+        // self-closing ArrowWriter written on a rayon task; the per-zoom part
+        // counter persists across chunks so part names never collide. Output
+        // values are unchanged (just distributed into more, smaller part files).
+        let mut by_zoom: StdHashMap<u32, Vec<ParquetRow>> = StdHashMap::new();
+        for r in rows {
+            by_zoom.entry(r.zoom as u32).or_default().push(r);
+        }
+        let total_bytes: u64 = by_zoom
+            .values()
+            .flat_map(|v| v.iter())
+            .map(|r| (r.positions.len() + r.indices.len()) as u64)
+            .sum::<u64>()
+            .max(1);
+        let cores = rayon::current_num_threads().max(1) as u64;
+        let mut zoom_vecs: Vec<(u32, Vec<ParquetRow>)> = by_zoom.into_iter().collect();
+        zoom_vecs.sort_by_key(|(z, _)| *z);
+
+        // Flat (zoom, part_idx, slice) work list across all zooms x sub-parts.
+        let mut work: Vec<(u32, u32, &[ParquetRow])> = Vec::new();
+        for (z, zrows) in &zoom_vecs {
+            if zrows.is_empty() {
+                continue;
+            }
+            let zbytes: u64 = zrows
+                .iter()
+                .map(|r| (r.positions.len() + r.indices.len()) as u64)
+                .sum();
+            // Enough parts for parallelism (proportional to cores) AND to keep
+            // each part <= max_file_bytes, but never split below ~16 MB/part —
+            // so small datasets stay a single part (matching the pyarrow layout
+            // that the partitioning/prime tests expect) while large zooms fan out.
+            const MIN_PART_BYTES: u64 = 16 * 1024 * 1024;
+            let by_parallel = (cores * zbytes + total_bytes - 1) / total_bytes;
+            let by_size = (zbytes + max_file_bytes.max(1) - 1) / max_file_bytes.max(1);
+            let cap_minsize = (zbytes / MIN_PART_BYTES).max(1);
+            let n_parts = by_parallel
+                .max(by_size)
+                .max(1)
+                .min(cap_minsize)
+                .min(zrows.len() as u64) as usize;
+            let per = (zrows.len() + n_parts - 1) / n_parts;
+            let counter = part_counter.entry(*z).or_insert(0);
+            let mut s = 0usize;
+            while s < zrows.len() {
+                let e = (s + per).min(zrows.len());
+                work.push((*z, *counter, &zrows[s..e]));
+                *counter += 1;
+                s = e;
+            }
+        }
+
+        let results: Vec<Result<u64, String>> = work
+            .into_par_iter()
+            .map(|(z, idx, slice)| {
+                let dir = out.join(format!("zoom={}", z));
+                std::fs::create_dir_all(&dir)
+                    .map_err(|e| format!("mkdir {}: {}", dir.display(), e))?;
+                let path = dir.join(format!("part_{:03}.parquet", idx));
+                let batch = build_batch_no_zoom(slice, tags)?;
+                let file = std::fs::File::create(&path)
+                    .map_err(|e| format!("create {}: {}", path.display(), e))?;
+                let mut w = parquet::arrow::ArrowWriter::try_new(
+                    file,
+                    schema.clone(),
+                    Some((*props).clone()),
+                )
+                .map_err(|e| format!("ArrowWriter: {}", e))?;
+                w.write(&batch).map_err(|e| format!("write: {}", e))?;
+                w.close().map_err(|e| format!("close: {}", e))?;
+                Ok(slice.len() as u64)
+            })
+            .collect();
+        for r in results {
+            total += r?;
+        }
+        t_write += _tw.elapsed().as_secs_f64();
+    }
+
+    if std::env::var("MUDM_NATIVE_PROFILE").is_ok() {
+        eprintln!(
+            "[native] read={:.1}s transform={:.1}s write+zstd={:.1}s",
+            t_read, t_xform, t_write
+        );
+    }
+    Ok(total)
+}
+
 // ---------------------------------------------------------------------------
 // PyO3 helpers: extract features and tags from Python dicts
 // ---------------------------------------------------------------------------
@@ -2880,6 +3236,52 @@ impl StreamingTileGenerator {
             )
         }).map_err(|e| pyo3::exceptions::PyIOError::new_err(e))?;
 
+        Ok(total)
+    }
+
+    /// Drive the ENTIRE partitioned Parquet consolidation natively in Rust:
+    /// chunked parallel read + transform + parallel per-zoom ZSTD write, all
+    /// under ONE `py.allow_threads` (GIL-free, no Python dict bridge, no
+    /// `_dict_to_record_batch`, no Python-side rotation). Bounded memory via the
+    /// byte-budget shard cursor + persistent per-zoom rotating writers. Output is
+    /// `{output_dir}/zoom=N/part_NNN.parquet`, byte-identical (modulo within-tile
+    /// row order) to the pyarrow partitioned path. `overlap_read` is reserved for
+    /// the Step-5 internal read/write overlap (currently sequential per chunk).
+    #[pyo3(signature = (output_dir, world_bounds, compression="zstd", compression_level=3, max_batch_bytes=2_000_000_000, max_file_bytes=500_000_000, overlap_read=true))]
+    fn generate_parquet_native_partitioned(
+        &mut self,
+        py: Python<'_>,
+        output_dir: &str,
+        world_bounds: (f64, f64, f64, f64, f64, f64),
+        compression: &str,
+        compression_level: i32,
+        max_batch_bytes: usize,
+        max_file_bytes: u64,
+        overlap_read: bool,
+    ) -> PyResult<u64> {
+        let _ = overlap_read; // sequential for now; Step 5 adds internal overlap
+        self._init_parquet_stream()?;
+        let shard_paths = std::mem::take(&mut self.shard_paths_snapshot);
+        let max_zoom = self.max_zoom;
+        let base_cells = self.base_cells;
+        let io_threads = self.io_threads;
+        let tags = self.tags_registry.clone();
+        let props = std::sync::Arc::new(
+            native_writer_props(compression, compression_level)
+                .map_err(|e| pyo3::exceptions::PyValueError::new_err(e))?,
+        );
+        let out = output_dir.to_string();
+        let wb = world_bounds;
+
+        let result = py.allow_threads(|| {
+            run_native_partitioned(
+                shard_paths, &out, wb, max_zoom, base_cells, io_threads, &tags,
+                max_batch_bytes, max_file_bytes, props,
+            )
+        });
+        // Always close the stream, even on error (avoid leaking the active lock).
+        let _ = self._close_parquet_stream();
+        let total = result.map_err(|e| pyo3::exceptions::PyIOError::new_err(e))?;
         Ok(total)
     }
 

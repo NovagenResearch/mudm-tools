@@ -73,6 +73,20 @@ def generate_parquet(
         generator._set_io_threads(io_threads)
 
     if partitioned:
+        # Fully-native Rust path: chunked parallel read + transform + parallel
+        # per-zoom ZSTD write, all GIL-free in one call (no dict bridge, no
+        # Python-side rotation). Gated on parallel + zstd + extension support;
+        # falls back transparently otherwise.
+        _use_native = (
+            effective_parallel
+            and compression == "zstd"
+            and hasattr(generator, "generate_parquet_native_partitioned")
+        )
+        if _use_native:
+            return generator.generate_parquet_native_partitioned(
+                str(output_path), world_bounds, compression, compression_level,
+                max_batch_bytes, max_file_bytes,
+            )
         return _generate_parquet_partitioned_streaming(
             generator, output_path, world_bounds,
             compression=compression, compression_level=compression_level,
