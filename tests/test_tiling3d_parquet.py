@@ -705,6 +705,52 @@ class TestParquetPartitioned:
         fids_p = sorted(set(r["feature_id"] for r in rows_p))
         assert fids_s == fids_p
 
+    def test_overlap_matches_serial(self, tmp_path):
+        """Native read∥transform overlap pipeline is byte-identical (modulo
+        within-tile row order) to the sequential native path. Forced to >=2
+        chunks via max_batch_bytes=1 so the producer/consumer handoff runs."""
+        # Spatially-spread TINs so ingestion produces several fragment shards.
+        centers = [
+            (0.2, 0.2, 0.2), (0.8, 0.2, 0.2), (0.2, 0.8, 0.2),
+            (0.2, 0.2, 0.8), (0.8, 0.8, 0.8), (0.5, 0.5, 0.5),
+            (0.3, 0.7, 0.4), (0.7, 0.3, 0.6),
+        ]
+        d = 0.05
+        feats = [
+            _make_tin_feature(
+                [cx - d, cy - d, cx + d, cy - d, cx, cy + d],
+                [cz - d, cz + d, cz], [3], tags={"name": f"c{i}"},
+            )
+            for i, (cx, cy, cz) in enumerate(centers)
+        ]
+
+        def _run(out_dir, overlap):
+            gen, _ = _build_generator_with_features(feats, min_zoom=0, max_zoom=2)
+            # (output_dir, world_bounds, compression, level, max_batch_bytes,
+            #  max_file_bytes, overlap_read) -> one shard per chunk.
+            return gen.generate_parquet_native_partitioned(
+                str(out_dir), WORLD_BOUNDS, "zstd", 3, 1, 500_000_000, overlap,
+            )
+
+        out_serial = tmp_path / "serial"
+        out_overlap = tmp_path / "overlap"
+        n_serial = _run(out_serial, False)
+        n_overlap = _run(out_overlap, True)
+        assert n_serial == n_overlap > 0
+
+        def _canon(rows):
+            sig = []
+            for r in rows:
+                sig.append((
+                    r["zoom"], r["tile_x"], r["tile_y"], r["tile_d"],
+                    r["feature_id"], r["geom_type"],
+                    r["positions"].tobytes(), r["indices"].tobytes(),
+                    tuple(sorted(r["tags"].items())),
+                ))
+            return sorted(sig)
+
+        assert _canon(read_parquet(out_serial)) == _canon(read_parquet(out_overlap))
+
 
 # ---------------------------------------------------------------------------
 # Streaming API low-level tests

@@ -2207,6 +2207,11 @@ struct ParquetRow {
 /// (same algorithm as `encode_glb_tile_from_fragments`). At max_zoom,
 /// writes per-face vertices directly. Lines and points are transformed
 /// to world coords without clustering.
+// --- transform profiling (CPU-time sums across threads; gated by MUDM_NATIVE_PROFILE) ---
+static PROF_GEOM_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PROF_QEM_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PROF_SERIALIZE_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn collect_parquet_rows(
     tiles: &[((u32, u32, u32, u32), Vec<Fragment3D>)],
     world_bounds: &(f64, f64, f64, f64, f64, f64),
@@ -2218,96 +2223,104 @@ fn collect_parquet_rows(
     let dy = if ymax != ymin { ymax - ymin } else { 1.0 };
     let dz = if zmax != zmin { zmax - zmin } else { 1.0 };
 
-    tiles.par_iter()
-        .flat_map(|((tz, tx, ty, td), frags)| {
-            let tz = *tz;
+    // Flatten to FRAGMENT-level work items so the heavy QEM fragments that
+    // concentrate in fat coarse-zoom tiles get work-stolen across all cores
+    // (tile-level par_iter only reached ~20x/80 from load imbalance). Row order
+    // is free: run_native_partitioned partitions by zoom and the equivalence
+    // tests canonical-sort, so per-fragment scheduling order does not matter.
+    let work: Vec<((u32, u32, u32, u32), &Fragment3D)> = tiles
+        .iter()
+        .flat_map(|(k, frags)| frags.iter().map(move |f| (*k, f)))
+        .collect();
+
+    work.par_iter()
+        .filter_map(|&((tz, tx, ty, td), frag)| {
             let do_simplify = tz < max_zoom;
-
-            let mut rows: Vec<ParquetRow> = Vec::new();
-
-            for frag in frags {
-                let n_verts = frag.z.len();
-                if n_verts == 0 {
-                    continue;
-                }
-
-                let (pos_f32, idx_u32) = match frag.geom_type {
-                    5 | 4 => {
-                        // TIN / PolyhedralSurface
-                        let rls: Vec<usize> = if frag.ring_lengths.is_empty() {
-                            vec![n_verts]
-                        } else {
-                            frag.ring_lengths.iter().map(|&r| r as usize).collect()
-                        };
-                        let n_faces = rls.len();
-                        let do_simplify_this = do_simplify && n_faces > 4;
-
-                        if do_simplify_this {
-                            parquet_tin_simplified(
-                                frag, &rls, n_verts,
-                                xmin, ymin, zmin, dx, dy, dz,
-                                base_cells, tz, max_zoom,
-                            )
-                        } else {
-                            parquet_tin_direct(
-                                frag, &rls, n_verts,
-                                xmin, ymin, zmin, dx, dy, dz,
-                            )
-                        }
-                    }
-                    2 => {
-                        // LineString
-                        let mut positions: Vec<f32> = Vec::with_capacity(n_verts * 3);
-                        let mut indices: Vec<u32> = Vec::with_capacity(n_verts.saturating_sub(1) * 2);
-                        for i in 0..n_verts {
-                            positions.push((xmin + frag.xy[i * 2] as f64 * dx) as f32);
-                            positions.push((ymin + frag.xy[i * 2 + 1] as f64 * dy) as f32);
-                            positions.push((zmin + frag.z[i] as f64 * dz) as f32);
-                        }
-                        for i in 0..n_verts.saturating_sub(1) {
-                            indices.push(i as u32);
-                            indices.push((i + 1) as u32);
-                        }
-                        (positions, indices)
-                    }
-                    1 => {
-                        // Point
-                        let mut positions: Vec<f32> = Vec::with_capacity(n_verts * 3);
-                        for i in 0..n_verts {
-                            positions.push((xmin + frag.xy[i * 2] as f64 * dx) as f32);
-                            positions.push((ymin + frag.xy[i * 2 + 1] as f64 * dy) as f32);
-                            positions.push((zmin + frag.z[i] as f64 * dz) as f32);
-                        }
-                        (positions, Vec::new())
-                    }
-                    _ => continue,
-                };
-
-                if pos_f32.is_empty() {
-                    continue;
-                }
-
-                // Convert to LE bytes
-                let pos_bytes: Vec<u8> = pos_f32.iter()
-                    .flat_map(|f| f.to_le_bytes())
-                    .collect();
-                let idx_bytes: Vec<u8> = idx_u32.iter()
-                    .flat_map(|i| i.to_le_bytes())
-                    .collect();
-
-                rows.push(ParquetRow {
-                    zoom: tz as u8,
-                    tile_x: *tx as u16,
-                    tile_y: *ty as u16,
-                    tile_d: *td as u16,
-                    feature_id: frag.feature_id,
-                    geom_type: frag.geom_type,
-                    positions: pos_bytes,
-                    indices: idx_bytes,
-                });
+            let n_verts = frag.z.len();
+            if n_verts == 0 {
+                return None;
             }
 
-            rows
+            let _tg = std::time::Instant::now();
+            let (pos_f32, idx_u32) = match frag.geom_type {
+                5 | 4 => {
+                    // TIN / PolyhedralSurface
+                    let rls: Vec<usize> = if frag.ring_lengths.is_empty() {
+                        vec![n_verts]
+                    } else {
+                        frag.ring_lengths.iter().map(|&r| r as usize).collect()
+                    };
+                    let n_faces = rls.len();
+                    let do_simplify_this = do_simplify && n_faces > 4;
+
+                    if do_simplify_this {
+                        parquet_tin_simplified(
+                            frag, &rls, n_verts,
+                            xmin, ymin, zmin, dx, dy, dz,
+                            base_cells, tz, max_zoom,
+                        )
+                    } else {
+                        parquet_tin_direct(
+                            frag, &rls, n_verts,
+                            xmin, ymin, zmin, dx, dy, dz,
+                        )
+                    }
+                }
+                2 => {
+                    // LineString
+                    let mut positions: Vec<f32> = Vec::with_capacity(n_verts * 3);
+                    let mut indices: Vec<u32> = Vec::with_capacity(n_verts.saturating_sub(1) * 2);
+                    for i in 0..n_verts {
+                        positions.push((xmin + frag.xy[i * 2] as f64 * dx) as f32);
+                        positions.push((ymin + frag.xy[i * 2 + 1] as f64 * dy) as f32);
+                        positions.push((zmin + frag.z[i] as f64 * dz) as f32);
+                    }
+                    for i in 0..n_verts.saturating_sub(1) {
+                        indices.push(i as u32);
+                        indices.push((i + 1) as u32);
+                    }
+                    (positions, indices)
+                }
+                1 => {
+                    // Point
+                    let mut positions: Vec<f32> = Vec::with_capacity(n_verts * 3);
+                    for i in 0..n_verts {
+                        positions.push((xmin + frag.xy[i * 2] as f64 * dx) as f32);
+                        positions.push((ymin + frag.xy[i * 2 + 1] as f64 * dy) as f32);
+                        positions.push((zmin + frag.z[i] as f64 * dz) as f32);
+                    }
+                    (positions, Vec::new())
+                }
+                _ => return None,
+            };
+            PROF_GEOM_NS.fetch_add(
+                _tg.elapsed().as_nanos() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+
+            if pos_f32.is_empty() {
+                return None;
+            }
+
+            // Convert to LE bytes
+            let _ts = std::time::Instant::now();
+            let pos_bytes: Vec<u8> = pos_f32.iter().flat_map(|f| f.to_le_bytes()).collect();
+            let idx_bytes: Vec<u8> = idx_u32.iter().flat_map(|i| i.to_le_bytes()).collect();
+            PROF_SERIALIZE_NS.fetch_add(
+                _ts.elapsed().as_nanos() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+
+            Some(ParquetRow {
+                zoom: tz as u8,
+                tile_x: tx as u16,
+                tile_y: ty as u16,
+                tile_d: td as u16,
+                feature_id: frag.feature_id,
+                geom_type: frag.geom_type,
+                positions: pos_bytes,
+                indices: idx_bytes,
+            })
         })
         .collect()
 }
@@ -2335,7 +2348,12 @@ fn parquet_tin_simplified(
         base_cells, zoom, max_zoom, indices.len(),
     );
     let target_tris = target_idx / 3;
+    let _tq = std::time::Instant::now();
     let (sp, mut si) = simplify::simplify_mesh(&positions, &indices, target_tris);
+    PROF_QEM_NS.fetch_add(
+        _tq.elapsed().as_nanos() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
     filter_oversized_triangles(&sp, &mut si, tile_max_edge_sq_world(base_cells, zoom, dx, dy, dz));
     (sp, si)
 }
@@ -2728,6 +2746,122 @@ impl RotatingWriterRs {
 /// `RotatingWriterRs` in PARALLEL (lever-A: one ArrowWriter per zoom, moved onto
 /// a rayon task). Writers persist across chunks so part files span chunks.
 /// Returns total rows. Output: `{output_dir}/zoom=N/part_NNN.parquet`.
+/// Read one shard chunk in parallel and group+sort its fragments per tile.
+/// The per-tile sort_by_key(feature_id) is part of READ output (groups come
+/// unordered from the DashMap) and is done here while cache-hot.
+fn read_chunk_sorted(
+    chunk: Vec<PathBuf>,
+    io_threads: usize,
+) -> Result<Vec<((u32, u32, u32, u32), Vec<Fragment3D>)>, String> {
+    let reader = Fragment3DReader::from_paths(chunk);
+    let mut tiles: Vec<((u32, u32, u32, u32), Vec<Fragment3D>)> = reader
+        .read_all_grouped_parallel(io_threads, true)
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .collect();
+    for (_k, v) in tiles.iter_mut() {
+        v.sort_by_key(|f| f.feature_id);
+    }
+    Ok(tiles)
+}
+
+/// Transform one chunk's tiles -> rows, partition by zoom, and write each zoom's
+/// rows as ~cores parallel part files (parallel ZSTD). Mutates `part_counter`
+/// (deterministic, single-caller) and returns the chunk's row count. The
+/// `into_par_iter()` write uses the CURRENT rayon pool (the dedicated consumer
+/// pool when overlapping). Byte-identical to the sequential write path.
+#[allow(clippy::too_many_arguments)]
+fn consume_chunk(
+    tiles: &[((u32, u32, u32, u32), Vec<Fragment3D>)],
+    out: &std::path::Path,
+    schema: &std::sync::Arc<arrow::datatypes::Schema>,
+    props: &std::sync::Arc<parquet::file::properties::WriterProperties>,
+    tags: &HashMap<u32, Vec<(String, TagValue)>>,
+    world_bounds: (f64, f64, f64, f64, f64, f64),
+    max_zoom: u32,
+    base_cells: u32,
+    max_file_bytes: u64,
+    part_counter: &mut std::collections::HashMap<u32, u32>,
+) -> Result<u64, String> {
+    use rayon::prelude::*;
+    use std::collections::HashMap as StdHashMap;
+
+    let rows = collect_parquet_rows(tiles, &world_bounds, max_zoom, base_cells);
+    if rows.is_empty() {
+        return Ok(0);
+    }
+    let mut by_zoom: StdHashMap<u32, Vec<ParquetRow>> = StdHashMap::new();
+    for r in rows {
+        by_zoom.entry(r.zoom as u32).or_default().push(r);
+    }
+    let total_bytes: u64 = by_zoom
+        .values()
+        .flat_map(|v| v.iter())
+        .map(|r| (r.positions.len() + r.indices.len()) as u64)
+        .sum::<u64>()
+        .max(1);
+    let cores = rayon::current_num_threads().max(1) as u64;
+    let mut zoom_vecs: Vec<(u32, Vec<ParquetRow>)> = by_zoom.into_iter().collect();
+    zoom_vecs.sort_by_key(|(z, _)| *z);
+
+    let mut work: Vec<(u32, u32, &[ParquetRow])> = Vec::new();
+    for (z, zrows) in &zoom_vecs {
+        if zrows.is_empty() {
+            continue;
+        }
+        let zbytes: u64 = zrows
+            .iter()
+            .map(|r| (r.positions.len() + r.indices.len()) as u64)
+            .sum();
+        const MIN_PART_BYTES: u64 = 16 * 1024 * 1024;
+        let by_parallel = (cores * zbytes + total_bytes - 1) / total_bytes;
+        let by_size = (zbytes + max_file_bytes.max(1) - 1) / max_file_bytes.max(1);
+        let cap_minsize = (zbytes / MIN_PART_BYTES).max(1);
+        let n_parts = by_parallel
+            .max(by_size)
+            .max(1)
+            .min(cap_minsize)
+            .min(zrows.len() as u64) as usize;
+        let per = (zrows.len() + n_parts - 1) / n_parts;
+        let counter = part_counter.entry(*z).or_insert(0);
+        let mut s = 0usize;
+        while s < zrows.len() {
+            let e = (s + per).min(zrows.len());
+            work.push((*z, *counter, &zrows[s..e]));
+            *counter += 1;
+            s = e;
+        }
+    }
+
+    let results: Vec<Result<u64, String>> = work
+        .into_par_iter()
+        .map(|(z, idx, slice)| {
+            let dir = out.join(format!("zoom={}", z));
+            std::fs::create_dir_all(&dir)
+                .map_err(|e| format!("mkdir {}: {}", dir.display(), e))?;
+            let path = dir.join(format!("part_{:03}.parquet", idx));
+            let batch = build_batch_no_zoom(slice, tags)?;
+            let file = std::fs::File::create(&path)
+                .map_err(|e| format!("create {}: {}", path.display(), e))?;
+            let mut w = parquet::arrow::ArrowWriter::try_new(
+                file,
+                schema.clone(),
+                Some((**props).clone()),
+            )
+            .map_err(|e| format!("ArrowWriter: {}", e))?;
+            w.write(&batch).map_err(|e| format!("write: {}", e))?;
+            w.close().map_err(|e| format!("close: {}", e))?;
+            Ok(slice.len() as u64)
+        })
+        .collect();
+    let mut chunk_total = 0u64;
+    for r in results {
+        chunk_total += r?;
+    }
+    Ok(chunk_total)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn run_native_partitioned(
     shard_paths: Vec<PathBuf>,
     output_dir: &str,
@@ -2739,143 +2873,118 @@ fn run_native_partitioned(
     max_batch_bytes: usize,
     max_file_bytes: u64,
     props: std::sync::Arc<parquet::file::properties::WriterProperties>,
+    overlap_read: bool,
+    channel_cap: usize,
 ) -> Result<u64, String> {
-    use rayon::prelude::*;
     use std::collections::HashMap as StdHashMap;
 
     let out = std::path::Path::new(output_dir);
     std::fs::create_dir_all(out).map_err(|e| format!("mkdir {}: {}", output_dir, e))?;
-
-    // Schema (no zoom) derived from an empty batch so the writers' schema
-    // EXACTLY matches what `build_batch_no_zoom` produces for real batches.
     let schema = build_batch_no_zoom(&[], tags)?.schema();
 
-    let mut part_counter: StdHashMap<u32, u32> = StdHashMap::new();
-    let mut total: u64 = 0;
-    let mut t_read = 0.0f64;
-    let mut t_xform = 0.0f64;
-    let mut t_write = 0.0f64;
-
-    let n = shard_paths.len();
-    let mut cursor = 0usize;
-    while cursor < n {
-        let start = cursor;
-        let mut est = 0usize;
-        let mut end = start;
-        while end < n && (end == start || est < max_batch_bytes) {
-            est += std::fs::metadata(&shard_paths[end])
-                .map(|m| m.len() as usize * 3)
-                .unwrap_or(0);
-            end += 1;
-        }
-        let chunk: Vec<PathBuf> = shard_paths[start..end].to_vec();
-        cursor = end;
-
-        // Parallel read + transform (rayon, GIL already released by the caller).
-        let _tr = std::time::Instant::now();
-        let reader = Fragment3DReader::from_paths(chunk);
-        let groups = reader
-            .read_all_grouped_parallel(io_threads, true)
-            .map_err(|e| e.to_string())?;
-        let mut tiles: Vec<((u32, u32, u32, u32), Vec<Fragment3D>)> =
-            groups.into_iter().collect();
-        for (_k, v) in tiles.iter_mut() {
-            v.sort_by_key(|f| f.feature_id);
-        }
-        t_read += _tr.elapsed().as_secs_f64();
-        let _tx = std::time::Instant::now();
-        let rows = collect_parquet_rows(&tiles, &world_bounds, max_zoom, base_cells);
-        t_xform += _tx.elapsed().as_secs_f64();
-        if rows.is_empty() {
-            continue;
-        }
-        let _tw = std::time::Instant::now();
-
-        // Partition rows by zoom, then split each zoom into ~cores parts so ZSTD
-        // parallelises at PART granularity (a single big zoom must NOT serialise
-        // the whole write — that was the regression). Each part is its own
-        // self-closing ArrowWriter written on a rayon task; the per-zoom part
-        // counter persists across chunks so part names never collide. Output
-        // values are unchanged (just distributed into more, smaller part files).
-        let mut by_zoom: StdHashMap<u32, Vec<ParquetRow>> = StdHashMap::new();
-        for r in rows {
-            by_zoom.entry(r.zoom as u32).or_default().push(r);
-        }
-        let total_bytes: u64 = by_zoom
-            .values()
-            .flat_map(|v| v.iter())
-            .map(|r| (r.positions.len() + r.indices.len()) as u64)
-            .sum::<u64>()
-            .max(1);
-        let cores = rayon::current_num_threads().max(1) as u64;
-        let mut zoom_vecs: Vec<(u32, Vec<ParquetRow>)> = by_zoom.into_iter().collect();
-        zoom_vecs.sort_by_key(|(z, _)| *z);
-
-        // Flat (zoom, part_idx, slice) work list across all zooms x sub-parts.
-        let mut work: Vec<(u32, u32, &[ParquetRow])> = Vec::new();
-        for (z, zrows) in &zoom_vecs {
-            if zrows.is_empty() {
-                continue;
+    // Precompute the byte-budget chunk path-lists (identical for both paths).
+    let mut chunks: Vec<Vec<PathBuf>> = Vec::new();
+    {
+        let n = shard_paths.len();
+        let mut cursor = 0usize;
+        while cursor < n {
+            let start = cursor;
+            let mut est = 0usize;
+            let mut end = start;
+            while end < n && (end == start || est < max_batch_bytes) {
+                est += std::fs::metadata(&shard_paths[end])
+                    .map(|m| m.len() as usize * 3)
+                    .unwrap_or(0);
+                end += 1;
             }
-            let zbytes: u64 = zrows
-                .iter()
-                .map(|r| (r.positions.len() + r.indices.len()) as u64)
-                .sum();
-            // Enough parts for parallelism (proportional to cores) AND to keep
-            // each part <= max_file_bytes, but never split below ~16 MB/part —
-            // so small datasets stay a single part (matching the pyarrow layout
-            // that the partitioning/prime tests expect) while large zooms fan out.
-            const MIN_PART_BYTES: u64 = 16 * 1024 * 1024;
-            let by_parallel = (cores * zbytes + total_bytes - 1) / total_bytes;
-            let by_size = (zbytes + max_file_bytes.max(1) - 1) / max_file_bytes.max(1);
-            let cap_minsize = (zbytes / MIN_PART_BYTES).max(1);
-            let n_parts = by_parallel
-                .max(by_size)
-                .max(1)
-                .min(cap_minsize)
-                .min(zrows.len() as u64) as usize;
-            let per = (zrows.len() + n_parts - 1) / n_parts;
-            let counter = part_counter.entry(*z).or_insert(0);
-            let mut s = 0usize;
-            while s < zrows.len() {
-                let e = (s + per).min(zrows.len());
-                work.push((*z, *counter, &zrows[s..e]));
-                *counter += 1;
-                s = e;
-            }
+            chunks.push(shard_paths[start..end].to_vec());
+            cursor = end;
         }
-
-        let results: Vec<Result<u64, String>> = work
-            .into_par_iter()
-            .map(|(z, idx, slice)| {
-                let dir = out.join(format!("zoom={}", z));
-                std::fs::create_dir_all(&dir)
-                    .map_err(|e| format!("mkdir {}: {}", dir.display(), e))?;
-                let path = dir.join(format!("part_{:03}.parquet", idx));
-                let batch = build_batch_no_zoom(slice, tags)?;
-                let file = std::fs::File::create(&path)
-                    .map_err(|e| format!("create {}: {}", path.display(), e))?;
-                let mut w = parquet::arrow::ArrowWriter::try_new(
-                    file,
-                    schema.clone(),
-                    Some((*props).clone()),
-                )
-                .map_err(|e| format!("ArrowWriter: {}", e))?;
-                w.write(&batch).map_err(|e| format!("write: {}", e))?;
-                w.close().map_err(|e| format!("close: {}", e))?;
-                Ok(slice.len() as u64)
-            })
-            .collect();
-        for r in results {
-            total += r?;
-        }
-        t_write += _tw.elapsed().as_secs_f64();
     }
 
+    let t_scope = std::time::Instant::now();
+
+    let total: u64 = if overlap_read {
+        // PIPELINE: a producer OS thread reads chunk N+1 on its own scoped
+        // K-thread read pool (blocking idle, stealing nothing from the consumer)
+        // while the MAIN thread is the sole ORDERED consumer (transform+write,
+        // owns its part_counter -> byte-identical). The consumer runs on a
+        // DEDICATED (cores-K)-wide pool to avoid oversubscription with the read
+        // pool; build_global is NOT used (other call sites need the full pool).
+        let cores = rayon::current_num_threads().max(1);
+        let read_k = if io_threads == 0 { 12 } else { io_threads.min(16) };
+        let cpw = cores.saturating_sub(read_k).max(1);
+        let consumer_pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(cpw)
+            .build()
+            .map_err(|e| e.to_string())?;
+
+        // `move` so the scope owns chunks/schema/props; the producer then moves
+        // chunks, and the consumer borrows schema/props by reference (the only
+        // value that MUST move into the consumer is the !Sync channel Receiver).
+        std::thread::scope(move |sc| -> Result<u64, String> {
+            type Chunk = (usize, Vec<((u32, u32, u32, u32), Vec<Fragment3D>)>);
+            let (tx, rx) = std::sync::mpsc::sync_channel::<Chunk>(channel_cap.max(1));
+            let schema_ref = &schema;
+            let props_ref = &props;
+
+            let prod = sc.spawn(move || -> Result<(), String> {
+                for (idx, chunk) in chunks.into_iter().enumerate() {
+                    let tiles = read_chunk_sorted(chunk, read_k)?;
+                    if tx.send((idx, tiles)).is_err() {
+                        break; // consumer hung up (error path) — stop reading
+                    }
+                }
+                Ok(()) // drop tx on return -> consumer sees EOF
+            });
+
+            // Consumer on the dedicated pool. `move` takes rx by value (Receiver
+            // is !Sync) plus the Copy references; all captures are Send.
+            let consumed: Result<u64, String> = consumer_pool.install(move || {
+                let mut pc: StdHashMap<u32, u32> = StdHashMap::new();
+                let mut t: u64 = 0;
+                let mut expected = 0usize;
+                for (got, tiles) in rx {
+                    debug_assert_eq!(got, expected, "consumer received chunks out of order");
+                    expected += 1;
+                    t += consume_chunk(
+                        &tiles, out, schema_ref, props_ref, tags, world_bounds,
+                        max_zoom, base_cells, max_file_bytes, &mut pc,
+                    )?;
+                }
+                Ok(t)
+            });
+            let t = consumed?;
+            prod.join().map_err(|_| "producer thread panicked".to_string())??;
+            Ok(t)
+        })?
+    } else {
+        let mut part_counter: StdHashMap<u32, u32> = StdHashMap::new();
+        let mut t: u64 = 0;
+        for chunk in chunks {
+            let tiles = read_chunk_sorted(chunk, io_threads)?;
+            t += consume_chunk(
+                &tiles, out, &schema, &props, tags, world_bounds, max_zoom,
+                base_cells, max_file_bytes, &mut part_counter,
+            )?;
+        }
+        t
+    };
+
     if std::env::var("MUDM_NATIVE_PROFILE").is_ok() {
+        use std::sync::atomic::Ordering::Relaxed;
         eprintln!(
-            "[native] read={:.1}s transform={:.1}s write+zstd={:.1}s",
-            t_read, t_xform, t_write
+            "[native] overlap={} scope={:.1}s rows={}",
+            overlap_read,
+            t_scope.elapsed().as_secs_f64(),
+            total
+        );
+        let geom = PROF_GEOM_NS.load(Relaxed) as f64 / 1e9;
+        let qem = PROF_QEM_NS.load(Relaxed) as f64 / 1e9;
+        let ser = PROF_SERIALIZE_NS.load(Relaxed) as f64 / 1e9;
+        eprintln!(
+            "[prof CPU-time sums] geom={:.1}s  qem={:.1}s  dedup+proj={:.1}s  serialize={:.1}s",
+            geom, qem, geom - qem, ser
         );
     }
     Ok(total)
@@ -3245,8 +3354,10 @@ impl StreamingTileGenerator {
     /// `_dict_to_record_batch`, no Python-side rotation). Bounded memory via the
     /// byte-budget shard cursor + persistent per-zoom rotating writers. Output is
     /// `{output_dir}/zoom=N/part_NNN.parquet`, byte-identical (modulo within-tile
-    /// row order) to the pyarrow partitioned path. `overlap_read` is reserved for
-    /// the Step-5 internal read/write overlap (currently sequential per chunk).
+    /// row order) to the pyarrow partitioned path. `overlap_read` runs the
+    /// producer/consumer read∥transform pipeline (default ON; measured ~23%
+    /// faster cold on oden, byte-identical) — pass `False` or set
+    /// `MUDM_NO_OVERLAP=1` to fall back to the strictly-sequential path.
     #[pyo3(signature = (output_dir, world_bounds, compression="zstd", compression_level=3, max_batch_bytes=2_000_000_000, max_file_bytes=500_000_000, overlap_read=true))]
     fn generate_parquet_native_partitioned(
         &mut self,
@@ -3259,7 +3370,18 @@ impl StreamingTileGenerator {
         max_file_bytes: u64,
         overlap_read: bool,
     ) -> PyResult<u64> {
-        let _ = overlap_read; // sequential for now; Step 5 adds internal overlap
+        // Read∥transform pipeline. Default ON (byte-identical to the sequential
+        // path, ~23% faster cold). MUDM_OVERLAP=1 force-enables even if a caller
+        // passes overlap_read=False; MUDM_NO_OVERLAP=1 is the kill switch (wins).
+        // MUDM_OVERLAP_CAP sets the in-flight chunk depth (default 1 = strict
+        // double-buffer, the measured optimum).
+        let overlap = (overlap_read || std::env::var("MUDM_OVERLAP").is_ok())
+            && std::env::var("MUDM_NO_OVERLAP").is_err();
+        let channel_cap = std::env::var("MUDM_OVERLAP_CAP")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(1)
+            .max(1);
         self._init_parquet_stream()?;
         let shard_paths = std::mem::take(&mut self.shard_paths_snapshot);
         let max_zoom = self.max_zoom;
@@ -3276,7 +3398,7 @@ impl StreamingTileGenerator {
         let result = py.allow_threads(|| {
             run_native_partitioned(
                 shard_paths, &out, wb, max_zoom, base_cells, io_threads, &tags,
-                max_batch_bytes, max_file_bytes, props,
+                max_batch_bytes, max_file_bytes, props, overlap, channel_cap,
             )
         });
         // Always close the stream, even on error (avoid leaking the active lock).
