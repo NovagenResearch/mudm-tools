@@ -26,3 +26,11 @@ gltf = { version = "1.4", features = ["import", "utils"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
+
+# mudm-tools vendored fork of draco-oxide 0.1.0-alpha.4 with a one-line
+# prelude visibility patch (exposes AttributeDomain + AttributeId) so the
+# Draco encoder can build meshes in-memory instead of round-tripping ASCII
+# .obj. Pinned to a vendored path source (deterministic; no branch/tag ref).
+# Cargo.lock records this as `source = ... (path)` for the patched crate.
+[patch.crates-io]
+draco-oxide = { path = "vendor/draco-oxide" }

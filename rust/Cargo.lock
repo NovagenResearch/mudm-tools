@@ -741,8 +741,6 @@ dependencies = [
 [[package]]
 name = "draco-oxide"
 version = "0.1.0-alpha.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "acbad1ec71b929aa0766554fdea06b3862ca8658ad8482aa0f803182760c2ae5"
 dependencies = [
  "base64 0.21.7",
  "draco-nd-vector",
