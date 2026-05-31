@@ -31,6 +31,7 @@ from collections import Counter
 from pathlib import Path
 
 import numpy as np
+import pyarrow as pa
 import pyarrow.dataset as ds
 import torch
 import torch.nn as nn
@@ -94,7 +95,18 @@ def _instance_base(inst):
 
 def load_neurons(tiles, coarse_zoom, fine_zoom, label_scheme, top_n, max_neurons,
                  cap, seed):
-    dset = ds.dataset(str(tiles), format="parquet")
+    tiles_p = Path(tiles)
+    if tiles_p.is_dir():
+        # Partitioned output: `zoom` is the zoom=N/ dir name (dropped from the
+        # file schema). Re-expose it as an int32 column via hive partitioning so
+        # the ds.field("zoom") filter + column read work (mirrors read_parquet).
+        dset = ds.dataset(
+            str(tiles_p), format="parquet",
+            partitioning=ds.HivePartitioning(pa.schema([("zoom", pa.int32())])),
+        )
+    else:
+        # Single-file output: `zoom` is already a column.
+        dset = ds.dataset(str(tiles_p), format="parquet")
     print(f"schema: {dset.schema.names}", flush=True)
     coarse = {}; fine = {}; ctype = {}; inst_base = {}
     clen = {}; flen = {}

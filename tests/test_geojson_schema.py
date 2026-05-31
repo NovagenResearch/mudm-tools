@@ -1,13 +1,15 @@
 import json
 import jsonschema
+import mudm
 import pytest
 from jsonschema import validate
 
 from mudm_tools.fileutils import gather_example_files
 
-# Load the generated GeoJSON schema
-with open("geojson_schema.json") as f:
-    schema = json.load(f)
+# GeoJSON schema generated from the mudm model. (The committed `geojson_schema.json`
+# build artifact was dropped in the repo split; generate it from the model instead,
+# so the test always validates against the current model's schema.)
+schema = mudm.GeoJSON.model_json_schema()
 
 # Define the directories containing the example JSON files
 VALID_EXAMPLES_DIR = "tests/json/geojson/valid"

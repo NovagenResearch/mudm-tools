@@ -83,28 +83,61 @@ def measure_peak_memory(B: int, n_cls: int, device: torch.device, bs: int) -> di
             "n_params": int(n_params)}
 
 
-def lod_storage_per_zoom(tiles_path: str) -> dict:
-    """Per-LOD on-disk storage from parquet metadata (no decompression)."""
-    pf = pq.ParquetFile(tiles_path)
-    z = pf.read(columns=["zoom"]).column("zoom").to_numpy()
-    per = collections.defaultdict(lambda: {"compressed": 0, "uncompressed": 0, "rows": 0})
-    offset = 0
+def _positions_stats(pf):
+    """Sum the `positions` column compressed/uncompressed bytes + rows across
+    every row group of one ParquetFile."""
+    comp = uncomp = rows = 0
     for rg in range(pf.metadata.num_row_groups):
         rgm = pf.metadata.row_group(rg)
-        n = rgm.num_rows
-        rg_zooms = z[offset:offset + n]; offset += n
-        zc = collections.Counter(rg_zooms.tolist())
-        pos_comp = pos_uncomp = 0
+        rows += rgm.num_rows
         for ci in range(rgm.num_columns):
             col = rgm.column(ci)
             if col.path_in_schema == "positions":
-                pos_comp = col.total_compressed_size
-                pos_uncomp = col.total_uncompressed_size
+                comp += col.total_compressed_size
+                uncomp += col.total_uncompressed_size
                 break
-        for zoom, cnt in zc.items():
-            per[int(zoom)]["compressed"] += pos_comp * cnt // n
-            per[int(zoom)]["uncompressed"] += pos_uncomp * cnt // n
-            per[int(zoom)]["rows"] += cnt
+    return comp, uncomp, rows
+
+
+def lod_storage_per_zoom(tiles_path: str) -> dict:
+    """Per-LOD on-disk storage from parquet metadata (no decompression).
+
+    Dual-mode: a partitioned ``zoom=N/part_*.parquet`` directory (one zoom per
+    subdir → exact per-zoom bytes) or a single ``tiles.parquet`` file (``zoom``
+    is a column → row-group positions bytes apportioned by per-zoom row count)."""
+    per = collections.defaultdict(lambda: {"compressed": 0, "uncompressed": 0, "rows": 0})
+    p = Path(tiles_path)
+    if p.is_dir():
+        for zdir in sorted(p.glob("zoom=*")):
+            try:
+                zoom = int(zdir.name.split("=", 1)[1])
+            except (IndexError, ValueError):
+                continue
+            for part in sorted(zdir.glob("*.parquet")):
+                c, u, r = _positions_stats(pq.ParquetFile(part))
+                per[zoom]["compressed"] += c
+                per[zoom]["uncompressed"] += u
+                per[zoom]["rows"] += r
+    else:
+        pf = pq.ParquetFile(tiles_path)
+        z = pf.read(columns=["zoom"]).column("zoom").to_numpy()
+        offset = 0
+        for rg in range(pf.metadata.num_row_groups):
+            rgm = pf.metadata.row_group(rg)
+            n = rgm.num_rows
+            rg_zooms = z[offset:offset + n]; offset += n
+            zc = collections.Counter(rg_zooms.tolist())
+            pos_comp = pos_uncomp = 0
+            for ci in range(rgm.num_columns):
+                col = rgm.column(ci)
+                if col.path_in_schema == "positions":
+                    pos_comp = col.total_compressed_size
+                    pos_uncomp = col.total_uncompressed_size
+                    break
+            for zoom, cnt in zc.items():
+                per[int(zoom)]["compressed"] += pos_comp * cnt // n
+                per[int(zoom)]["uncompressed"] += pos_uncomp * cnt // n
+                per[int(zoom)]["rows"] += cnt
     fine_unc = per.get(3, {}).get("uncompressed", 1) or 1
     out = {}
     for zoom, v in per.items():

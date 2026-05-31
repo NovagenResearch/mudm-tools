@@ -771,11 +771,17 @@ def tile_streaming(
     t_index_pq = _ingest_chunked(gen_pq)
 
     t0 = time.perf_counter()
-    n_rows_pq = _gen_pq(gen_pq, pq_path, bounds)
+    # partitioned=True -> native Rust consolidation: bounded memory (O(batch),
+    # not O(all rows)) + the read∥transform overlap path. Output is now a
+    # `tiles.parquet/zoom=N/part_*.parquet` DIRECTORY, not a single file.
+    n_rows_pq = _gen_pq(gen_pq, pq_path, bounds, partitioned=True)
     t_gen_pq = time.perf_counter() - t0
     del gen_pq
 
-    pq_size = pq_path.stat().st_size if pq_path.exists() else 0
+    if pq_path.is_dir():
+        pq_size = sum(f.stat().st_size for f in pq_path.rglob("*") if f.is_file())
+    else:
+        pq_size = pq_path.stat().st_size if pq_path.exists() else 0
     results["parquet_rows"] = n_rows_pq
     results["parquet_index_time"] = t_index_pq
     results["parquet_gen_time"] = t_gen_pq

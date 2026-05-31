@@ -41,7 +41,7 @@ def test_geojson_validation():
 
 
 def test_rust_available_flag():
-    import mudm
+    import mudm_tools
 
     assert isinstance(mudm_tools.RUST_AVAILABLE, bool)
 

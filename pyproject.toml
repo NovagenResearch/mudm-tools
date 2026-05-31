@@ -39,6 +39,14 @@ dependencies = [
 
 [project.optional-dependencies]
 draco = ["DracoPy>=1.4"]
+# Xenium spatial-transcriptomics converter (scripts/xenium_to_tiles.py +
+# converters/xenium.py). Optional: install with `pip install mudm-tools[xenium]`
+# or run tests with `uv run --extra xenium pytest`.
+xenium = [
+    "polars>=1.41.2",
+    "tifffile>=2026.3.3",
+    "pillow>=12.2.0",
+]
 
 [project.scripts]
 mudm-serve = "mudm_tools.serve:main"
@@ -67,4 +75,9 @@ pythonpath = ["src/", "scripts/"]
 dev = [
     "maturin>=1.13.1",
     "pytest>=9.0.3",
+    # torch is a runtime dep of active_learning/classifiers/xenium_mlp.py and of
+    # the benchmark/probe scripts + their tests. It was previously undeclared
+    # (present only ad-hoc in the venv); declared here so the test suite is
+    # reproducible. Runtime users of the ML classifier should install torch too.
+    "torch>=2.6",
 ]

@@ -1,14 +1,22 @@
 """Tests for Xenium -> muDM tile conversion pipeline."""
 
 import json
-import numpy as np
-import polars as pl
-import pytest
 from pathlib import Path
 
+import numpy as np
+import pytest
+
+# These tests exercise the optional [xenium] extra (polars/tifffile/pillow).
+# Skip the whole module when it isn't installed so the core suite stays green;
+# run them with `uv run --extra xenium pytest tests/test_xenium_to_tiles.py`.
+pytest.importorskip("polars")
+pytest.importorskip("tifffile")
+pytest.importorskip("PIL")
+
+import polars as pl
 from PIL import Image
 
-from scripts.xenium_to_tiles import boundaries_to_geojson, transcripts_to_geojson, read_um_per_px, generate_raster_tiles, generate_vector_tiles, write_metadata, convert_xenium
+from xenium_to_tiles import boundaries_to_geojson, transcripts_to_geojson, read_um_per_px, generate_raster_tiles, generate_vector_tiles, write_metadata, convert_xenium
 
 
 @pytest.fixture
@@ -129,6 +137,7 @@ def test_generate_vector_tiles(tmp_boundary_parquet, tmp_path):
         layer_name="cells",
         min_zoom=0,
         max_zoom=1,
+        temp_dir=str(tmp_path / "tmp"),
     )
 
     assert info["feature_count"] == 2
@@ -150,6 +159,7 @@ def test_generate_transcript_vector_tiles(tmp_transcript_parquet, tmp_path):
         layer_name="transcripts",
         min_zoom=0,
         max_zoom=1,
+        temp_dir=str(tmp_path / "tmp"),
     )
 
     assert info["feature_count"] == 3

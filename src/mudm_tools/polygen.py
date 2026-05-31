@@ -4,7 +4,7 @@ import string
 from shapely.geometry import MultiPoint
 from shapely.geometry.polygon import orient
 from typing import List
-import mudm_tools.model as mj
+import mudm.model as mj
 
 
 def generate_convex_polygon(x0, y0, x1, y1, num_vertices) -> List[float]:

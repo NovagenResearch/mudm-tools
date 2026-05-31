@@ -1,11 +1,15 @@
 import json
+from pathlib import Path
+
 import jsonschema
 import pytest
 from jsonschema import validate
 from mudm_tools.fileutils import gather_example_files
 
-# Load the original GeoJSON schema
-with open("external/GeoJSON.json") as f:
+# Load the original upstream (RFC 7946) GeoJSON schema, vendored under external/.
+# Path is anchored to the repo root so the test works regardless of CWD.
+_SCHEMA_PATH = Path(__file__).resolve().parents[1] / "external" / "GeoJSON.json"
+with open(_SCHEMA_PATH) as f:
     schema = json.load(f)
 
 # Define the directories containing the example JSON files
