@@ -206,7 +206,7 @@ impl ShardReader3D {
 /// `mmap` + `madvise(WILLNEED)`. The handle is dropped immediately after the
 /// hint is issued — the kernel hint persists past close.
 #[cfg(target_os = "linux")]
-fn prefetch_advise(path: &Path) {
+pub(crate) fn prefetch_advise(path: &Path) {
     use std::os::unix::io::AsRawFd;
     if let Ok(f) = File::open(path) {
         let fd = f.as_raw_fd();
@@ -220,7 +220,7 @@ fn prefetch_advise(path: &Path) {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn prefetch_advise(path: &Path) {
+pub(crate) fn prefetch_advise(path: &Path) {
     if let Ok(f) = File::open(path) {
         // Safety: file is opened read-only and the mapping is not aliased
         // mutably; we only issue an advisory hint and drop the mapping.

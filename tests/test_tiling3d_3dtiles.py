@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import math
+import sys
 from pathlib import Path
 
 import pytest
@@ -539,3 +540,349 @@ def test_parentid_extras_in_glb(tmp_path):
     assert any(
         n.get("extras", {}).get("compartment") == "axon" for n in nodes
     ), f"no node carries compartment tag; got nodes={nodes}"
+
+
+# ===========================================================================
+# WS-C C.1 + C.4 — GLB byte-identity gate (serial == parallel, canonical order)
+# ===========================================================================
+
+
+def _make_obj_shards(obj_dir: Path, n: int = 60, *, seed: int = 1) -> list[str]:
+    """Write `n` tiny single-triangle .obj files clustered in world space.
+
+    add_obj_files writes ONE `.mjf` shard per input file, so the encode phase
+    must merge many shards' fragments into the same coarse-zoom tiles. The
+    within-tile merge order (DashMap) is non-deterministic across reads; this
+    is the structure that makes the feature_id sort load-bearing for byte
+    identity.
+    """
+    import random
+
+    obj_dir.mkdir(parents=True, exist_ok=True)
+    rng = random.Random(seed)
+    paths: list[str] = []
+    for i in range(n):
+        cx = rng.uniform(5.0, 15.0)
+        cy = rng.uniform(5.0, 15.0)
+        cz = rng.uniform(5.0, 15.0)
+        p = obj_dir / f"mesh_{i:03d}.obj"
+        p.write_text(
+            f"v {cx} {cy} {cz}\n"
+            f"v {cx + 1.0} {cy} {cz}\n"
+            f"v {cx + 0.5} {cy + 1.0} {cz + 0.5}\n"
+            "f 1 2 3\n"
+        )
+        paths.append(str(p))
+    return paths
+
+
+def _glb_sha_map(out_dir: Path) -> dict[str, str]:
+    import hashlib
+
+    return {
+        str(p.relative_to(out_dir)): hashlib.sha256(p.read_bytes()).hexdigest()
+        for p in sorted(out_dir.rglob("*.glb"))
+    }
+
+
+def _generate_3dtiles_from_shards(
+    tmp_path: Path, out_name: str, *, io_threads: int
+) -> dict[str, str]:
+    """Ingest the shared OBJ shard fixture and emit GLB tiles, returning the
+    {glb_relpath: sha256} map. `io_threads=1` is serial, `0` uses the global
+    rayon pool (parallel reads)."""
+    from mudm_tools._rs import StreamingTileGenerator
+
+    obj_dir = tmp_path / "objs"
+    if not obj_dir.exists():
+        _make_obj_shards(obj_dir)
+    paths = sorted(str(p) for p in obj_dir.glob("*.obj"))
+    bounds = (0.0, 0.0, 0.0, 100.0, 100.0, 100.0)
+
+    gen = StreamingTileGenerator(min_zoom=0, max_zoom=3, base_cells=100)
+    gen._set_io_threads(io_threads)
+    tags = [{"idx": str(i)} for i in range(len(paths))]
+    gen.add_obj_files(paths, bounds, tags, 0)
+
+    out_dir = tmp_path / out_name
+    gen.generate_3dtiles(str(out_dir), bounds)
+    return _glb_sha_map(out_dir)
+
+
+def test_glb_serial_equals_parallel_byte_identity(tmp_path):
+    """WS-C C.1+C.4 gate: with the per-tile feature_id sort canonicalizing
+    within-tile node order, a SERIAL run (io_threads=1) and a PARALLEL run
+    (global pool) must produce BYTE-IDENTICAL .glb files.
+
+    Pre-sort this FAILS because the DashMap merge of many shards into a tile is
+    non-deterministic (verified: serial run-to-run output itself varies). The
+    sort canonicalizes node order so serial == parallel == stable.
+    """
+    pytest.importorskip("mudm_tools._rs")
+
+    serial = _generate_3dtiles_from_shards(tmp_path, "serial", io_threads=1)
+    parallel = _generate_3dtiles_from_shards(tmp_path, "parallel", io_threads=0)
+
+    assert serial, "no GLB tiles produced"
+    assert set(serial) == set(parallel), (
+        f"different tile sets: serial-only={set(serial) - set(parallel)} "
+        f"parallel-only={set(parallel) - set(serial)}"
+    )
+    diffs = {k: (serial[k], parallel[k]) for k in serial if serial[k] != parallel[k]}
+    assert not diffs, (
+        f"{len(diffs)} GLB tiles differ between serial and parallel runs "
+        f"(non-canonical within-tile order); e.g. {list(diffs)[:5]}"
+    )
+
+
+def test_glb_serial_runs_are_stable_byte_identity(tmp_path):
+    """WS-C C.1+C.4 gate: two independent serial ingests of the same multi-shard
+    fixture must produce byte-identical GLB. Pre-sort this FAILS (DashMap merge
+    order is non-deterministic even serially); the feature_id sort fixes it."""
+    pytest.importorskip("mudm_tools._rs")
+
+    run_a = _generate_3dtiles_from_shards(tmp_path, "serial_a", io_threads=1)
+    run_b = _generate_3dtiles_from_shards(tmp_path, "serial_b", io_threads=1)
+
+    assert run_a, "no GLB tiles produced"
+    diffs = {k: (run_a[k], run_b[k]) for k in run_a if run_a[k] != run_b[k]}
+    assert not diffs, (
+        f"{len(diffs)} GLB tiles differ between two serial runs "
+        f"(non-deterministic merge order); e.g. {list(diffs)[:5]}"
+    )
+
+
+# ===========================================================================
+# WS-C C.2 — n_batches back-pressure against the ceiling + Step 2b floor
+# ===========================================================================
+
+
+def _make_spread_obj_shards(obj_dir: Path, n: int = 80, *, seed: int = 7) -> list[str]:
+    """Write `n` tiny single-triangle .obj files SPREAD across world space so
+    they fall into many distinct coarse-zoom tile keys.
+
+    Unlike `_make_obj_shards` (which clusters into one coarse tile), spreading
+    across tile keys lets the C.2 hash-batcher actually split the resident set
+    across batches — exercising the re-split path. Each .obj is its own shard,
+    so the encode phase still merges shards into tiles per the C.4 sort.
+    """
+    import random
+
+    obj_dir.mkdir(parents=True, exist_ok=True)
+    rng = random.Random(seed)
+    paths: list[str] = []
+    for i in range(n):
+        # Spread across the full [2, 98] cube so coarse zooms get distinct tiles.
+        cx = rng.uniform(2.0, 98.0)
+        cy = rng.uniform(2.0, 98.0)
+        cz = rng.uniform(2.0, 98.0)
+        p = obj_dir / f"spread_{i:03d}.obj"
+        p.write_text(
+            f"v {cx} {cy} {cz}\n"
+            f"v {cx + 0.5} {cy} {cz}\n"
+            f"v {cx + 0.25} {cy + 0.5} {cz + 0.25}\n"
+            "f 1 2 3\n"
+        )
+        paths.append(str(p))
+    return paths
+
+
+def _generate_3dtiles_spread(
+    tmp_path: Path,
+    out_name: str,
+    *,
+    io_threads: int,
+    max_memory_bytes: int | None = None,
+    probe: bool = False,
+) -> tuple[dict[str, str], int]:
+    """Ingest the spread OBJ fixture and emit GLB tiles. Returns
+    ({glb_relpath: sha256}, peak_resident_bytes). `peak` is 0 unless
+    `probe=True` (resets + reads the per-batch peak-resident probe)."""
+    from mudm_tools._rs import StreamingTileGenerator
+
+    obj_dir = tmp_path / "spread_objs"
+    if not obj_dir.exists():
+        _make_spread_obj_shards(obj_dir)
+    paths = sorted(str(p) for p in obj_dir.glob("*.obj"))
+    bounds = (0.0, 0.0, 0.0, 100.0, 100.0, 100.0)
+
+    gen = StreamingTileGenerator(min_zoom=0, max_zoom=3, base_cells=100)
+    gen._set_io_threads(io_threads)
+    if max_memory_bytes is not None:
+        gen._set_max_memory(max_memory_bytes)
+    tags = [{"idx": str(i)} for i in range(len(paths))]
+    gen.add_obj_files(paths, bounds, tags, 0)
+
+    if probe:
+        gen._reset_peak_resident_bytes()
+
+    out_dir = tmp_path / out_name
+    gen.generate_3dtiles(str(out_dir), bounds)
+    peak = gen._get_peak_resident_bytes() if probe else 0
+    return _glb_sha_map(out_dir), peak
+
+
+def test_glb_back_pressure_keeps_peak_within_budget(tmp_path):
+    """WS-C C.2 gate: a tiny ceiling that under-estimates with the disk*3.0
+    guess must force >1 batch via re-split, keeping peak resident decoded
+    bytes within budget — AND the GLB output stays byte-identical to the
+    default-budget (C.1) run (the feature_id sort is preserved)."""
+    pytest.importorskip("mudm_tools._rs")
+
+    # Baseline: default (large) ceiling — the C.1 byte-identity reference.
+    baseline, _ = _generate_3dtiles_spread(tmp_path, "bp_baseline", io_threads=1)
+    assert baseline, "no GLB tiles produced"
+
+    # Tiny ceiling forces the per-zoom resident set to be split into batches and
+    # re-split when a batch overshoots. 64 KiB is far below one zoom's resident
+    # set for this fixture but above any single tile's floor.
+    tiny = 64 * 1024
+    bounded, peak = _generate_3dtiles_spread(
+        tmp_path, "bp_bounded", io_threads=1, max_memory_bytes=tiny, probe=True
+    )
+
+    # Output unchanged vs the C.1 baseline (back-pressure changes batching only).
+    assert set(baseline) == set(bounded), (
+        f"different tile sets: baseline-only={set(baseline) - set(bounded)} "
+        f"bounded-only={set(bounded) - set(baseline)}"
+    )
+    diffs = {k: (baseline[k], bounded[k]) for k in baseline if baseline[k] != bounded[k]}
+    assert not diffs, (
+        f"{len(diffs)} GLB tiles differ between default-budget and bounded runs; "
+        f"e.g. {list(diffs)[:5]}"
+    )
+
+    # Peak resident decoded bytes per batch stays within the derived budget.
+    # The function derives effective_budget = 0.8 * ceiling; the probe records
+    # the actual resident bytes after the (possibly re-split) batch is built.
+    assert peak > 0, "peak-resident probe did not record any batch"
+    assert peak <= tiny, (
+        f"peak resident bytes {peak} exceeded ceiling {tiny} — back-pressure "
+        f"re-split did not bound the batch"
+    )
+
+
+def _make_one_tile_obj_shards(obj_dir: Path, n: int = 200, *, seed: int = 3) -> list[str]:
+    """Write `n` tiny .obj files tightly clustered so ALL fragments land in the
+    SAME single coarse-zoom tile key — an irreducible completeness unit that
+    cannot be split across batches. Used to exercise the Step 2b hard floor."""
+    import random
+
+    obj_dir.mkdir(parents=True, exist_ok=True)
+    rng = random.Random(seed)
+    paths: list[str] = []
+    for i in range(n):
+        # All within a tiny neighborhood → one tile at every zoom.
+        cx = 50.0 + rng.uniform(-0.05, 0.05)
+        cy = 50.0 + rng.uniform(-0.05, 0.05)
+        cz = 50.0 + rng.uniform(-0.05, 0.05)
+        p = obj_dir / f"onetile_{i:04d}.obj"
+        p.write_text(
+            f"v {cx} {cy} {cz}\n"
+            f"v {cx + 0.01} {cy} {cz}\n"
+            f"v {cx + 0.005} {cy + 0.01} {cz + 0.005}\n"
+            "f 1 2 3\n"
+        )
+        paths.append(str(p))
+    return paths
+
+
+def test_glb_floor_violation_raises(tmp_path):
+    """WS-C Step 2b (hard-cap floor): a single tile whose resident fragments
+    exceed a tiny ceiling cannot be split (it is written whole via fs::write),
+    so the generator must record a Fatal ceiling_floor failure and raise the
+    typed error — fail-fast, rather than silently OOMing."""
+    pytest.importorskip("mudm_tools._rs")
+    from mudm_tools._rs import StreamingTileGenerator
+
+    obj_dir = tmp_path / "onetile_objs"
+    paths = _make_one_tile_obj_shards(obj_dir)
+    bounds = (0.0, 0.0, 0.0, 100.0, 100.0, 100.0)
+
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+
+    gen = StreamingTileGenerator(min_zoom=0, max_zoom=3, base_cells=100)
+    gen._set_io_threads(1)
+    gen._set_run_dir(str(run_dir))
+    # A ceiling below one tile's resident fragment bytes → irreducible floor.
+    gen._set_max_memory(256)
+    tags = [{"idx": str(i)} for i in range(len(paths))]
+    gen.add_obj_files(paths, bounds, tags, 0)
+
+    out_dir = tmp_path / "floor_tiles"
+    with pytest.raises(Exception) as exc:
+        gen.generate_3dtiles(str(out_dir), bounds)
+    msg = str(exc.value).lower()
+    assert "ceiling" in msg or "floor" in msg, (
+        f"floor-violation error should name the ceiling/floor; got: {exc.value}"
+    )
+
+    # The Fatal record must be in errors.jsonl with kind ceiling_floor.
+    log = (run_dir / "errors.jsonl").read_text()
+    assert "ceiling_floor" in log, f"no ceiling_floor record in errors.jsonl; got: {log}"
+    assert '"severity":"fatal"' in log, f"floor violation must be fatal; got: {log}"
+
+
+# ===========================================================================
+# WS-C C.5 — GLB peak-RSS test (Linux-gated)
+# ===========================================================================
+
+
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux"),
+    reason="ru_maxrss semantics differ per-OS (KB on Linux, bytes on macOS); "
+    "the peak-RSS budget assertion is calibrated for Linux. Skips on macOS.",
+)
+def test_glb_peak_rss_within_budget_linux(tmp_path):
+    """WS-C C.5 gate (Linux-only): under a tiny `_set_max_memory` ceiling that
+    forces the per-zoom resident set to be split into >1 batch, the process's
+    peak RSS growth across `generate_3dtiles` must stay within the ceiling plus
+    a generous slack (encode staging, Python/arrow allocator headroom, glibc
+    arena retention). This is the end-to-end RSS proof that complements the
+    cheap per-batch resident-bytes probe asserted by
+    `test_glb_back_pressure_keeps_peak_within_budget`.
+
+    Decode-counter follow-up: a per-shard "decoded <= once per zoom" counter is
+    NOT currently exposed by the Rust extension (only the process-global
+    PEAK_RESIDENT_BYTES probe via `_get/_reset_peak_resident_bytes`). The
+    per-batch resident-bytes probe below stands in as the bounded-memory proof;
+    a dedicated decode-counter is a follow-up if cross-zoom re-decode accounting
+    is needed (see WS-C C.5 Step 1).
+    """
+    import resource
+
+    pytest.importorskip("mudm_tools._rs")
+
+    # Tiny ceiling forces >1 batch (well below one zoom's resident set for the
+    # spread fixture, but above any single tile's irreducible floor).
+    tiny = 64 * 1024
+
+    rss_before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+
+    shas, peak = _generate_3dtiles_spread(
+        tmp_path, "rss_bounded", io_threads=1, max_memory_bytes=tiny, probe=True
+    )
+    assert shas, "no GLB tiles produced"
+
+    rss_after = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    # ru_maxrss is KB on Linux; convert the delta to bytes.
+    rss_delta_bytes = (rss_after - rss_before) * 1024
+
+    # The cheap per-batch resident probe must show the bounded batch.
+    assert peak > 0, "peak-resident probe did not record any batch"
+    assert peak <= tiny, (
+        f"per-batch resident bytes {peak} exceeded ceiling {tiny} — back-pressure "
+        f"re-split did not bound the batch"
+    )
+
+    # End-to-end RSS growth must stay within the ceiling + slack. ru_maxrss is a
+    # high-water mark for the whole process (never shrinks), so a large slack
+    # absorbs the Rust/Python/arrow allocator footprint that is unrelated to the
+    # decoded-fragment residency the ceiling governs. The point is that growth is
+    # bounded (does NOT scale with the full corpus), not byte-exact.
+    slack = 256 * 1024 * 1024  # 256 MiB
+    assert rss_delta_bytes < tiny + slack, (
+        f"peak RSS grew by {rss_delta_bytes} bytes across generate_3dtiles, "
+        f"exceeding ceiling {tiny} + slack {slack} — memory is not bounded"
+    )
