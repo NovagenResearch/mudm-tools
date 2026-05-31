@@ -8,6 +8,7 @@ mod simplify;
 mod tile_transform;
 mod encoder_pbf3;
 mod fragment;
+mod error_log;
 mod encoder_glb;
 mod tileset_json;
 mod streaming;

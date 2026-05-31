@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import sys
 import time
@@ -72,6 +73,35 @@ def _fmt_bytes(n: int) -> str:
     if n < 1024 * 1024:
         return f"{n / 1024:.1f} KB"
     return f"{n / (1024 * 1024):.2f} MB"
+
+
+def _surface_run_summary(pyramid_dir: Path, phase: str) -> dict | None:
+    """Read ``<pyramid_dir>/run_summary.json`` (WS-D) and ``logging.info`` it.
+
+    The Rust ErrorCollector streams ``errors.jsonl`` + ``run_summary.json`` under
+    ``pyramid_dir`` (only when ``_set_run_dir`` is set and the phase wires the
+    collector). The Rust side already raises on fatal; Python just surfaces the
+    honest ok/fail counts and the errors.jsonl path. Returns the parsed summary,
+    or ``None`` when no summary was written for this phase.
+    """
+    summary_path = pyramid_dir / "run_summary.json"
+    if not summary_path.exists():
+        return None
+    try:
+        summary = json.loads(summary_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    errlog = pyramid_dir / "errors.jsonl"
+    logging.info(
+        "[%s] run_summary: ok=%s fail=%s fatal=%s elapsed_s=%.2f (errors: %s)",
+        summary.get("phase", phase),
+        summary.get("ok", "?"),
+        summary.get("fail", "?"),
+        summary.get("fatal", "?"),
+        float(summary.get("elapsed_s", 0.0)),
+        errlog if errlog.exists() else "none",
+    )
+    return summary
 
 
 # ---------------------------------------------------------------------------
@@ -643,6 +673,7 @@ def tile_streaming(
         pbf3_dir.mkdir(parents=True, exist_ok=True)
 
         gen = StreamingTileGenerator(min_zoom=0, max_zoom=max_zoom)
+        gen._set_run_dir(str(pyramid_dir))
         print(f"\nStreaming pbf3 ingest (zoom 0-{max_zoom})...")
         t_index = _ingest_chunked(gen)
         print(f"  Ingest: {_fmt_time(t_index)}")
@@ -650,6 +681,7 @@ def tile_streaming(
         t0 = time.perf_counter()
         n_tiles = gen.generate_pbf3(str(pbf3_dir), "default")
         t_gen = time.perf_counter() - t0
+        _surface_run_summary(pyramid_dir, "pbf3")
 
         tilejson_path = pbf3_dir / "tilejson3d.json"
         gen.write_tilejson3d(str(tilejson_path), bounds, "default")
@@ -676,12 +708,14 @@ def tile_streaming(
         tiles3d_dir.mkdir(parents=True, exist_ok=True)
 
         gen3d = StreamingTileGenerator(min_zoom=0, max_zoom=max_zoom, base_cells=100)
+        gen3d._set_run_dir(str(pyramid_dir))
         print(f"\nStreaming 3D Tiles ingest (zoom 0-{max_zoom}, base_cells=100)...")
         t_index_3d = _ingest_chunked(gen3d)
 
         t0 = time.perf_counter()
         n_tiles_3d = gen3d.generate_3dtiles(str(tiles3d_dir), bounds)
         t_gen_3d = time.perf_counter() - t0
+        _surface_run_summary(pyramid_dir, "3dtiles")
         del gen3d
 
         tiles3d_size = sum(f.stat().st_size for f in tiles3d_dir.rglob("*") if f.is_file())
@@ -718,12 +752,14 @@ def tile_streaming(
         feat_pbf3_dir.mkdir(parents=True, exist_ok=True)
 
         gen_fpbf3 = StreamingTileGenerator(min_zoom=0, max_zoom=max_zoom, base_cells=100)
+        gen_fpbf3._set_run_dir(str(pyramid_dir))
         print(f"\nStreaming feature-centric PBF3 ingest (zoom 0-{max_zoom}, base_cells=100)...")
         t_index_fpbf3 = _ingest_chunked(gen_fpbf3)
 
         t0 = time.perf_counter()
         n_feat_pbf3 = gen_fpbf3.generate_feature_pbf3(str(feat_pbf3_dir), bounds)
         t_gen_fpbf3 = time.perf_counter() - t0
+        _surface_run_summary(pyramid_dir, "feature_pbf3")
         del gen_fpbf3
 
         feat_pbf3_size = sum(f.stat().st_size for f in feat_pbf3_dir.rglob("*") if f.is_file())
@@ -744,12 +780,14 @@ def tile_streaming(
         ng_dir.mkdir(parents=True, exist_ok=True)
 
         gen_ng = StreamingTileGenerator(min_zoom=0, max_zoom=max_zoom, base_cells=100)
+        gen_ng._set_run_dir(str(pyramid_dir))
         print(f"\nStreaming Neuroglancer ingest (zoom 0-{max_zoom}, base_cells=100)...")
         t_index_ng = _ingest_chunked(gen_ng)
 
         t0 = time.perf_counter()
         n_feat_ng = gen_ng.generate_neuroglancer_multilod(str(ng_dir), bounds)
         t_gen_ng = time.perf_counter() - t0
+        _surface_run_summary(pyramid_dir, "neuroglancer")
         del gen_ng
 
         ng_size = sum(f.stat().st_size for f in ng_dir.rglob("*") if f.is_file())
@@ -767,6 +805,7 @@ def tile_streaming(
 
     pq_path = pyramid_dir / "tiles.parquet"
     gen_pq = StreamingTileGenerator(min_zoom=0, max_zoom=max_zoom, base_cells=100)
+    gen_pq._set_run_dir(str(pyramid_dir))
     print(f"\nStreaming Parquet ingest (zoom 0-{max_zoom}, base_cells=100)...")
     t_index_pq = _ingest_chunked(gen_pq)
 
@@ -776,6 +815,7 @@ def tile_streaming(
     # `tiles.parquet/zoom=N/part_*.parquet` DIRECTORY, not a single file.
     n_rows_pq = _gen_pq(gen_pq, pq_path, bounds, partitioned=True)
     t_gen_pq = time.perf_counter() - t0
+    _surface_run_summary(pyramid_dir, "parquet")
     del gen_pq
 
     if pq_path.is_dir():

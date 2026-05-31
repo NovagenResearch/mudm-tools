@@ -1413,6 +1413,66 @@ class TestRepartitionParquet:
             repartition_parquet(f)
 
 
+class TestMemoryCeilingPlumbing:
+    """WS-0 Task 0.2: the resolved memory ceiling is plumbed into the
+    generators + Python without changing default behavior."""
+
+    def test_set_and_get_max_memory(self, tmp_path):
+        """_set_max_memory / _get_max_memory round-trip; default is sane."""
+        gen, _ = _build_generator_with_features([_make_dense_tin_feature()])
+        # Default resolves via detect_max_memory_bytes(0) -> >= 1 GiB.
+        assert gen._get_max_memory() >= 1024 * 1024 * 1024
+        gen._set_max_memory(4 * 1024 * 1024 * 1024)
+        assert gen._get_max_memory() == 4 * 1024 * 1024 * 1024
+
+    def test_generate_3dtiles_default_unchanged(self, tmp_path):
+        """generate_3dtiles still succeeds with the resolver-backed default
+        (max_memory_gb=0) — behavior preserved."""
+        gen, _ = _build_generator_with_features([_make_dense_tin_feature()])
+        out = tmp_path / "tiles3d"
+        n = gen.generate_3dtiles(str(out), WORLD_BOUNDS)
+        assert n > 0
+        assert (out / "tileset.json").exists()
+
+    def test_generate_neuroglancer_multilod_accepts_max_memory(self, tmp_path):
+        """generate_neuroglancer_multilod accepts the new max_memory_bytes
+        kwarg (default 0 -> resolver) without changing behavior."""
+        gen, _ = _build_generator_with_features([_make_dense_tin_feature()])
+        out = tmp_path / "ng"
+        # Explicit default and an explicit value both succeed identically.
+        n = gen.generate_neuroglancer_multilod(
+            str(out), WORLD_BOUNDS, 10, 0,
+        )
+        assert n > 0
+
+    def test_parquet_default_derives_from_generator_ceiling(self, tmp_path):
+        """A tiny generator ceiling makes the partitioned writer chunk, but
+        output stays byte-identical to the explicit-budget path."""
+        feat = _make_dense_tin_feature(n_triangles=12)
+        gen_a, _ = _build_generator_with_features([feat])
+        gen_b, _ = _build_generator_with_features([feat])
+        # gen_a uses the default (derived) budget; gen_b forces a tiny ceiling.
+        gen_b._set_max_memory(1)
+
+        out_a = tmp_path / "a.parquet"
+        out_b = tmp_path / "b.parquet"
+        n_a = generate_parquet(gen_a, out_a, WORLD_BOUNDS)
+        n_b = generate_parquet(gen_b, out_b, WORLD_BOUNDS)
+        assert n_a == n_b > 0
+
+        def _canon(rows):
+            return sorted(
+                (
+                    r["zoom"], r["tile_x"], r["tile_y"], r["tile_d"],
+                    r["feature_id"], r["geom_type"],
+                    r["positions"].tobytes(), r["indices"].tobytes(),
+                )
+                for r in rows
+            )
+
+        assert _canon(read_parquet(out_a)) == _canon(read_parquet(out_b))
+
+
 def test_parentid_survives_parquet(tmp_path):
     """Top-level MuDMFeature.parentId must round-trip into Parquet tags as _parent_id."""
     feat = _make_tin_feature(

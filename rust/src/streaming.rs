@@ -36,6 +36,7 @@ use crate::tileset_json;
 use crate::tile_transform;
 use crate::obj_parser;
 use crate::simplify;
+use crate::error_log::{ErrorCollector, Severity};
 
 // Geometry type constants matching protobuf GeomType.
 const POINT3D: u8 = 1;
@@ -1922,6 +1923,7 @@ fn read_group_simplify_encode(
     base_cells: u32,
     effective_compression: &str,
     max_memory_bytes: usize,
+    collector: &ErrorCollector,
 ) -> io::Result<(u32, Vec<(u32, u32, u32, u32)>)> {
     use dashmap::DashMap;
     use std::collections::hash_map::DefaultHasher;
@@ -2063,6 +2065,7 @@ fn read_group_simplify_encode(
                         owned, tags_registry, out_dir,
                         xmin, ymin, zmin, dx, dy, dz,
                         max_zoom, base_cells, effective_compression,
+                        collector,
                     )?;
                     zoom_count += count;
                     zoom_keys.extend(keys);
@@ -2099,12 +2102,14 @@ fn encode_bucket_to_3dtiles(
     max_zoom: u32,
     base_cells: u32,
     effective_compression: &str,
+    collector: &ErrorCollector,
 ) -> io::Result<(u32, Vec<(u32, u32, u32, u32)>)> {
     // Read all fragments from this bucket's shard files and group by tile key
     let mut reader = Fragment3DReader::open_dir(bucket_dir)?;
     let groups = reader.read_all_grouped()?;
     _encode_grouped_fragments(groups, tags_registry, out_dir,
-        xmin, ymin, zmin, dx, dy, dz, max_zoom, base_cells, effective_compression)
+        xmin, ymin, zmin, dx, dy, dz, max_zoom, base_cells, effective_compression,
+        collector)
 }
 
 /// Encode a single bucket file into GLB tiles.
@@ -2117,14 +2122,24 @@ fn encode_bucket_file_to_3dtiles(
     max_zoom: u32,
     base_cells: u32,
     effective_compression: &str,
+    collector: &ErrorCollector,
 ) -> io::Result<(u32, Vec<(u32, u32, u32, u32)>)> {
     let mut reader = Fragment3DReader::new(bucket_file)?;
     let groups = reader.read_all_grouped()?;
     _encode_grouped_fragments(groups, tags_registry, out_dir,
-        xmin, ymin, zmin, dx, dy, dz, max_zoom, base_cells, effective_compression)
+        xmin, ymin, zmin, dx, dy, dz, max_zoom, base_cells, effective_compression,
+        collector)
 }
 
 /// Shared encoding logic for grouped fragments.
+///
+/// WS-D D.3: collects per-tile write results in the encode `par_iter` instead of
+/// swallowing failures with `.ok()`. On a failed `create_dir_all`/`fs::write`,
+/// records a non-fatal `"3dtiles"`/`"write"` failure in the `ErrorCollector` and
+/// excludes the tile from the count; the GLB bytes of SUCCESSFUL tiles are
+/// unchanged (the encode path is untouched). The returned `tile_keys` is pruned
+/// to only the tiles that actually wrote, so `tileset.json` (built from these
+/// keys) never references a missing `.glb` (GLB-4).
 fn _encode_grouped_fragments(
     groups: AHashMap<(u32, u32, u32, u32), Vec<Fragment3D>>,
     tags_registry: &HashMap<u32, Vec<(String, TagValue)>>,
@@ -2134,17 +2149,18 @@ fn _encode_grouped_fragments(
     max_zoom: u32,
     base_cells: u32,
     effective_compression: &str,
+    collector: &ErrorCollector,
 ) -> io::Result<(u32, Vec<(u32, u32, u32, u32)>)> {
 
     let mut tiles: Vec<((u32, u32, u32, u32), Vec<Fragment3D>)> = groups.into_iter().collect();
     tiles.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
 
-    let tile_keys: Vec<(u32, u32, u32, u32)> = tiles.iter().map(|(k, _)| *k).collect();
-
     const INNER_PAR_THRESHOLD: usize = 16;
 
-    let count: u32 = tiles.par_iter()
+    // Collect (tile_key, ok) so failed tiles can be pruned from tile_keys.
+    let written: Vec<((u32, u32, u32, u32), bool)> = tiles.par_iter()
         .map(|((tz, tx, ty, td), frags)| {
+            let (tz, tx, ty, td) = (*tz, *tx, *ty, *td);
             // Simplification already done during redistribution — skip here
             let do_simplify = false;
 
@@ -2152,14 +2168,14 @@ fn _encode_grouped_fragments(
                 frags.par_iter().filter_map(|frag| {
                     fragment_to_glb_feature(
                         frag, tags_registry, xmin, ymin, zmin, dx, dy, dz,
-                        do_simplify, max_zoom, base_cells, *tz,
+                        do_simplify, max_zoom, base_cells, tz,
                     )
                 }).collect()
             } else {
                 frags.iter().filter_map(|frag| {
                     fragment_to_glb_feature(
                         frag, tags_registry, xmin, ymin, zmin, dx, dy, dz,
-                        do_simplify, max_zoom, base_cells, *tz,
+                        do_simplify, max_zoom, base_cells, tz,
                     )
                 }).collect()
             };
@@ -2174,13 +2190,41 @@ fn _encode_grouped_fragments(
                 .join(tx.to_string())
                 .join(ty.to_string())
                 .join(format!("{}.glb", td));
+            let tile_id = format!("{}/{}/{}/{}.glb", tz, tx, ty, td);
+
+            // Checked dir-create + write. A failure is non-fatal (skip the tile,
+            // continue the rest); recorded as data + a flag inside the rayon
+            // pool — NO PyErr here (collect-then-raise discipline; this path is
+            // non-fatal so the outer frame just prunes).
             if let Some(parent) = tile_path.parent() {
-                std::fs::create_dir_all(parent).ok();
+                if let Err(e) = std::fs::create_dir_all(parent) {
+                    collector.record_failure(
+                        "3dtiles", Severity::NonFatal, &tile_id, "write", &e.to_string(),
+                    );
+                    return ((tz, tx, ty, td), false);
+                }
             }
-            std::fs::write(&tile_path, data).ok();
-            1u32
+            if let Err(e) = std::fs::write(&tile_path, &data) {
+                collector.record_failure(
+                    "3dtiles", Severity::NonFatal, &tile_id, "write", &e.to_string(),
+                );
+                return ((tz, tx, ty, td), false);
+            }
+            collector.inc_ok();
+            ((tz, tx, ty, td), true)
         })
-        .sum();
+        .collect();
+
+    // Count only successful writes; prune failed tile keys so tileset.json
+    // never references a missing .glb.
+    let mut tile_keys: Vec<(u32, u32, u32, u32)> = Vec::with_capacity(written.len());
+    let mut count = 0u32;
+    for (key, ok) in &written {
+        if *ok {
+            count += 1;
+            tile_keys.push(*key);
+        }
+    }
 
     Ok((count, tile_keys))
 }
@@ -3122,6 +3166,53 @@ pub struct StreamingTileGenerator {
     /// construction via `detect_io_threads()`; the Python layer may override
     /// it with `_set_io_threads`.
     io_threads: usize,
+    /// Hard ceiling on resident decoded-fragment bytes per output path.
+    /// Resolved at construction via `detect_max_memory_bytes(0)` (env
+    /// `MUDM_MAX_MEMORY_GB` / 0.8×RAM / 8 GiB fallback). The Python layer may
+    /// override it with `_set_max_memory`.
+    max_memory_bytes: usize,
+    /// Optional run directory for the WS-D error-log facility. When `Some`,
+    /// each phase constructs an `ErrorCollector` that streams `errors.jsonl`
+    /// + `run_summary.json` here. `None` (the default) → in-memory only, no
+    /// files written, so existing callers see no behavior change. Set via the
+    /// PyO3 `_set_run_dir` setter (mirrors `_set_io_threads`/`_set_max_memory`).
+    run_dir: Option<PathBuf>,
+}
+
+/// Total physical RAM in bytes, cross-platform. Replaces the old
+/// `/proc/meminfo`-only path (which was macOS-broken and KB-unit-coupled).
+fn total_physical_ram_bytes() -> Option<usize> {
+    #[cfg(target_os = "linux")]
+    {
+        let s = std::fs::read_to_string("/proc/meminfo").ok()?;
+        // "MemTotal:  N kB"  → KB → bytes
+        for line in s.lines() {
+            if let Some(rest) = line.strip_prefix("MemTotal:") {
+                let kb: usize = rest.split_whitespace().next()?.parse().ok()?;
+                return Some(kb * 1024); // KB source
+            }
+        }
+        None
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // sysctl hw.memsize → BYTES (do NOT *1024)
+        let out = std::process::Command::new("sysctl").args(["-n", "hw.memsize"]).output().ok()?;
+        String::from_utf8(out.stdout).ok()?.trim().parse::<usize>().ok() // bytes source
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    { None }
+}
+
+/// Ceiling on resident decoded-fragment bytes per output path.
+/// (1) explicit>0; (2) env MUDM_MAX_MEMORY_GB; (3) 0.8 * RAM; (4) 8 GiB.
+fn detect_max_memory_bytes(explicit: usize) -> usize {
+    const GIB: usize = 1024 * 1024 * 1024;
+    if explicit > 0 { return explicit; }
+    if let Ok(v) = std::env::var("MUDM_MAX_MEMORY_GB") {
+        if let Ok(g) = v.parse::<f64>() { if g > 0.0 { return (g * GIB as f64) as usize; } }
+    }
+    total_physical_ram_bytes().map(|r| (r as f64 * 0.8) as usize).unwrap_or(8 * GIB)
 }
 
 /// Detect the default I/O concurrency for the parallel read path.
@@ -3199,6 +3290,8 @@ impl StreamingTileGenerator {
             shard_paths_snapshot: Vec::new(),
             parallel_shard_cursor: 0,
             io_threads: detect_io_threads(),
+            max_memory_bytes: detect_max_memory_bytes(0),
+            run_dir: None,
         })
     }
 
@@ -3468,22 +3561,27 @@ impl StreamingTileGenerator {
         let tags_ref = &self.tags_registry;
         let comp = effective_compression.to_string();
 
-        // Memory budget: if 0, auto-detect from system RAM (80% of total)
+        // Memory budget: an explicit `max_memory_gb` wins; otherwise fall back
+        // to the generator's already-resolved ceiling (`self.max_memory_bytes`,
+        // from `detect_max_memory_bytes(0)` at construction or `_set_max_memory`).
+        // This replaces the old `/proc/meminfo`-only branch, which was
+        // macOS-broken and KB-unit-coupled (WS-0).
         let max_memory_bytes = if max_memory_gb > 0 {
-            max_memory_gb * 1024 * 1024 * 1024
+            detect_max_memory_bytes(max_memory_gb * 1024 * 1024 * 1024)
         } else {
-            // Read /proc/meminfo for total RAM, use 80%
-            let total_ram = std::fs::read_to_string("/proc/meminfo")
-                .ok()
-                .and_then(|s| {
-                    s.lines()
-                        .find(|l| l.starts_with("MemTotal:"))
-                        .and_then(|l| l.split_whitespace().nth(1))
-                        .and_then(|v| v.parse::<usize>().ok())
-                })
-                .unwrap_or(8 * 1024 * 1024); // fallback: 8 GB in KB
-            (total_ram * 1024) * 4 / 5 // 80% of total, convert KB to bytes
+            self.max_memory_bytes
         };
+
+        // WS-D error-log facility (D.3): streams `errors.jsonl`/`run_summary.json`
+        // to `run_dir` when set; in-memory only otherwise (no behavior change /
+        // no new file for existing callers). Constructed before the GIL is
+        // released so a dir-open failure is a normal early PyErr. GLB tile-write
+        // failures are NON-FATAL: recorded inside the rayon pool, the tile is
+        // pruned, and the rest continue — no PyErr is raised from the pool.
+        let collector = ErrorCollector::new(self.run_dir.clone())
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
+        let collector_ref = &collector;
+        let phase_start = std::time::Instant::now();
 
         // Per-zoom batched in-memory pipeline
         let frag_dir = self.frag_dir.clone();
@@ -3493,10 +3591,12 @@ impl StreamingTileGenerator {
                 xmin, ymin, zmin, dx, dy, dz,
                 max_zoom, base_cells, &comp,
                 max_memory_bytes,
+                collector_ref,
             )
         }).map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
 
-        // Write tileset.json
+        // Write tileset.json (built from the PRUNED tile_keys → no dangling
+        // content URI referencing a missing .glb, GLB-4).
         let tileset = tileset_json::generate_tileset_json(
             &all_tile_keys, &wb, self.min_zoom, self.max_zoom,
         );
@@ -3504,6 +3604,11 @@ impl StreamingTileGenerator {
         let tileset_str = serde_json::to_string_pretty(&tileset)
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
         std::fs::write(&tileset_path, tileset_str)
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
+
+        // Honest summary (no-op when run_dir is None).
+        collector
+            .finish_summary("3dtiles", phase_start.elapsed().as_secs_f64())
             .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
 
         self.tiles_written = total_count;
@@ -3615,6 +3720,33 @@ impl StreamingTileGenerator {
     /// "global pool" sentinel rather than a "use detect default" request.
     fn _set_io_threads(&mut self, n: usize) {
         self.io_threads = n;
+    }
+
+    /// Override the resolved per-output-path memory ceiling (in bytes).
+    ///
+    /// Stored as-is; `generate_3dtiles`/`generate_neuroglancer_multilod` and
+    /// the Python Parquet writer derive their per-path budgets from it when an
+    /// explicit per-call budget is not supplied. Mirrors `_set_io_threads`.
+    fn _set_max_memory(&mut self, max_memory_bytes: usize) {
+        self.max_memory_bytes = max_memory_bytes;
+    }
+
+    /// Set the run directory for the WS-D error-log facility.
+    ///
+    /// When set, each phase streams `errors.jsonl` + `run_summary.json` here.
+    /// Stored as `Some(PathBuf)`; left `None` by default so existing callers
+    /// see no new files and no behavior change. Mirrors `_set_io_threads` /
+    /// `_set_max_memory`.
+    fn _set_run_dir(&mut self, dir: &str) {
+        self.run_dir = Some(PathBuf::from(dir));
+    }
+
+    /// Read the resolved per-output-path memory ceiling (in bytes).
+    ///
+    /// Lets the Python layer derive the Parquet `max_batch_bytes` default from
+    /// the same ceiling without re-running the resolver.
+    fn _get_max_memory(&self) -> usize {
+        self.max_memory_bytes
     }
 
     /// Initialize the streaming Parquet iterator.
@@ -4052,6 +4184,20 @@ impl StreamingTileGenerator {
             size_b.cmp(&size_a)
         });
 
+        // WS-D error-log facility: streams `errors.jsonl` + `run_summary.json`
+        // to `run_dir` when set; in-memory only otherwise (no behavior change
+        // for existing callers). Constructed before the GIL is released so the
+        // dir-open failure is a normal early PyErr (collect-then-raise pattern
+        // is only for failures discovered inside the rayon pool).
+        let collector = ErrorCollector::new(self.run_dir.clone())
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
+        let collector_ref = &collector;
+        // Successful fids (honest count) — only files that parsed and wrote
+        // every fragment cleanly. Bounded O(n_files); rayon-safe.
+        let ok_fids: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+        let ok_fids_ref = &ok_fids;
+        let ingest_start = std::time::Instant::now();
+
         // Release GIL — parallel parse + project + clip + write
         // with_min_len(1) forces rayon to steal one file at a time.
         // No locks: each thread writes to its own file.
@@ -4064,8 +4210,19 @@ impl StreamingTileGenerator {
                 // Parse OBJ in Rust
                 let (vertices, faces) = match obj_parser::parse_obj(path) {
                     Ok(vf) => vf,
-                    Err(_) => return, // skip broken files
+                    Err(e) => {
+                        // Non-fatal: skip this broken file, record + continue.
+                        collector_ref.record_failure(
+                            "ingest", Severity::NonFatal, path, "parse", &e.to_string(),
+                        );
+                        return;
+                    }
                 };
+
+                // Tracks any fatal write failure for THIS file (incl. nested
+                // chunk writes). On any failure the file is not counted as ok
+                // and its fragments may be incomplete — recorded as Fatal.
+                let file_failed = std::sync::atomic::AtomicBool::new(false);
 
                 // Build indexed mesh in [0,1]³ normalized coords
                 let (positions, indices, bb) = build_indexed_mesh(
@@ -4078,14 +4235,14 @@ impl StreamingTileGenerator {
                 const PARALLEL_CLIP_THRESHOLD: usize = 500_000;
                 const CLIP_CHUNK_SIZE: usize = 50_000;
 
-                // Write helper closure for fragment output
+                // Write helper closure for fragment output. Returns the
+                // checked io::Result so the caller can record a Fatal write
+                // failure (writer-create / per-write / flush all checked —
+                // NOT Drop, which take()s the writer making Drop a no-op).
                 let write_clip_results = |clip_results: Vec<((u32,u32,u32,u32), ClipFeature)>,
                                           frag_path: PathBuf,
-                                          fid: u32| {
-                    let mut writer = match Fragment3DWriter::new(&frag_path) {
-                        Ok(w) => w,
-                        Err(_) => return,
-                    };
+                                          fid: u32| -> io::Result<()> {
+                    let mut writer = Fragment3DWriter::new(&frag_path)?;
                     for ((tz, tx_coord, ty, td), cf) in clip_results {
                         let frag = Fragment3D {
                             feature_id: fid,
@@ -4095,9 +4252,10 @@ impl StreamingTileGenerator {
                             z: cf.z.iter().map(|&v| v as f32).collect(),
                             ring_lengths: cf.ring_lengths,
                         };
-                        writer.write(&frag).ok();
+                        writer.write(&frag)?;
                     }
-                    writer.flush().ok();
+                    writer.flush()?;
+                    Ok(())
                 };
 
                 if n_tris >= PARALLEL_CLIP_THRESHOLD {
@@ -4122,7 +4280,12 @@ impl StreamingTileGenerator {
                         let frag_path = frag_dir.join(
                             format!("frag_{:05}_z{}.mjf", i, zoom)
                         );
-                        write_clip_results(clip_results, frag_path, fid);
+                        if let Err(e) = write_clip_results(clip_results, frag_path, fid) {
+                            collector_ref.record_failure(
+                                "ingest", Severity::Fatal, path, "write", &e.to_string(),
+                            );
+                            file_failed.store(true, std::sync::atomic::Ordering::Relaxed);
+                        }
                         cur_pos = sp;
                         cur_idx = si;
                     }
@@ -4163,7 +4326,12 @@ impl StreamingTileGenerator {
                         let frag_path = frag_dir.join(
                             format!("frag_{:05}_c{:04}.mjf", i, chunk_idx)
                         );
-                        write_clip_results(clip_results, frag_path, fid);
+                        if let Err(e) = write_clip_results(clip_results, frag_path, fid) {
+                            collector_ref.record_failure(
+                                "ingest", Severity::Fatal, path, "write", &e.to_string(),
+                            );
+                            file_failed.store(true, std::sync::atomic::Ordering::Relaxed);
+                        }
                     });
                 } else {
                     // Small file: pre-simplify per zoom, clip each LOD
@@ -4173,7 +4341,22 @@ impl StreamingTileGenerator {
                     );
 
                     let frag_path = frag_dir.join(format!("frag_{:05}.mjf", i));
-                    write_clip_results(clip_results, frag_path, fid);
+                    if let Err(e) = write_clip_results(clip_results, frag_path, fid) {
+                        collector_ref.record_failure(
+                            "ingest", Severity::Fatal, path, "write", &e.to_string(),
+                        );
+                        file_failed.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+
+                // Honest count: this file is OK only if it parsed and every
+                // fragment wrote cleanly. Failed files are recorded above and
+                // excluded from the returned fids.
+                if !file_failed.load(std::sync::atomic::Ordering::Relaxed) {
+                    collector_ref.inc_ok();
+                    if let Ok(mut v) = ok_fids_ref.lock() {
+                        v.push(fid);
+                    }
                 }
             });
             };
@@ -4189,7 +4372,25 @@ impl StreamingTileGenerator {
             }
         });
 
-        Ok(fids)
+        // GIL re-held — safe to raise a typed PyErr now (NEVER inside the
+        // rayon pool / allow_threads). Collect-then-raise: a Fatal write
+        // failure was recorded with plain data inside the pool; surface it
+        // here (mirrors the Parquet collect-then-? pattern).
+        let _ = fids; // pre-assigned ids superseded by the honest set below
+        let elapsed_s = ingest_start.elapsed().as_secs_f64();
+        collector.finish_summary("ingest", elapsed_s)
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
+        if collector.had_fatal() {
+            return Err(pyo3::exceptions::PyIOError::new_err(
+                "add_obj_files: fatal write error during ingest (see errors.jsonl)",
+            ));
+        }
+
+        // Return only the successfully-ingested fids, in ascending order so
+        // the result is deterministic regardless of rayon scheduling.
+        let mut ok = ok_fids.into_inner().unwrap_or_default();
+        ok.sort_unstable();
+        Ok(ok)
     }
 
     /// Add meshes from a Parquet file with pre-processed binary geometry.
@@ -4868,14 +5069,25 @@ impl StreamingTileGenerator {
     ///   {output_dir}/segment_properties/info (metadata from tags)
     ///
     /// Returns the number of segments written.
-    #[pyo3(signature = (output_dir, world_bounds, vertex_quantization_bits=10))]
+    #[pyo3(signature = (output_dir, world_bounds, vertex_quantization_bits=10, max_memory_bytes=0))]
     fn generate_neuroglancer_multilod(
         &mut self,
         py: Python<'_>,
         output_dir: &str,
         world_bounds: (f64, f64, f64, f64, f64, f64),
         vertex_quantization_bits: u8,
+        max_memory_bytes: usize,
     ) -> PyResult<u32> {
+        // Resolve the per-path memory ceiling (explicit arg wins, else the
+        // generator's resolved ceiling). UNUSED until WS-B wires the bounded
+        // feature-bucketed read; plumbed now so WS-B lands atomically. Behavior
+        // is identical to before — the read path is still whole-corpus here.
+        let _max_memory_bytes = if max_memory_bytes > 0 {
+            detect_max_memory_bytes(max_memory_bytes)
+        } else {
+            self.max_memory_bytes
+        };
+
         // Flush and close the fragment writer
         if let Some(mut writer) = self.fragment_writer.take() {
             writer.flush()
@@ -5605,5 +5817,16 @@ mod tests {
         let tag = TagValue::Str("hello".to_string());
         let encoded = encode_tag_value(&tag);
         assert!(!encoded.is_empty());
+    }
+
+    #[test]
+    fn test_detect_max_memory_env_override() {
+        std::env::set_var("MUDM_MAX_MEMORY_GB", "4");
+        assert_eq!(detect_max_memory_bytes(0), 4 * 1024 * 1024 * 1024);
+        std::env::remove_var("MUDM_MAX_MEMORY_GB");
+        // explicit arg wins over env + default
+        assert_eq!(detect_max_memory_bytes(2 * 1024 * 1024 * 1024), 2 * 1024 * 1024 * 1024);
+        // default is positive and not the bare KB-vs-bytes bug (must be >= 1 GiB)
+        assert!(detect_max_memory_bytes(0) >= 1024 * 1024 * 1024);
     }
 }

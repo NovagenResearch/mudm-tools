@@ -29,7 +29,7 @@ def generate_parquet(
     batch_size: int = 50_000,
     partitioned: bool = False,
     max_file_bytes: int = _DEFAULT_MAX_FILE_BYTES,
-    max_batch_bytes: int = _DEFAULT_MAX_BATCH_BYTES,
+    max_batch_bytes: int | None = None,
     parallel: bool = True,
     io_threads: int | None = None,
 ) -> int:
@@ -46,8 +46,13 @@ def generate_parquet(
         compression_level: Compression level (default 3).
         batch_size: Number of fragments to process per batch (streaming mode).
         partitioned: If True, write partitioned output (one file per zoom level).
-        max_batch_bytes: Byte budget per batch (default 2 GB). Stops reading
-            fragments once cumulative in-memory size exceeds this threshold.
+        max_batch_bytes: Byte budget per batch. Stops reading fragments once
+            cumulative in-memory size exceeds this threshold. When None
+            (default), the budget is derived from the generator's resolved
+            memory ceiling (``_get_max_memory``) and capped at the historical
+            2 GB default — so the default behavior is unchanged on hosts whose
+            ceiling exceeds 2 GB, and tightened (never loosened) on smaller
+            hosts. Pass an explicit value to override entirely.
         parallel: If True (and the generator supports it), use the parallel
             shard reader for batch decoding. Falls back to the serial path
             transparently when the extension lacks ``_next_parquet_batch_parallel``.
@@ -66,6 +71,25 @@ def generate_parquet(
         return _generate_parquet_inmemory(
             generator, output_path, world_bounds,
             compression=compression, compression_level=compression_level,
+        )
+
+    # Resolve the per-batch byte budget. An explicit value always wins; the
+    # None default derives from the generator's resolved memory ceiling
+    # (WS-0) but is capped at the historical 2 GB default so default behavior
+    # is preserved on large-RAM hosts and only tightened on smaller ones.
+    if max_batch_bytes is None:
+        derived = None
+        if hasattr(generator, "_get_max_memory"):
+            ceiling = generator._get_max_memory()
+            if ceiling and ceiling > 0:
+                # Per-batch budget derives from the path ceiling; the Rust
+                # batch reader already folds a ~3x ZSTD expansion internally,
+                # so the budget handed in is the decoded-bytes target.
+                derived = ceiling
+        max_batch_bytes = (
+            min(_DEFAULT_MAX_BATCH_BYTES, derived)
+            if derived is not None
+            else _DEFAULT_MAX_BATCH_BYTES
         )
 
     effective_parallel = parallel and hasattr(generator, "_next_parquet_batch_parallel")

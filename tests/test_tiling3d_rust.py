@@ -1072,6 +1072,95 @@ class TestStreamingGlb:
         assert "indices" not in prim
         assert gltf["nodes"][0]["extras"]["label"] == "origin"
 
+    @pytest.mark.skipif(not RUST_AVAILABLE, reason="Rust extensions not compiled")
+    def test_glb_write_failure_prunes_tile_and_logs(self, tmp_path):
+        """WS-D D.3: a failed GLB tile write is recorded in errors.jsonl, excluded
+        from the returned tile count, AND pruned from tileset.json (no dangling
+        content URI referencing a missing .glb).
+
+        Simulate a write failure by pre-creating the target .glb path as a
+        DIRECTORY so std::fs::write to it fails for exactly one tile while every
+        other tile writes cleanly.
+        """
+        import json
+        import os
+        from mudm_tools._rs import StreamingTileGenerator
+
+        bounds = (0.0, 0.0, 0.0, 100.0, 100.0, 100.0)
+
+        def _build_gen():
+            g = StreamingTileGenerator(min_zoom=0, max_zoom=2)
+            # Spread many small TIN triangles across the extent so several
+            # distinct leaf tiles are produced.
+            for i in range(40):
+                nx = (i % 8) * 0.11 + 0.02
+                ny = (i // 8) * 0.18 + 0.02
+                feat = {
+                    "geometry": [nx, ny, nx + 0.04, ny, nx + 0.02, ny + 0.06, nx, ny],
+                    "geometry_z": [0.5, 0.51, 0.52, 0.5],
+                    "ring_lengths": [4],
+                    "type": 5,
+                    "tags": {"face": i},
+                    "minX": nx, "minY": ny, "minZ": 0.5,
+                    "maxX": nx + 0.04, "maxY": ny + 0.06, "maxZ": 0.52,
+                }
+                g.add_feature(feat)
+            return g
+
+        # --- Pass 1: clean run to discover the produced tile layout ---
+        clean_out = tmp_path / "clean"
+        clean_gen = _build_gen()
+        clean_count = clean_gen.generate_3dtiles(str(clean_out), bounds)
+        assert clean_count > 1, "fixture must produce more than one tile"
+
+        glb_rels = []
+        for root, _, files in os.walk(str(clean_out)):
+            for fn in files:
+                if fn.endswith(".glb"):
+                    glb_rels.append(os.path.relpath(os.path.join(root, fn), str(clean_out)))
+        assert len(glb_rels) == clean_count
+
+        # Choose a leaf-zoom tile (zoom == max_zoom == 2) to block so pruning it
+        # cannot cascade-remove a parent's children unexpectedly.
+        blocked_rel = sorted(r for r in glb_rels if r.split(os.sep)[0] == "2")[0]
+        z, x, y, dfile = blocked_rel.split(os.sep)
+        d = dfile[:-4]  # strip ".glb"
+        blocked_uri = f"{z}/{x}/{y}/{d}.glb"
+
+        # --- Pass 2: re-run with that one tile's path pre-created as a dir ---
+        out = tmp_path / "tiles"
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        # Pre-create the blocked tile path AS A DIRECTORY → fs::write fails.
+        blocked_abs = out / z / x / y / f"{d}.glb"
+        blocked_abs.mkdir(parents=True)
+
+        gen = _build_gen()
+        gen._set_run_dir(str(run_dir))
+        count = gen.generate_3dtiles(str(out), bounds)
+
+        # (b) returned count excludes the failed tile.
+        assert count == clean_count - 1, (
+            f"expected {clean_count - 1} (one tile pruned), got {count}"
+        )
+
+        # (a) errors.jsonl records the failed write.
+        errlog = run_dir / "errors.jsonl"
+        assert errlog.exists(), "errors.jsonl must be written when run_dir is set"
+        log_text = errlog.read_text()
+        recs = [json.loads(ln) for ln in log_text.splitlines() if ln.strip()]
+        write_recs = [r for r in recs if r["error_kind"] == "write"]
+        assert len(write_recs) == 1, f"expected one write failure record, got {recs}"
+        rec = write_recs[0]
+        assert rec["phase"] == "3dtiles"
+        assert blocked_uri in rec["item"] or f"{z}/{x}/{y}/{d}" in rec["item"]
+
+        # (c) the failed tile key is absent from tileset.json.
+        tileset_text = (out / "tileset.json").read_text()
+        assert blocked_uri not in tileset_text, (
+            "tileset.json must not reference the missing .glb"
+        )
+
 
 def _parse_glb_json(data: bytes):
     """Parse the JSON chunk from GLB bytes."""
@@ -1225,3 +1314,91 @@ class TestStreamingDracoGlb:
         # If accessors exist, position accessor should have a bufferView (raw encoding)
         if "accessors" in gltf:
             assert "bufferView" in gltf["accessors"][0]
+
+
+# --- WS-D Task D.2: add_obj_files error-log wiring ---
+
+
+class TestAddObjFilesErrorLog:
+    """WS-D D.2: add_obj_files records bad files + counts honestly.
+
+    A file with invalid UTF-8 bytes triggers a parse read error in
+    ``parse_obj`` (BufReader::lines() yields Err on non-UTF-8), exercising the
+    parse-failure path. With a run_dir set, the bad file must appear in
+    ``errors.jsonl`` with phase 'ingest', the returned fids must exclude it
+    (honest count), and the good files must still ingest. Without a run_dir,
+    a clean all-valid ingest must write no errors.jsonl and behave as before.
+    """
+
+    @pytest.mark.skipif(not RUST_AVAILABLE, reason="Rust extensions not compiled")
+    def test_logs_bad_file_and_counts_honestly(self, tmp_path):
+        import json
+        from mudm_tools._rs import StreamingTileGenerator
+
+        # 2 valid tiny triangles + 1 malformed (invalid UTF-8) file
+        good1 = tmp_path / "good1.obj"
+        good1.write_text("v 1 1 1\nv 2 1 1\nv 1 2 1\nf 1 2 3\n")
+        good2 = tmp_path / "good2.obj"
+        good2.write_text("v 3 3 3\nv 4 3 3\nv 3 4 3\nf 1 2 3\n")
+        bad = tmp_path / "bad.obj"
+        # Invalid UTF-8 sequence — parse_obj's reader.lines() returns Err
+        bad.write_bytes(b"v 1 1 1\n\xff\xfe bad bytes f 1 2 3\n")
+
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+
+        gen = StreamingTileGenerator(min_zoom=0, max_zoom=1, base_cells=100)
+        gen._set_run_dir(str(run_dir))
+
+        paths = [str(good1), str(good2), str(bad)]
+        bounds = (0.0, 0.0, 0.0, 10.0, 10.0, 10.0)
+        tags_list = [{"name": "good1"}, {"name": "good2"}, {"name": "bad"}]
+
+        fids = gen.add_obj_files(paths, bounds, tags_list)
+
+        # Honest count: only the 2 good files ingested
+        assert len(fids) == 2
+
+        # errors.jsonl must list the bad file with phase 'ingest'
+        errlog = run_dir / "errors.jsonl"
+        assert errlog.exists(), "errors.jsonl should be written when run_dir is set"
+        lines = [ln for ln in errlog.read_text().splitlines() if ln.strip()]
+        assert len(lines) == 1, f"expected 1 error record, got {lines}"
+        rec = json.loads(lines[0])
+        assert rec["phase"] == "ingest"
+        assert rec["error_kind"] == "parse"
+        assert "bad.obj" in rec["item"]
+        # bad file's fid (index 2) must be absent from the honest set
+        assert all(fid != 2 for fid in fids)
+
+        # The 2 good files actually ingested: generate produces tiles
+        out = str(tmp_path / "tiles")
+        n_tiles = gen.generate_3dtiles(out, bounds)
+        assert n_tiles > 0
+
+    @pytest.mark.skipif(not RUST_AVAILABLE, reason="Rust extensions not compiled")
+    def test_clean_ingest_no_run_dir_unchanged(self, tmp_path):
+        """All-valid ingest with NO run_dir: no new file, same result as before."""
+        from mudm_tools._rs import StreamingTileGenerator
+
+        good1 = tmp_path / "g1.obj"
+        good1.write_text("v 1 1 1\nv 2 1 1\nv 1 2 1\nf 1 2 3\n")
+        good2 = tmp_path / "g2.obj"
+        good2.write_text("v 3 3 3\nv 4 3 3\nv 3 4 3\nf 1 2 3\n")
+
+        gen = StreamingTileGenerator(min_zoom=0, max_zoom=1, base_cells=100)
+        # No _set_run_dir call.
+
+        paths = [str(good1), str(good2)]
+        bounds = (0.0, 0.0, 0.0, 10.0, 10.0, 10.0)
+        tags_list = [{"name": "g1"}, {"name": "g2"}]
+
+        fids = gen.add_obj_files(paths, bounds, tags_list)
+        assert len(fids) == 2
+
+        # No errors.jsonl anywhere under tmp_path (run_dir was never set)
+        assert not any(tmp_path.rglob("errors.jsonl"))
+
+        out = str(tmp_path / "tiles")
+        n_tiles = gen.generate_3dtiles(out, bounds)
+        assert n_tiles > 0
