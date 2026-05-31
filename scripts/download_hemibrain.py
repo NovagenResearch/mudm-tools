@@ -573,9 +573,18 @@ def tile_streaming(
     Giant meshes (>500 MB) are ingested one at a time to cap peak RAM.
     Smaller meshes are batched for parallel rayon ingest.
 
+    EMIT-ALL (WS-A): one ``StreamingTileGenerator`` is ingested ONCE, then
+    both outputs are emitted from it (``generate_3dtiles`` + ``generate_parquet``)
+    before the generator is dropped — byte-identical to separate per-format
+    ingests (see ``tests/test_emit_all.py``).
+
+    ``skip_pbf3`` is retained for caller compatibility but is now a no-op: pbf3,
+    feature-centric pbf3, and neuroglancer are no longer emitted here (their Rust
+    ``generate_*`` implementations are kept untouched; NG is deferred).
+
     Output uses pyramid directory structure:
-        {output_dir}/{pyramid_name}/3dtiles/  (tileset.json, features.json, *.glb)
-        {output_dir}/{pyramid_name}/pbf3/      (tilejson3d.json, *.pbf3)
+        {output_dir}/{pyramid_name}/3dtiles/      (tileset.json, features.json, *.glb)
+        {output_dir}/{pyramid_name}/tiles.parquet/ (zoom=N/part_*.parquet)
     """
     import shutil
     import subprocess
@@ -665,40 +674,38 @@ def tile_streaming(
     # Pyramid directory structure
     pyramid_dir = output_dir / pyramid_name
 
-    # --- pbf3 ---
-    if not skip_pbf3:
-        pbf3_dir = pyramid_dir / "pbf3"
-        if pbf3_dir.exists():
-            shutil.rmtree(pbf3_dir)
-        pbf3_dir.mkdir(parents=True, exist_ok=True)
+    # --- EMIT-ALL: one generator, ONE ingest, multiple outputs ---
+    # WS-A (2026-05-31 scope): emit 3dtiles + parquet from a SINGLE ingest.
+    # Each generate_* opens frag_dir read-only; only Drop deletes it
+    # (streaming.rs), so reusing one generator across generate_3dtiles +
+    # generate_parquet is byte-identical to two separate generators that each
+    # ingest the same inputs (proven by tests/test_emit_all.py, WS-A A.1).
+    # NG is DEFERRED and pbf3/feature_pbf3 are dropped this round (their Rust
+    # generate_* implementations are kept untouched, just no longer called
+    # here). skip_pbf3 is retained as a no-op param for caller compatibility.
+    from mudm_tools.tiling3d.parquet_writer import generate_parquet as _gen_pq
 
-        gen = StreamingTileGenerator(min_zoom=0, max_zoom=max_zoom)
-        gen._set_run_dir(str(pyramid_dir))
-        print(f"\nStreaming pbf3 ingest (zoom 0-{max_zoom})...")
-        t_index = _ingest_chunked(gen)
-        print(f"  Ingest: {_fmt_time(t_index)}")
+    # run_dir must exist before ingest: the Rust ErrorCollector opens
+    # <run_dir>/errors.jsonl on the first generate/ingest phase and does not
+    # mkdir it (error_log.rs). With one ingest up front (vs the old per-format
+    # blocks that each mkdir'd their output dir first), create it here.
+    pyramid_dir.mkdir(parents=True, exist_ok=True)
 
-        t0 = time.perf_counter()
-        n_tiles = gen.generate_pbf3(str(pbf3_dir), "default")
-        t_gen = time.perf_counter() - t0
-        _surface_run_summary(pyramid_dir, "pbf3")
+    gen = StreamingTileGenerator(min_zoom=0, max_zoom=max_zoom, base_cells=100)
+    gen._set_run_dir(str(pyramid_dir))
 
-        tilejson_path = pbf3_dir / "tilejson3d.json"
-        gen.write_tilejson3d(str(tilejson_path), bounds, "default")
-        del gen
+    # Ingest ONCE (measured once now; per-format generate is measured below).
+    print(f"\nStreaming ingest (zoom 0-{max_zoom}, base_cells=100)...")
+    t_index = _ingest_chunked(gen)
+    print(f"  Ingest: {_fmt_time(t_index)}")
 
-        pbf3_size = sum(f.stat().st_size for f in pbf3_dir.rglob("*") if f.is_file())
-        results["pbf3_tiles"] = n_tiles
-        results["pbf3_index_time"] = t_index
-        results["pbf3_gen_time"] = t_gen
-        results["pbf3_size_raw"] = pbf3_size
-        results["pbf3_size_gzip"] = 0  # skip gzip for speed
-        results["pbf3_dir"] = pbf3_dir
-
-        print(f"  {n_tiles} tiles in {_fmt_time(t_gen)}")
-        print(f"  Size: {_fmt_bytes(pbf3_size)} raw")
-        if t_gen > 0:
-            print(f"  Throughput: {n_tiles / t_gen:.0f} tiles/s")
+    # pbf3/feature_pbf3/neuroglancer no longer emitted this round.
+    results["pbf3_tiles"] = None
+    results["pbf3_dir"] = None
+    results["feature_pbf3_features"] = None
+    results["feature_pbf3_dir"] = None
+    results["neuroglancer_features"] = None
+    results["neuroglancer_dir"] = None
 
     # --- 3dtiles (optional) ---
     if not skip_3dtiles:
@@ -707,20 +714,15 @@ def tile_streaming(
             shutil.rmtree(tiles3d_dir)
         tiles3d_dir.mkdir(parents=True, exist_ok=True)
 
-        gen3d = StreamingTileGenerator(min_zoom=0, max_zoom=max_zoom, base_cells=100)
-        gen3d._set_run_dir(str(pyramid_dir))
-        print(f"\nStreaming 3D Tiles ingest (zoom 0-{max_zoom}, base_cells=100)...")
-        t_index_3d = _ingest_chunked(gen3d)
-
+        print(f"\nGenerating 3D Tiles...")
         t0 = time.perf_counter()
-        n_tiles_3d = gen3d.generate_3dtiles(str(tiles3d_dir), bounds)
+        n_tiles_3d = gen.generate_3dtiles(str(tiles3d_dir), bounds)
         t_gen_3d = time.perf_counter() - t0
         _surface_run_summary(pyramid_dir, "3dtiles")
-        del gen3d
 
         tiles3d_size = sum(f.stat().st_size for f in tiles3d_dir.rglob("*") if f.is_file())
         results["3dtiles_tiles"] = n_tiles_3d
-        results["3dtiles_index_time"] = t_index_3d
+        results["3dtiles_index_time"] = t_index
         results["3dtiles_gen_time"] = t_gen_3d
         results["3dtiles_size_raw"] = tiles3d_size
         results["3dtiles_size_gzip"] = 0
@@ -744,86 +746,31 @@ def tile_streaming(
             check=True,
         )
 
-    # --- feature-centric PBF3 (gated: it is a pbf3 variant) ---
-    if not skip_pbf3:
-        feat_pbf3_dir = pyramid_dir / "mudm_feature_pbf3"
-        if feat_pbf3_dir.exists():
-            shutil.rmtree(feat_pbf3_dir)
-        feat_pbf3_dir.mkdir(parents=True, exist_ok=True)
-
-        gen_fpbf3 = StreamingTileGenerator(min_zoom=0, max_zoom=max_zoom, base_cells=100)
-        gen_fpbf3._set_run_dir(str(pyramid_dir))
-        print(f"\nStreaming feature-centric PBF3 ingest (zoom 0-{max_zoom}, base_cells=100)...")
-        t_index_fpbf3 = _ingest_chunked(gen_fpbf3)
-
-        t0 = time.perf_counter()
-        n_feat_pbf3 = gen_fpbf3.generate_feature_pbf3(str(feat_pbf3_dir), bounds)
-        t_gen_fpbf3 = time.perf_counter() - t0
-        _surface_run_summary(pyramid_dir, "feature_pbf3")
-        del gen_fpbf3
-
-        feat_pbf3_size = sum(f.stat().st_size for f in feat_pbf3_dir.rglob("*") if f.is_file())
-        results["feature_pbf3_features"] = n_feat_pbf3
-        results["feature_pbf3_index_time"] = t_index_fpbf3
-        results["feature_pbf3_gen_time"] = t_gen_fpbf3
-        results["feature_pbf3_size_raw"] = feat_pbf3_size
-        results["feature_pbf3_dir"] = feat_pbf3_dir
-
-        print(f"  {n_feat_pbf3} features in {_fmt_time(t_gen_fpbf3)}")
-        print(f"  Size: {_fmt_bytes(feat_pbf3_size)} raw")
-
-    # --- neuroglancer (gated: viewer format, not needed for ML Parquet) ---
-    if not skip_3dtiles:
-        ng_dir = pyramid_dir / "neuroglancer"
-        if ng_dir.exists():
-            shutil.rmtree(ng_dir)
-        ng_dir.mkdir(parents=True, exist_ok=True)
-
-        gen_ng = StreamingTileGenerator(min_zoom=0, max_zoom=max_zoom, base_cells=100)
-        gen_ng._set_run_dir(str(pyramid_dir))
-        print(f"\nStreaming Neuroglancer ingest (zoom 0-{max_zoom}, base_cells=100)...")
-        t_index_ng = _ingest_chunked(gen_ng)
-
-        t0 = time.perf_counter()
-        n_feat_ng = gen_ng.generate_neuroglancer_multilod(str(ng_dir), bounds)
-        t_gen_ng = time.perf_counter() - t0
-        _surface_run_summary(pyramid_dir, "neuroglancer")
-        del gen_ng
-
-        ng_size = sum(f.stat().st_size for f in ng_dir.rglob("*") if f.is_file())
-        results["neuroglancer_features"] = n_feat_ng
-        results["neuroglancer_index_time"] = t_index_ng
-        results["neuroglancer_gen_time"] = t_gen_ng
-        results["neuroglancer_size_raw"] = ng_size
-        results["neuroglancer_dir"] = ng_dir
-
-        print(f"  {n_feat_ng} features in {_fmt_time(t_gen_ng)}")
-        print(f"  Size: {_fmt_bytes(ng_size)} raw")
-
-    # --- parquet ---
-    from mudm_tools.tiling3d.parquet_writer import generate_parquet as _gen_pq
-
+    # --- parquet (always; reuses the same ingested generator) ---
     pq_path = pyramid_dir / "tiles.parquet"
-    gen_pq = StreamingTileGenerator(min_zoom=0, max_zoom=max_zoom, base_cells=100)
-    gen_pq._set_run_dir(str(pyramid_dir))
-    print(f"\nStreaming Parquet ingest (zoom 0-{max_zoom}, base_cells=100)...")
-    t_index_pq = _ingest_chunked(gen_pq)
-
+    print(f"\nGenerating Parquet...")
     t0 = time.perf_counter()
     # partitioned=True -> native Rust consolidation: bounded memory (O(batch),
-    # not O(all rows)) + the read∥transform overlap path. Output is now a
+    # not O(all rows)) + the read∥transform overlap path. Output is a
     # `tiles.parquet/zoom=N/part_*.parquet` DIRECTORY, not a single file.
-    n_rows_pq = _gen_pq(gen_pq, pq_path, bounds, partitioned=True)
+    # parallel=True + io_threads=12 is the measured consolidation knee on oden
+    # (80 was worse) — do NOT change these.
+    n_rows_pq = _gen_pq(
+        gen, pq_path, bounds,
+        partitioned=True, parallel=True, io_threads=12,
+    )
     t_gen_pq = time.perf_counter() - t0
     _surface_run_summary(pyramid_dir, "parquet")
-    del gen_pq
+
+    # frag_dir removed only here (Drop) — after the LAST generate_* call.
+    del gen
 
     if pq_path.is_dir():
         pq_size = sum(f.stat().st_size for f in pq_path.rglob("*") if f.is_file())
     else:
         pq_size = pq_path.stat().st_size if pq_path.exists() else 0
     results["parquet_rows"] = n_rows_pq
-    results["parquet_index_time"] = t_index_pq
+    results["parquet_index_time"] = t_index
     results["parquet_gen_time"] = t_gen_pq
     results["parquet_size_raw"] = pq_size
     results["parquet_path"] = pq_path
