@@ -13,12 +13,10 @@ from geojson_pydantic import (
 )
 from mudm.model import (
     MuDM,
-    MuDMFeature,
     MuDMFeatureCollection,
     PolyhedralSurface,
     TIN,
 )
-
 
 # ---------------------------------------------------------------------------
 # Step 1a: Existing geometry types accept [x, y, z] coordinates
@@ -217,23 +215,17 @@ class TestPolyhedralSurface:
     """Tests for the PolyhedralSurface 3D geometry type."""
 
     def test_create_tetrahedron(self):
-        ps = PolyhedralSurface(
-            type="PolyhedralSurface", coordinates=TETRAHEDRON_COORDS
-        )
+        ps = PolyhedralSurface(type="PolyhedralSurface", coordinates=TETRAHEDRON_COORDS)
         assert ps.type == "PolyhedralSurface"
         assert len(ps.coordinates) == 4
 
     def test_bbox(self):
-        ps = PolyhedralSurface(
-            type="PolyhedralSurface", coordinates=TETRAHEDRON_COORDS
-        )
+        ps = PolyhedralSurface(type="PolyhedralSurface", coordinates=TETRAHEDRON_COORDS)
         bb = ps.bbox3d()
         assert bb == (0.0, 0.0, 0.0, 10.0, 10.0, 10.0)
 
     def test_centroid(self):
-        ps = PolyhedralSurface(
-            type="PolyhedralSurface", coordinates=TETRAHEDRON_COORDS
-        )
+        ps = PolyhedralSurface(type="PolyhedralSurface", coordinates=TETRAHEDRON_COORDS)
         c = ps.centroid3d()
         assert len(c) == 3
         # centroid of unique vertices (0,0,0),(10,0,0),(5,10,0),(5,5,10)
@@ -242,9 +234,7 @@ class TestPolyhedralSurface:
         assert c[2] == pytest.approx(2.5)
 
     def test_roundtrip_json(self):
-        ps = PolyhedralSurface(
-            type="PolyhedralSurface", coordinates=TETRAHEDRON_COORDS
-        )
+        ps = PolyhedralSurface(type="PolyhedralSurface", coordinates=TETRAHEDRON_COORDS)
         data = ps.model_dump()
         ps2 = PolyhedralSurface.model_validate(data)
         assert ps2.type == "PolyhedralSurface"
@@ -256,9 +246,7 @@ class TestPolyhedralSurface:
 
     def test_single_face(self):
         face = [[(0, 0, 0), (10, 0, 0), (5, 10, 0), (0, 0, 0)]]
-        ps = PolyhedralSurface(
-            type="PolyhedralSurface", coordinates=[face]
-        )
+        ps = PolyhedralSurface(type="PolyhedralSurface", coordinates=[face])
         assert len(ps.coordinates) == 1
 
 

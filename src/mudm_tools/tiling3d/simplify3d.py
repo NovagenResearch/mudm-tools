@@ -6,13 +6,17 @@ geometry_z=[z0,z1,...] (parallel arrays).
 
 from __future__ import annotations
 
-import math
-
 
 def _sq_seg_dist_3d(
-    px: float, py: float, pz: float,
-    ax: float, ay: float, az: float,
-    bx: float, by: float, bz: float,
+    px: float,
+    py: float,
+    pz: float,
+    ax: float,
+    ay: float,
+    az: float,
+    bx: float,
+    by: float,
+    bz: float,
 ) -> float:
     """Squared distance from point P to line segment AB in 3D."""
     dx = bx - ax
@@ -20,9 +24,7 @@ def _sq_seg_dist_3d(
     dz = bz - az
 
     if dx != 0.0 or dy != 0.0 or dz != 0.0:
-        t = ((px - ax) * dx + (py - ay) * dy + (pz - az) * dz) / (
-            dx * dx + dy * dy + dz * dz
-        )
+        t = ((px - ax) * dx + (py - ay) * dy + (pz - az) * dz) / (dx * dx + dy * dy + dz * dz)
         if t > 1.0:
             ax, ay, az = bx, by, bz
         elif t > 0.0:
@@ -114,9 +116,15 @@ def _rdp_3d(
 
     for i in range(first + 1, last):
         sq_dist = _sq_seg_dist_3d(
-            xy[i * 2], xy[i * 2 + 1], z[i],
-            ax, ay, az,
-            bx, by, bz,
+            xy[i * 2],
+            xy[i * 2 + 1],
+            z[i],
+            ax,
+            ay,
+            az,
+            bx,
+            by,
+            bz,
         )
         if sq_dist > max_sq_dist:
             index = i

@@ -5,6 +5,7 @@ class TileHandler:
     """
     Class to handle the generation of tiles from MuDM data
     """
+
     tile_json: TileModel
     pbf: bool
     parquet: bool

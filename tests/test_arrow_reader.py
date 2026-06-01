@@ -2,14 +2,10 @@
 
 from __future__ import annotations
 
-import json
 
-import pyarrow as pa
 import pytest
-import shapely
 from shapely.geometry import (
     LineString as ShapelyLineString,
-    MultiLineString as ShapelyMultiLineString,
     MultiPolygon as ShapelyMultiPolygon,
     Point as ShapelyPoint,
     Polygon as ShapelyPolygon,
@@ -28,20 +24,15 @@ from mudm_tools.arrow._from_geometry import (
 from mudm.model import (
     MuDMFeature,
     MuDMFeatureCollection,
-    PolyhedralSurface,
     TIN,
 )
 
 from geojson_pydantic import (
-    GeometryCollection,
     LineString,
-    MultiLineString,
-    MultiPoint,
     MultiPolygon,
     Point,
     Polygon,
 )
-
 
 # ---- Fixtures ----
 
@@ -149,10 +140,12 @@ class TestShapelyToMuDM:
         assert len(m.coordinates) == 2  # exterior + 1 hole
 
     def test_multipolygon(self):
-        s = ShapelyMultiPolygon([
-            ShapelyPolygon([(0, 0), (1, 0), (1, 1), (0, 0)]),
-            ShapelyPolygon([(5, 5), (6, 5), (6, 6), (5, 5)]),
-        ])
+        s = ShapelyMultiPolygon(
+            [
+                ShapelyPolygon([(0, 0), (1, 0), (1, 1), (0, 0)]),
+                ShapelyPolygon([(5, 5), (6, 5), (6, 6), (5, 5)]),
+            ]
+        )
         m = shapely_to_microjson(s)
         assert isinstance(m, MultiPolygon)
         assert len(m.coordinates) == 2
@@ -220,7 +213,10 @@ class TestArrowRoundTrip:
 
     def test_null_geometry(self):
         orig = MuDMFeature(
-            type="Feature", id="null", geometry=None, properties={"tag": "x"},
+            type="Feature",
+            id="null",
+            geometry=None,
+            properties={"tag": "x"},
         )
         table = to_arrow_table(orig)
         fc = from_arrow_table(table)
@@ -324,6 +320,7 @@ class TestParquetToGlb:
         # Export to GLB (with Draco if available)
         try:
             import DracoPy  # noqa: F401
+
             config = GltfConfig(draco=True)
         except ImportError:
             config = GltfConfig(draco=False)

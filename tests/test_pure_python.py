@@ -6,11 +6,10 @@ They must pass even when _rs is not compiled.
 """
 
 import json
-import pytest
 
 
 def test_model_validation():
-    from mudm.model import MuDM, GeoJSON
+    from mudm.model import MuDM
 
     data = {
         "type": "FeatureCollection",
@@ -41,7 +40,7 @@ def test_geojson_validation():
 
 
 def test_rust_available_flag():
-    import mudm
+    import mudm_tools
 
     assert isinstance(mudm_tools.RUST_AVAILABLE, bool)
 

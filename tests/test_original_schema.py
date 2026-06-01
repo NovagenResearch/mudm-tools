@@ -1,11 +1,15 @@
 import json
+from pathlib import Path
+
 import jsonschema
 import pytest
 from jsonschema import validate
 from mudm_tools.fileutils import gather_example_files
 
-# Load the original GeoJSON schema
-with open("external/GeoJSON.json") as f:
+# Load the original upstream (RFC 7946) GeoJSON schema, vendored under external/.
+# Path is anchored to the repo root so the test works regardless of CWD.
+_SCHEMA_PATH = Path(__file__).resolve().parents[1] / "external" / "GeoJSON.json"
+with open(_SCHEMA_PATH) as f:
     schema = json.load(f)
 
 # Define the directories containing the example JSON files
@@ -28,10 +32,8 @@ def test_valid_geojsons(filename):
     except jsonschema.exceptions.ValidationError as err:
         pytest.fail(f"JSON Schema validation failed. Error: {err}")
     except Exception as e:
-        pytest.fail(
-            f"""Unexpected error occurred
-                    during validation of {filename}: {str(e)}"""
-        )
+        pytest.fail(f"""Unexpected error occurred
+                    during validation of {filename}: {str(e)}""")
 
 
 @pytest.mark.parametrize("filename", invalid_examples)
@@ -42,16 +44,12 @@ def test_invalid_geojsons(filename):
     # Try to parse the data as a GeoJSON object
     try:
         validate(instance=data, schema=schema)
-        pytest.fail(
-            f"""Parsing succeeded on {filename},
-                    but it should not have."""
-        )
+        pytest.fail(f"""Parsing succeeded on {filename},
+                    but it should not have.""")
     except jsonschema.exceptions.ValidationError:
         # The validation error is expected, so we just pass
         pass
     except Exception as e:
         # An unexpected error occurred, so we fail the test
-        pytest.fail(
-            f"""Unexpected error occurred
-                    during validation of {filename}: {str(e)}"""
-        )
+        pytest.fail(f"""Unexpected error occurred
+                    during validation of {filename}: {str(e)}""")

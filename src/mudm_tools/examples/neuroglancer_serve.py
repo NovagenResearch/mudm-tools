@@ -18,8 +18,6 @@ from __future__ import annotations
 import argparse
 import functools
 import json
-import os
-import urllib.parse
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
 
@@ -45,7 +43,7 @@ class CORSHTTPRequestHandler(SimpleHTTPRequestHandler):
         self.end_headers()
 
 
-def detect_layers(directory: Path) -> list[dict]:
+def detect_layers(directory: Path) -> list[tuple[str, str]]:
     """Auto-detect Neuroglancer layers by looking for info files."""
     layers = []
     for child in sorted(directory.iterdir()):
@@ -69,15 +67,15 @@ def detect_layers(directory: Path) -> list[dict]:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Serve Neuroglancer precomputed data with CORS"
-    )
+    parser = argparse.ArgumentParser(description="Serve Neuroglancer precomputed data with CORS")
     parser.add_argument(
         "directory",
         help="Directory containing precomputed data (output of neuroglancer_export.py)",
     )
     parser.add_argument(
-        "--port", type=int, default=9000,
+        "--port",
+        type=int,
+        default=9000,
         help="Port to serve on (default: 9000)",
     )
     parser.add_argument(
@@ -124,7 +122,8 @@ def main() -> None:
                 # Auto-detect segment IDs from binary files in the directory
                 seg_dir = export_dir / name
                 seg_ids = sorted(
-                    f.name for f in seg_dir.iterdir()
+                    f.name
+                    for f in seg_dir.iterdir()
                     if f.is_file() and f.name != "info" and not f.name.startswith(".")
                 )
                 if seg_ids:

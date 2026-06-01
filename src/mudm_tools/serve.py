@@ -19,6 +19,7 @@ from pathlib import Path
 
 try:
     import brotli
+
     _HAS_BROTLI = True
 except ImportError:
     _HAS_BROTLI = False
@@ -59,7 +60,7 @@ class TileHandler(SimpleHTTPRequestHandler):
 
         # Neuroglancer routes
         if path.startswith("/neuroglancer/"):
-            rel = path[len("/neuroglancer/"):]
+            rel = path[len("/neuroglancer/") :]
             parts = rel.split("/", 1)
             pyramid_id = parts[0]
             rest = parts[1] if len(parts) > 1 else ""
@@ -67,7 +68,7 @@ class TileHandler(SimpleHTTPRequestHandler):
 
         # 3D tile data
         if path.startswith("/tiles/"):
-            rel = path[len("/tiles/"):]
+            rel = path[len("/tiles/") :]
             parts = rel.split("/", 1)
             pyramid_id = parts[0]
             rest = parts[1] if len(parts) > 1 else ""
@@ -94,7 +95,7 @@ class TileHandler(SimpleHTTPRequestHandler):
             return ""
 
         if path.startswith("/tiles2d/") and self.tiles2d_base:
-            rel = path[len("/tiles2d/"):]
+            rel = path[len("/tiles2d/") :]
             tile_path = os.path.join(self.tiles2d_base, rel)
             if os.path.isfile(tile_path):
                 return tile_path
@@ -150,6 +151,7 @@ class TileHandler(SimpleHTTPRequestHandler):
 
     def _serve_2d_datasets_json(self):
         import json as _json
+
         datasets = []
         base = Path(self.tiles2d_base) if self.tiles2d_base else None
         if base and base.exists():
@@ -177,12 +179,22 @@ class TileHandler(SimpleHTTPRequestHandler):
 def main():
     parser = argparse.ArgumentParser(description="Serve muDM tile viewer")
     parser.add_argument("--port", type=int, default=8080, help="Port (default: 8080)")
-    parser.add_argument("--tiles-base", type=str, required=True, help="Directory containing pyramids.json")
-    parser.add_argument("--tiles2d-base", type=str, default="", help="Directory containing 2D tile datasets")
-    parser.add_argument("--viewer", type=str, default="3d", choices=["3d", "2d"],
-                        help="Bundled viewer to use (default: 3d)")
-    parser.add_argument("--viewer-dir", type=str, default=None,
-                        help="Custom viewer directory (overrides --viewer)")
+    parser.add_argument(
+        "--tiles-base", type=str, required=True, help="Directory containing pyramids.json"
+    )
+    parser.add_argument(
+        "--tiles2d-base", type=str, default="", help="Directory containing 2D tile datasets"
+    )
+    parser.add_argument(
+        "--viewer",
+        type=str,
+        default="3d",
+        choices=["3d", "2d"],
+        help="Bundled viewer to use (default: 3d)",
+    )
+    parser.add_argument(
+        "--viewer-dir", type=str, default=None, help="Custom viewer directory (overrides --viewer)"
+    )
     args = parser.parse_args()
 
     tiles_base = os.path.abspath(args.tiles_base)

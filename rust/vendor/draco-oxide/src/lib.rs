@@ -1,0 +1,45 @@
+// lib.rs
+
+/// Contains the interface between `Mesh` object and 3D geometry files
+/// such as obj and gltf.
+pub mod io;
+
+/// Contains compression techniques used by the encoder and the decoder.
+pub(crate) mod shared;
+
+/// Defines the mesh encoder.
+pub mod encode;
+
+// /// Defines the decoders.
+// pub mod decode;
+
+/// Contains the shared definitions, native objects, and the buffer.
+pub(crate) mod core;
+
+/// Contains the macros used by the encoder and the decoder.
+pub(crate) mod utils;
+
+/// Contains the most commonly used traits, types, and objects.
+pub mod prelude {
+    pub use crate::core::attribute::{Attribute, AttributeType};
+    // mudm-tools fork patch: expose AttributeDomain + AttributeId so a
+    // downstream crate can drive MeshBuilder::add_attribute in-memory
+    // (the published prelude omits these; `core` is pub(crate) so the
+    // full path does not resolve from outside). See encoder_draco.rs.
+    pub use crate::core::attribute::{AttributeDomain, AttributeId};
+    pub use crate::core::bit_coder::{
+        ByteReader, ByteWriter, FunctionalByteReader, FunctionalByteWriter,
+    };
+    pub use crate::core::mesh::{builder::MeshBuilder, Mesh};
+    pub use crate::core::shared::ConfigType;
+    pub use crate::core::shared::{DataValue, NdVector, Vector};
+    pub use crate::encode::{self, encode};
+    // pub use crate::decode::{self, decode};
+}
+
+/// Evaluation module contains the evaluation functions for the encoder and the decoder.
+/// When enabled, draco-oxide encoder will spit out the evaluation data mixed with encoded data,
+/// and then the `EvalWriter` is used to filter out the evaluation data. This functionality is
+/// most often used in the development and testing phase.
+#[cfg(feature = "evaluation")]
+pub mod eval;

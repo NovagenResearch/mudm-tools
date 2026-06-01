@@ -3,7 +3,6 @@
 import json
 import urllib.parse
 
-import pytest
 
 from mudm_tools.neuroglancer.state import (
     build_annotation_layer,
@@ -53,9 +52,7 @@ class TestBuildViewerState:
     def test_with_position(self):
         layers = [build_skeleton_layer("n", "precomputed://x")]
         state = build_viewer_state(layers, position=[100.0, 200.0, 50.0])
-        assert state["navigation"]["pose"]["position"]["voxelCoordinates"] == [
-            100.0, 200.0, 50.0
-        ]
+        assert state["navigation"]["pose"]["position"]["voxelCoordinates"] == [100.0, 200.0, 50.0]
 
     def test_multiple_layers(self):
         layers = [
@@ -89,6 +86,4 @@ class TestViewerStateToUrl:
         fragment = url.split("#!")[1]
         decoded = json.loads(urllib.parse.unquote(fragment))
         assert decoded["layers"][0]["name"] == "test"
-        assert decoded["navigation"]["pose"]["position"]["voxelCoordinates"] == [
-            1.0, 2.0, 3.0
-        ]
+        assert decoded["navigation"]["pose"]["position"]["voxelCoordinates"] == [1.0, 2.0, 3.0]

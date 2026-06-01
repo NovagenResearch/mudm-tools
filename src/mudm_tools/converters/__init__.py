@@ -22,9 +22,11 @@ _REGISTRY: dict[str, type] = {}
 
 def register(name: str):
     """Decorator to register a converter class."""
+
     def decorator(cls):
         _REGISTRY[name] = cls
         return cls
+
     return decorator
 
 

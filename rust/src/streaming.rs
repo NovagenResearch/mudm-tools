@@ -29,13 +29,14 @@ use rayon::prelude::*;
 use ahash::AHashMap;
 
 use crate::types::BBox3D;
-use crate::fragment::{Fragment3D, Fragment3DWriter, Fragment3DReader};
+use crate::fragment::{Fragment3D, Fragment3DWriter, Fragment3DReader, prefetch_advise};
 use crate::encoder_pbf3;
 use crate::encoder_glb::{self, GlbFeature};
 use crate::tileset_json;
 use crate::tile_transform;
 use crate::obj_parser;
 use crate::simplify;
+use crate::error_log::{ErrorCollector, Severity};
 
 // Geometry type constants matching protobuf GeomType.
 const POINT3D: u8 = 1;
@@ -1898,6 +1899,45 @@ fn redistribute_fragments_to_buckets(
     Ok(bucket_dirs)
 }
 
+/// WS-C C.2 test probe: the maximum *actual* resident decoded-fragment bytes
+/// observed in any single batch's DashMap during `read_group_simplify_encode`
+/// (after re-split). Updated with a `fetch_max` per batch; read/reset from
+/// Python via `_get_peak_resident_bytes` / `_reset_peak_resident_bytes` so the
+/// peak-RSS / back-pressure tests can assert the batch stayed within budget
+/// without a full RSS measurement. Process-global and cheap (one atomic store
+/// per batch, NOT per fragment), so it has no effect on output bytes.
+static PEAK_RESIDENT_BYTES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// WS-B test probe: the bucket count `k` used by the last
+/// `generate_neuroglancer_multilod` feature-bucketed read. `k == 1` means the
+/// whole corpus fit one bucket (whole-corpus-equivalent path); `k > 1` proves
+/// the bounded bucketing actually split the corpus. Process-global, one store
+/// per generate call — no effect on output bytes.
+static NG_LAST_BUCKET_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// WS-B test probe (mirrors the WS-C `PEAK_RESIDENT_BYTES` pattern for the NG
+/// path): the maximum *actual* resident decoded-fragment bytes held in any
+/// single bucket's RETAINED feature map during `generate_neuroglancer_multilod`
+/// — i.e. the Σ `Fragment3D::estimate_bytes` over the features kept for that
+/// bucket (`hash(fid) % k == b`), taken as a `fetch_max` across the `k`
+/// buckets. With the bounded filter-during-decode fix this scales ≈ corpus / k,
+/// so a tiny ceiling (large k) yields a substantially smaller peak than a huge
+/// ceiling (k == 1). Read/reset from Python via `_get_ng_peak_resident_bytes` /
+/// `_reset_ng_peak_resident_bytes`. Process-global; one `fetch_max` per bucket,
+/// NOT per fragment — no effect on output bytes.
+static NG_PEAK_RESIDENT_BYTES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+fn observe_resident_bytes(n: usize) {
+    PEAK_RESIDENT_BYTES.fetch_max(n, Ordering::Relaxed);
+}
+
+fn observe_ng_resident_bytes(n: usize) {
+    NG_PEAK_RESIDENT_BYTES.fetch_max(n, Ordering::Relaxed);
+}
+
 /// Memory-adaptive pipeline: per-zoom batched read → group → simplify → encode.
 ///
 /// Processes each zoom level separately, with hash-based spatial batching to
@@ -1922,10 +1962,28 @@ fn read_group_simplify_encode(
     base_cells: u32,
     effective_compression: &str,
     max_memory_bytes: usize,
+    io_threads: usize,
+    collector: &ErrorCollector,
 ) -> io::Result<(u32, Vec<(u32, u32, u32, u32)>)> {
     use dashmap::DashMap;
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
+
+    // WS-C C.3 (Option A): cap the per-zoom read concurrency at the I/O-thread
+    // count (≤16, mirroring the Parquet `read_k` cap at the overlap read site).
+    // `io_threads == 0` means "use the ambient global rayon pool" (the parallel
+    // default); `1` is the serial fallback; `N>1` runs the per-zoom read on a
+    // scoped pool of N threads. This is I/O scheduling only — it does not change
+    // which fragments land in which tile, so GLB output stays byte-identical
+    // (the per-tile `feature_id` sort, C.4, canonicalizes within-tile order).
+    let read_pool: Option<rayon::ThreadPool> = if io_threads > 1 {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(io_threads.min(16))
+            .build()
+            .ok()
+    } else {
+        None
+    };
 
     // Discover fragment files
     let mut all_paths: Vec<PathBuf> = std::fs::read_dir(frag_dir)?
@@ -1991,10 +2049,16 @@ fn read_group_simplify_encode(
         );
     }
 
-    // Process all zoom levels in parallel.
-    // Each zoom reads only its own files, groups fragments, and encodes GLBs.
+    // WS-C C.1: process zoom levels SERIALLY (one zoom resident at a time) so
+    // peak decoded-fragment residency is ~one zoom's batch rather than
+    // `(max_zoom+1) × per-zoom budget` when all zooms ran concurrently
+    // (`into_par_iter`). Parallelism is retained INSIDE each zoom: the per-zoom
+    // `zoom_files.par_iter()` read below and the encode `par_iter` in
+    // `_encode_grouped_fragments`. A tile's GLB bytes are independent of which
+    // zoom is scheduled when, so this is byte-neutral (changes peak memory and
+    // scheduling only).
     let results: Vec<io::Result<(u32, Vec<(u32, u32, u32, u32)>)>> =
-        files_per_zoom.into_par_iter().enumerate().map(|(zoom_idx, zoom_files)| {
+        files_per_zoom.into_iter().enumerate().map(|(zoom_idx, zoom_files)| {
             let zoom = zoom_idx as u32;
 
             // Estimate memory for this zoom from actual file sizes
@@ -2004,73 +2068,177 @@ fn read_group_simplify_encode(
                 .sum();
             let zoom_estimate = (zoom_disk_bytes as f64 * 3.0) as usize; // ZSTD ~3x
 
-            // Batching: split into batches if estimated memory exceeds budget
-            let effective_budget = (max_memory_bytes as f64 * 0.8) as usize;
-            let n_batches = ((zoom_estimate + effective_budget - 1) / effective_budget).max(1);
+            // WS-C C.2: derive the per-zoom byte budget from the WS-0 ceiling
+            // (`max_memory_bytes`, == `self.max_memory_bytes` when no explicit
+            // per-call budget was given). The `disk_bytes × 3.0` guess only
+            // seeds the INITIAL `n_batches`; after a batch's DashMap is built we
+            // re-check the ACTUAL resident bytes (Σ `Fragment3D::estimate_bytes`)
+            // and re-split (increase `n_batches`, re-read the whole zoom) when a
+            // batch overshoots — mirroring the Parquet byte-budget chunker. This
+            // bounds peak resident decoded bytes to the budget instead of merely
+            // reducing it. The irreducible floor (one TILE > the full ceiling)
+            // is detected per batch and surfaced as a Fatal `ceiling_floor`
+            // (collect-then-raise at the caller), per spec §WS-0.
+            let effective_budget = ((max_memory_bytes as f64 * 0.8) as usize).max(1);
+            let mut n_batches =
+                ((zoom_estimate + effective_budget - 1) / effective_budget).max(1);
 
-            let mut zoom_count = 0u32;
-            let mut zoom_keys = Vec::new();
-
-            for batch in 0..n_batches {
-                let groups: DashMap<(u32, u32, u32, u32), Vec<Fragment3D>> = DashMap::new();
+            // Re-split loop: keep increasing `n_batches` until no batch's actual
+            // resident set overshoots the budget for a *reducible* reason (i.e.
+            // a batch holds >1 tile and could be split further). A batch whose
+            // overshoot is a single tile larger than the budget is irreducible
+            // by hash-batching: it is accepted if it fits the full ceiling, or
+            // raised as a floor violation if it does not.
+            'resplit: loop {
                 let n_b = n_batches;
+                let mut zoom_count = 0u32;
+                let mut zoom_keys = Vec::new();
+                let mut needs_resplit = false;
 
-                zoom_files.par_iter().for_each(|path| {
-                    let mut reader = match Fragment3DReader::new(path) {
-                        Ok(r) => r,
-                        Err(_) => return,
-                    };
+                for batch in 0..n_b {
+                    let groups: DashMap<(u32, u32, u32, u32), Vec<Fragment3D>> = DashMap::new();
 
-                    let mut local: AHashMap<(u32, u32, u32, u32), Vec<Fragment3D>> = AHashMap::new();
+                    // WS-C C.3 (Option A): the per-zoom read body. `prefetch_advise`
+                    // issues a best-effort OS readahead hint (posix_fadvise on
+                    // Linux, mmap+madvise elsewhere) BEFORE the decoder opens the
+                    // shard, overlapping open()+decode. Both the hint and the
+                    // scoped-pool scheduling are I/O-only: identical fragments are
+                    // grouped into identical tiles regardless, so GLB bytes are
+                    // unchanged.
+                    let read_one = |path: &PathBuf| {
+                        prefetch_advise(path);
+                        let mut reader = match Fragment3DReader::new(path) {
+                            Ok(r) => r,
+                            Err(_) => return,
+                        };
 
-                    loop {
-                        match reader.read_next() {
-                            Ok(Some(frag)) => {
-                                // Filter: only this zoom level (needed for mixed files)
-                                if frag.tile_z != zoom {
-                                    continue;
-                                }
+                        let mut local: AHashMap<(u32, u32, u32, u32), Vec<Fragment3D>> = AHashMap::new();
 
-                                // Filter: only this batch (by tile key hash)
-                                if n_b > 1 {
-                                    let mut hasher = DefaultHasher::new();
-                                    (frag.tile_x, frag.tile_y, frag.tile_d).hash(&mut hasher);
-                                    if (hasher.finish() as usize) % n_b != batch {
+                        loop {
+                            match reader.read_next() {
+                                Ok(Some(frag)) => {
+                                    // Filter: only this zoom level (needed for mixed files)
+                                    if frag.tile_z != zoom {
                                         continue;
                                     }
-                                }
 
-                                let key = (frag.tile_z, frag.tile_x, frag.tile_y, frag.tile_d);
-                                local.entry(key).or_default().push(frag);
+                                    // Filter: only this batch (by tile key hash)
+                                    if n_b > 1 {
+                                        let mut hasher = DefaultHasher::new();
+                                        (frag.tile_x, frag.tile_y, frag.tile_d).hash(&mut hasher);
+                                        if (hasher.finish() as usize) % n_b != batch {
+                                            continue;
+                                        }
+                                    }
+
+                                    let key = (frag.tile_z, frag.tile_x, frag.tile_y, frag.tile_d);
+                                    local.entry(key).or_default().push(frag);
+                                }
+                                Ok(None) => break,
+                                Err(_) => break,
                             }
-                            Ok(None) => break,
-                            Err(_) => break,
+                        }
+
+                        // Batch-insert into shared DashMap
+                        for (key, mut frags) in local {
+                            groups.entry(key).or_default().extend(frags.drain(..));
+                        }
+                    };
+
+                    // Run the read on the capped `io_threads` scoped pool when one
+                    // was built (`io_threads > 1`); otherwise on the ambient pool
+                    // (`io_threads == 0`, parallel default) / serially via rayon's
+                    // single-thread behavior under `MUDM_IO_THREADS=1`.
+                    match &read_pool {
+                        Some(pool) => pool.install(|| zoom_files.par_iter().for_each(&read_one)),
+                        None => zoom_files.par_iter().for_each(&read_one),
+                    }
+
+                    // WS-C C.2 back-pressure: measure the ACTUAL resident bytes
+                    // of this batch's DashMap and the largest single tile within
+                    // it (the irreducible unit — written whole via `fs::write`).
+                    let mut batch_resident: usize = 0;
+                    let mut largest_tile: usize = 0;
+                    let mut largest_tile_key = (0u32, 0u32, 0u32, 0u32);
+                    for entry in groups.iter() {
+                        let tile_bytes: usize =
+                            entry.value().iter().map(|f| f.estimate_bytes()).sum();
+                        batch_resident += tile_bytes;
+                        if tile_bytes > largest_tile {
+                            largest_tile = tile_bytes;
+                            largest_tile_key = *entry.key();
                         }
                     }
 
-                    // Batch-insert into shared DashMap
-                    for (key, mut frags) in local {
-                        groups.entry(key).or_default().extend(frags.drain(..));
+                    // Step 2b (hard-cap floor): a single tile exceeding the full
+                    // ceiling cannot be split (it is one `fs::write`). Record a
+                    // Fatal `ceiling_floor` failure and bail; the caller (GIL
+                    // frame) checks `had_fatal()` and raises the typed error.
+                    if largest_tile > max_memory_bytes {
+                        let (tz, tx, ty, td) = largest_tile_key;
+                        let tile_id = format!("{}/{}/{}/{}", tz, tx, ty, td);
+                        collector.record_failure(
+                            "3dtiles",
+                            Severity::Fatal,
+                            &tile_id,
+                            "ceiling_floor",
+                            &format!(
+                                "tile resident {} bytes exceeds memory ceiling {} bytes \
+                                 (irreducible: a tile is written whole)",
+                                largest_tile, max_memory_bytes,
+                            ),
+                        );
+                        return Err(io::Error::new(
+                            io::ErrorKind::OutOfMemory,
+                            format!(
+                                "ceiling_floor: tile {} resident {} bytes exceeds memory \
+                                 ceiling {} bytes",
+                                tile_id, largest_tile, max_memory_bytes,
+                            ),
+                        ));
                     }
-                });
 
-                // Encode this batch's tile groups
-                let owned: AHashMap<(u32, u32, u32, u32), Vec<Fragment3D>> =
-                    groups.into_iter().collect();
+                    // If the batch overshoots the budget AND the overshoot is
+                    // reducible (the largest tile itself fits the budget, so
+                    // re-splitting can shrink this batch), trigger a re-split.
+                    // An overshoot caused by one tile larger than the budget but
+                    // within the ceiling is accepted as-is (hash-batching cannot
+                    // split a single tile further).
+                    if batch_resident > effective_budget && largest_tile <= effective_budget {
+                        needs_resplit = true;
+                        break;
+                    }
 
-                if !owned.is_empty() {
-                    let (count, keys) = _encode_grouped_fragments(
-                        owned, tags_registry, out_dir,
-                        xmin, ymin, zmin, dx, dy, dz,
-                        max_zoom, base_cells, effective_compression,
-                    )?;
-                    zoom_count += count;
-                    zoom_keys.extend(keys);
+                    observe_resident_bytes(batch_resident);
+
+                    // Encode this batch's tile groups
+                    let owned: AHashMap<(u32, u32, u32, u32), Vec<Fragment3D>> =
+                        groups.into_iter().collect();
+
+                    if !owned.is_empty() {
+                        let (count, keys) = _encode_grouped_fragments(
+                            owned, tags_registry, out_dir,
+                            xmin, ymin, zmin, dx, dy, dz,
+                            max_zoom, base_cells, effective_compression,
+                            collector,
+                        )?;
+                        zoom_count += count;
+                        zoom_keys.extend(keys);
+                    }
                 }
-            }
 
-            eprintln!("[encode] zoom {} done: {} tiles", zoom, zoom_count);
-            Ok((zoom_count, zoom_keys))
+                if needs_resplit {
+                    // Double the split granularity and re-read the whole zoom.
+                    // Anything already encoded this pass is overwritten by the
+                    // re-read (same tile keys → same `fs::write` targets), so the
+                    // final output is independent of the discarded partial pass.
+                    n_batches = n_batches.saturating_add(1).max(n_batches * 2);
+                    continue 'resplit;
+                }
+
+                eprintln!("[encode] zoom {} done: {} tiles", zoom, zoom_count);
+                break 'resplit Ok((zoom_count, zoom_keys));
+            }
         }).collect();
 
     // Aggregate results from all zoom levels
@@ -2099,12 +2267,14 @@ fn encode_bucket_to_3dtiles(
     max_zoom: u32,
     base_cells: u32,
     effective_compression: &str,
+    collector: &ErrorCollector,
 ) -> io::Result<(u32, Vec<(u32, u32, u32, u32)>)> {
     // Read all fragments from this bucket's shard files and group by tile key
     let mut reader = Fragment3DReader::open_dir(bucket_dir)?;
     let groups = reader.read_all_grouped()?;
     _encode_grouped_fragments(groups, tags_registry, out_dir,
-        xmin, ymin, zmin, dx, dy, dz, max_zoom, base_cells, effective_compression)
+        xmin, ymin, zmin, dx, dy, dz, max_zoom, base_cells, effective_compression,
+        collector)
 }
 
 /// Encode a single bucket file into GLB tiles.
@@ -2117,14 +2287,24 @@ fn encode_bucket_file_to_3dtiles(
     max_zoom: u32,
     base_cells: u32,
     effective_compression: &str,
+    collector: &ErrorCollector,
 ) -> io::Result<(u32, Vec<(u32, u32, u32, u32)>)> {
     let mut reader = Fragment3DReader::new(bucket_file)?;
     let groups = reader.read_all_grouped()?;
     _encode_grouped_fragments(groups, tags_registry, out_dir,
-        xmin, ymin, zmin, dx, dy, dz, max_zoom, base_cells, effective_compression)
+        xmin, ymin, zmin, dx, dy, dz, max_zoom, base_cells, effective_compression,
+        collector)
 }
 
 /// Shared encoding logic for grouped fragments.
+///
+/// WS-D D.3: collects per-tile write results in the encode `par_iter` instead of
+/// swallowing failures with `.ok()`. On a failed `create_dir_all`/`fs::write`,
+/// records a non-fatal `"3dtiles"`/`"write"` failure in the `ErrorCollector` and
+/// excludes the tile from the count; the GLB bytes of SUCCESSFUL tiles are
+/// unchanged (the encode path is untouched). The returned `tile_keys` is pruned
+/// to only the tiles that actually wrote, so `tileset.json` (built from these
+/// keys) never references a missing `.glb` (GLB-4).
 fn _encode_grouped_fragments(
     groups: AHashMap<(u32, u32, u32, u32), Vec<Fragment3D>>,
     tags_registry: &HashMap<u32, Vec<(String, TagValue)>>,
@@ -2134,17 +2314,39 @@ fn _encode_grouped_fragments(
     max_zoom: u32,
     base_cells: u32,
     effective_compression: &str,
+    collector: &ErrorCollector,
 ) -> io::Result<(u32, Vec<(u32, u32, u32, u32)>)> {
 
     let mut tiles: Vec<((u32, u32, u32, u32), Vec<Fragment3D>)> = groups.into_iter().collect();
-    tiles.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
 
-    let tile_keys: Vec<(u32, u32, u32, u32)> = tiles.iter().map(|(k, _)| *k).collect();
+    // WS-C C.4: canonicalize within-tile fragment order by feature_id before
+    // encoding. GLB tiles are order-loose (each fragment → one GLB node; the
+    // geometry is identical regardless of node order), but the source `groups`
+    // come from a DashMap merge of many shards in non-deterministic order, so
+    // node order — and therefore the GLB bytes — varied run-to-run and between
+    // serial/parallel reads. Sorting by feature_id (mirroring the Parquet
+    // read-side sort at `read_chunk_sorted`) makes node order deterministic, so
+    // a serial run and a parallel run emit byte-identical .glb files. This
+    // changes ONLY node ordering, never geometry/accessors/encode logic.
+    for (_k, frags) in tiles.iter_mut() {
+        // frag_cmp leads with feature_id (strict refinement of the old key), so
+        // this cannot reorder distinct features (no synthetic re-bake) but also
+        // breaks ties between a feature's own multiple fragments in a tile —
+        // making GLB node order deterministic on real data.
+        frags.sort_by(crate::fragment::frag_cmp);
+    }
+
+    // Encode the fattest tiles first (load balancing). The outer ordering of
+    // `tiles` does not affect any single tile's bytes — only the within-tile
+    // `frags` order (canonicalized above) does.
+    tiles.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
 
     const INNER_PAR_THRESHOLD: usize = 16;
 
-    let count: u32 = tiles.par_iter()
+    // Collect (tile_key, ok) so failed tiles can be pruned from tile_keys.
+    let written: Vec<((u32, u32, u32, u32), bool)> = tiles.par_iter()
         .map(|((tz, tx, ty, td), frags)| {
+            let (tz, tx, ty, td) = (*tz, *tx, *ty, *td);
             // Simplification already done during redistribution — skip here
             let do_simplify = false;
 
@@ -2152,14 +2354,14 @@ fn _encode_grouped_fragments(
                 frags.par_iter().filter_map(|frag| {
                     fragment_to_glb_feature(
                         frag, tags_registry, xmin, ymin, zmin, dx, dy, dz,
-                        do_simplify, max_zoom, base_cells, *tz,
+                        do_simplify, max_zoom, base_cells, tz,
                     )
                 }).collect()
             } else {
                 frags.iter().filter_map(|frag| {
                     fragment_to_glb_feature(
                         frag, tags_registry, xmin, ymin, zmin, dx, dy, dz,
-                        do_simplify, max_zoom, base_cells, *tz,
+                        do_simplify, max_zoom, base_cells, tz,
                     )
                 }).collect()
             };
@@ -2174,13 +2376,41 @@ fn _encode_grouped_fragments(
                 .join(tx.to_string())
                 .join(ty.to_string())
                 .join(format!("{}.glb", td));
+            let tile_id = format!("{}/{}/{}/{}.glb", tz, tx, ty, td);
+
+            // Checked dir-create + write. A failure is non-fatal (skip the tile,
+            // continue the rest); recorded as data + a flag inside the rayon
+            // pool — NO PyErr here (collect-then-raise discipline; this path is
+            // non-fatal so the outer frame just prunes).
             if let Some(parent) = tile_path.parent() {
-                std::fs::create_dir_all(parent).ok();
+                if let Err(e) = std::fs::create_dir_all(parent) {
+                    collector.record_failure(
+                        "3dtiles", Severity::NonFatal, &tile_id, "write", &e.to_string(),
+                    );
+                    return ((tz, tx, ty, td), false);
+                }
             }
-            std::fs::write(&tile_path, data).ok();
-            1u32
+            if let Err(e) = std::fs::write(&tile_path, &data) {
+                collector.record_failure(
+                    "3dtiles", Severity::NonFatal, &tile_id, "write", &e.to_string(),
+                );
+                return ((tz, tx, ty, td), false);
+            }
+            collector.inc_ok();
+            ((tz, tx, ty, td), true)
         })
-        .sum();
+        .collect();
+
+    // Count only successful writes; prune failed tile keys so tileset.json
+    // never references a missing .glb.
+    let mut tile_keys: Vec<(u32, u32, u32, u32)> = Vec::with_capacity(written.len());
+    let mut count = 0u32;
+    for (key, ok) in &written {
+        if *ok {
+            count += 1;
+            tile_keys.push(*key);
+        }
+    }
 
     Ok((count, tile_keys))
 }
@@ -2207,6 +2437,11 @@ struct ParquetRow {
 /// (same algorithm as `encode_glb_tile_from_fragments`). At max_zoom,
 /// writes per-face vertices directly. Lines and points are transformed
 /// to world coords without clustering.
+// --- transform profiling (CPU-time sums across threads; gated by MUDM_NATIVE_PROFILE) ---
+static PROF_GEOM_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PROF_QEM_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PROF_SERIALIZE_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn collect_parquet_rows(
     tiles: &[((u32, u32, u32, u32), Vec<Fragment3D>)],
     world_bounds: &(f64, f64, f64, f64, f64, f64),
@@ -2218,96 +2453,104 @@ fn collect_parquet_rows(
     let dy = if ymax != ymin { ymax - ymin } else { 1.0 };
     let dz = if zmax != zmin { zmax - zmin } else { 1.0 };
 
-    tiles.par_iter()
-        .flat_map(|((tz, tx, ty, td), frags)| {
-            let tz = *tz;
+    // Flatten to FRAGMENT-level work items so the heavy QEM fragments that
+    // concentrate in fat coarse-zoom tiles get work-stolen across all cores
+    // (tile-level par_iter only reached ~20x/80 from load imbalance). Row order
+    // is free: run_native_partitioned partitions by zoom and the equivalence
+    // tests canonical-sort, so per-fragment scheduling order does not matter.
+    let work: Vec<((u32, u32, u32, u32), &Fragment3D)> = tiles
+        .iter()
+        .flat_map(|(k, frags)| frags.iter().map(move |f| (*k, f)))
+        .collect();
+
+    work.par_iter()
+        .filter_map(|&((tz, tx, ty, td), frag)| {
             let do_simplify = tz < max_zoom;
-
-            let mut rows: Vec<ParquetRow> = Vec::new();
-
-            for frag in frags {
-                let n_verts = frag.z.len();
-                if n_verts == 0 {
-                    continue;
-                }
-
-                let (pos_f32, idx_u32) = match frag.geom_type {
-                    5 | 4 => {
-                        // TIN / PolyhedralSurface
-                        let rls: Vec<usize> = if frag.ring_lengths.is_empty() {
-                            vec![n_verts]
-                        } else {
-                            frag.ring_lengths.iter().map(|&r| r as usize).collect()
-                        };
-                        let n_faces = rls.len();
-                        let do_simplify_this = do_simplify && n_faces > 4;
-
-                        if do_simplify_this {
-                            parquet_tin_simplified(
-                                frag, &rls, n_verts,
-                                xmin, ymin, zmin, dx, dy, dz,
-                                base_cells, tz, max_zoom,
-                            )
-                        } else {
-                            parquet_tin_direct(
-                                frag, &rls, n_verts,
-                                xmin, ymin, zmin, dx, dy, dz,
-                            )
-                        }
-                    }
-                    2 => {
-                        // LineString
-                        let mut positions: Vec<f32> = Vec::with_capacity(n_verts * 3);
-                        let mut indices: Vec<u32> = Vec::with_capacity(n_verts.saturating_sub(1) * 2);
-                        for i in 0..n_verts {
-                            positions.push((xmin + frag.xy[i * 2] as f64 * dx) as f32);
-                            positions.push((ymin + frag.xy[i * 2 + 1] as f64 * dy) as f32);
-                            positions.push((zmin + frag.z[i] as f64 * dz) as f32);
-                        }
-                        for i in 0..n_verts.saturating_sub(1) {
-                            indices.push(i as u32);
-                            indices.push((i + 1) as u32);
-                        }
-                        (positions, indices)
-                    }
-                    1 => {
-                        // Point
-                        let mut positions: Vec<f32> = Vec::with_capacity(n_verts * 3);
-                        for i in 0..n_verts {
-                            positions.push((xmin + frag.xy[i * 2] as f64 * dx) as f32);
-                            positions.push((ymin + frag.xy[i * 2 + 1] as f64 * dy) as f32);
-                            positions.push((zmin + frag.z[i] as f64 * dz) as f32);
-                        }
-                        (positions, Vec::new())
-                    }
-                    _ => continue,
-                };
-
-                if pos_f32.is_empty() {
-                    continue;
-                }
-
-                // Convert to LE bytes
-                let pos_bytes: Vec<u8> = pos_f32.iter()
-                    .flat_map(|f| f.to_le_bytes())
-                    .collect();
-                let idx_bytes: Vec<u8> = idx_u32.iter()
-                    .flat_map(|i| i.to_le_bytes())
-                    .collect();
-
-                rows.push(ParquetRow {
-                    zoom: tz as u8,
-                    tile_x: *tx as u16,
-                    tile_y: *ty as u16,
-                    tile_d: *td as u16,
-                    feature_id: frag.feature_id,
-                    geom_type: frag.geom_type,
-                    positions: pos_bytes,
-                    indices: idx_bytes,
-                });
+            let n_verts = frag.z.len();
+            if n_verts == 0 {
+                return None;
             }
 
-            rows
+            let _tg = std::time::Instant::now();
+            let (pos_f32, idx_u32) = match frag.geom_type {
+                5 | 4 => {
+                    // TIN / PolyhedralSurface
+                    let rls: Vec<usize> = if frag.ring_lengths.is_empty() {
+                        vec![n_verts]
+                    } else {
+                        frag.ring_lengths.iter().map(|&r| r as usize).collect()
+                    };
+                    let n_faces = rls.len();
+                    let do_simplify_this = do_simplify && n_faces > 4;
+
+                    if do_simplify_this {
+                        parquet_tin_simplified(
+                            frag, &rls, n_verts,
+                            xmin, ymin, zmin, dx, dy, dz,
+                            base_cells, tz, max_zoom,
+                        )
+                    } else {
+                        parquet_tin_direct(
+                            frag, &rls, n_verts,
+                            xmin, ymin, zmin, dx, dy, dz,
+                        )
+                    }
+                }
+                2 => {
+                    // LineString
+                    let mut positions: Vec<f32> = Vec::with_capacity(n_verts * 3);
+                    let mut indices: Vec<u32> = Vec::with_capacity(n_verts.saturating_sub(1) * 2);
+                    for i in 0..n_verts {
+                        positions.push((xmin + frag.xy[i * 2] as f64 * dx) as f32);
+                        positions.push((ymin + frag.xy[i * 2 + 1] as f64 * dy) as f32);
+                        positions.push((zmin + frag.z[i] as f64 * dz) as f32);
+                    }
+                    for i in 0..n_verts.saturating_sub(1) {
+                        indices.push(i as u32);
+                        indices.push((i + 1) as u32);
+                    }
+                    (positions, indices)
+                }
+                1 => {
+                    // Point
+                    let mut positions: Vec<f32> = Vec::with_capacity(n_verts * 3);
+                    for i in 0..n_verts {
+                        positions.push((xmin + frag.xy[i * 2] as f64 * dx) as f32);
+                        positions.push((ymin + frag.xy[i * 2 + 1] as f64 * dy) as f32);
+                        positions.push((zmin + frag.z[i] as f64 * dz) as f32);
+                    }
+                    (positions, Vec::new())
+                }
+                _ => return None,
+            };
+            PROF_GEOM_NS.fetch_add(
+                _tg.elapsed().as_nanos() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+
+            if pos_f32.is_empty() {
+                return None;
+            }
+
+            // Convert to LE bytes
+            let _ts = std::time::Instant::now();
+            let pos_bytes: Vec<u8> = pos_f32.iter().flat_map(|f| f.to_le_bytes()).collect();
+            let idx_bytes: Vec<u8> = idx_u32.iter().flat_map(|i| i.to_le_bytes()).collect();
+            PROF_SERIALIZE_NS.fetch_add(
+                _ts.elapsed().as_nanos() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+
+            Some(ParquetRow {
+                zoom: tz as u8,
+                tile_x: tx as u16,
+                tile_y: ty as u16,
+                tile_d: td as u16,
+                feature_id: frag.feature_id,
+                geom_type: frag.geom_type,
+                positions: pos_bytes,
+                indices: idx_bytes,
+            })
         })
         .collect()
 }
@@ -2335,7 +2578,12 @@ fn parquet_tin_simplified(
         base_cells, zoom, max_zoom, indices.len(),
     );
     let target_tris = target_idx / 3;
+    let _tq = std::time::Instant::now();
     let (sp, mut si) = simplify::simplify_mesh(&positions, &indices, target_tris);
+    PROF_QEM_NS.fetch_add(
+        _tq.elapsed().as_nanos() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
     filter_oversized_triangles(&sp, &mut si, tile_max_edge_sq_world(base_cells, zoom, dx, dy, dz));
     (sp, si)
 }
@@ -2383,10 +2631,603 @@ fn parquet_tin_direct(
     (positions, indices)
 }
 
+/// Build the 9-column (+`row_count`) Python dict for one Parquet batch.
+///
+/// Factored out of `_next_parquet_batch` so the serial and parallel batch
+/// methods emit a byte-identical column layout. Callers run `collect_parquet_rows`
+/// (GIL-released) first, then call this with the GIL held to materialise the dict.
+fn build_batch_dict(
+    py: Python<'_>,
+    rows: &[ParquetRow],
+    tags_registry: &HashMap<u32, Vec<(String, TagValue)>>,
+) -> PyResult<PyObject> {
+    let n = rows.len();
+
+    let zoom_list = pyo3::types::PyList::empty(py);
+    let tx_list = pyo3::types::PyList::empty(py);
+    let ty_list = pyo3::types::PyList::empty(py);
+    let td_list = pyo3::types::PyList::empty(py);
+    let fid_list = pyo3::types::PyList::empty(py);
+    let gt_list = pyo3::types::PyList::empty(py);
+    let pos_list = pyo3::types::PyList::empty(py);
+    let idx_list = pyo3::types::PyList::empty(py);
+    let tags_list = pyo3::types::PyList::empty(py);
+
+    for row in rows {
+        zoom_list.append(row.zoom)?;
+        tx_list.append(row.tile_x)?;
+        ty_list.append(row.tile_y)?;
+        td_list.append(row.tile_d)?;
+        fid_list.append(row.feature_id)?;
+        gt_list.append(row.geom_type)?;
+        pos_list.append(pyo3::types::PyBytes::new(py, &row.positions))?;
+        idx_list.append(pyo3::types::PyBytes::new(py, &row.indices))?;
+
+        let tag_pairs = pyo3::types::PyList::empty(py);
+        if let Some(tags) = tags_registry.get(&row.feature_id) {
+            for (k, v) in tags {
+                let vs = match v {
+                    TagValue::Str(s) => s.clone(),
+                    TagValue::Int(i) => i.to_string(),
+                    TagValue::Float(f) => f.to_string(),
+                    TagValue::Bool(b) => b.to_string(),
+                };
+                tag_pairs.append((k.as_str(), vs.as_str()))?;
+            }
+        }
+        tags_list.append(tag_pairs)?;
+    }
+
+    let dict = pyo3::types::PyDict::new(py);
+    dict.set_item("zoom", zoom_list)?;
+    dict.set_item("tile_x", tx_list)?;
+    dict.set_item("tile_y", ty_list)?;
+    dict.set_item("tile_d", td_list)?;
+    dict.set_item("feature_id", fid_list)?;
+    dict.set_item("geom_type", gt_list)?;
+    dict.set_item("positions", pos_list)?;
+    dict.set_item("indices", idx_list)?;
+    dict.set_item("tags", tags_list)?;
+    dict.set_item("row_count", n)?;
+
+    Ok(dict.into())
+}
+
+/// Build an Arrow `RecordBatch` for one Parquet batch ENTIRELY in Rust — no GIL,
+/// no per-row Python calls, and `positions`/`indices` written straight into Arrow
+/// `LargeBinary` buffers (eliminating the `PyBytes` + `pa.array(list)` copies of
+/// the dict bridge). Schema matches the Python `_parquet_schema()`: zoom u8,
+/// tile_x/y/d u16, feature_id u32, geom_type u8, positions/indices LargeBinary,
+/// tags Map(entries{key:utf8, value:utf8}). Map child field names are
+/// `entries/key/value` to match pyarrow's `pa.map_(utf8,utf8)` default (NOT
+/// arrow-rs's `entries/keys/values`). Tag stringification is identical to
+/// `build_batch_dict`, so output is byte-identical modulo row order.
+fn build_batch_recordbatch(
+    rows: &[ParquetRow],
+    tags_registry: &HashMap<u32, Vec<(String, TagValue)>>,
+) -> Result<arrow::record_batch::RecordBatch, String> {
+    use arrow::array::*;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use std::sync::Arc;
+
+    let zoom: UInt8Array = rows.iter().map(|r| Some(r.zoom)).collect();
+    let tile_x: UInt16Array = rows.iter().map(|r| Some(r.tile_x)).collect();
+    let tile_y: UInt16Array = rows.iter().map(|r| Some(r.tile_y)).collect();
+    let tile_d: UInt16Array = rows.iter().map(|r| Some(r.tile_d)).collect();
+    let feature_id: UInt32Array = rows.iter().map(|r| Some(r.feature_id)).collect();
+    let geom_type: UInt8Array = rows.iter().map(|r| Some(r.geom_type)).collect();
+    let positions: LargeBinaryArray = rows.iter().map(|r| Some(r.positions.as_slice())).collect();
+    let indices: LargeBinaryArray = rows.iter().map(|r| Some(r.indices.as_slice())).collect();
+
+    // Map child field names matching pyarrow's default (entries/key/value).
+    let field_names = MapFieldNames {
+        entry: "entries".to_string(),
+        key: "key".to_string(),
+        value: "value".to_string(),
+    };
+    let mut map_builder =
+        MapBuilder::new(Some(field_names), StringBuilder::new(), StringBuilder::new());
+    for row in rows {
+        if let Some(tags) = tags_registry.get(&row.feature_id) {
+            for (k, v) in tags {
+                map_builder.keys().append_value(k);
+                match v {
+                    TagValue::Str(s) => map_builder.values().append_value(s),
+                    TagValue::Int(i) => map_builder.values().append_value(i.to_string()),
+                    TagValue::Float(f) => map_builder.values().append_value(f.to_string()),
+                    TagValue::Bool(b) => map_builder.values().append_value(b.to_string()),
+                }
+            }
+        }
+        map_builder.append(true).map_err(|e| format!("map build: {}", e))?;
+    }
+    let tags_arr = map_builder.finish();
+
+    // Fields nullable=true to match pyarrow `pa.field` defaults; arrays are
+    // non-null which is valid under nullable fields. tags DataType is taken
+    // from the built array so schema and array always agree.
+    let schema = Schema::new(vec![
+        Field::new("zoom", DataType::UInt8, true),
+        Field::new("tile_x", DataType::UInt16, true),
+        Field::new("tile_y", DataType::UInt16, true),
+        Field::new("tile_d", DataType::UInt16, true),
+        Field::new("feature_id", DataType::UInt32, true),
+        Field::new("geom_type", DataType::UInt8, true),
+        Field::new("positions", DataType::LargeBinary, true),
+        Field::new("indices", DataType::LargeBinary, true),
+        Field::new("tags", tags_arr.data_type().clone(), true),
+    ]);
+
+    let columns: Vec<ArrayRef> = vec![
+        Arc::new(zoom),
+        Arc::new(tile_x),
+        Arc::new(tile_y),
+        Arc::new(tile_d),
+        Arc::new(feature_id),
+        Arc::new(geom_type),
+        Arc::new(positions),
+        Arc::new(indices),
+        Arc::new(tags_arr),
+    ];
+    arrow::record_batch::RecordBatch::try_new(Arc::new(schema), columns)
+        .map_err(|e| format!("RecordBatch: {}", e))
+}
+
+/// Like `build_batch_recordbatch` but WITHOUT the `zoom` column — for the
+/// partitioned writer where zoom is encoded in the `zoom=N/` directory name
+/// (matches Python `_parquet_schema_no_zoom()`). 8 columns; Map child names
+/// `entries/key/value`; nullable=true; identical tag stringification.
+fn build_batch_no_zoom(
+    rows: &[ParquetRow],
+    tags_registry: &HashMap<u32, Vec<(String, TagValue)>>,
+) -> Result<arrow::record_batch::RecordBatch, String> {
+    use arrow::array::*;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use std::sync::Arc;
+
+    let tile_x: UInt16Array = rows.iter().map(|r| Some(r.tile_x)).collect();
+    let tile_y: UInt16Array = rows.iter().map(|r| Some(r.tile_y)).collect();
+    let tile_d: UInt16Array = rows.iter().map(|r| Some(r.tile_d)).collect();
+    let feature_id: UInt32Array = rows.iter().map(|r| Some(r.feature_id)).collect();
+    let geom_type: UInt8Array = rows.iter().map(|r| Some(r.geom_type)).collect();
+    let positions: LargeBinaryArray = rows.iter().map(|r| Some(r.positions.as_slice())).collect();
+    let indices: LargeBinaryArray = rows.iter().map(|r| Some(r.indices.as_slice())).collect();
+
+    let field_names = MapFieldNames {
+        entry: "entries".to_string(),
+        key: "key".to_string(),
+        value: "value".to_string(),
+    };
+    let mut map_builder =
+        MapBuilder::new(Some(field_names), StringBuilder::new(), StringBuilder::new());
+    for row in rows {
+        if let Some(tags) = tags_registry.get(&row.feature_id) {
+            for (k, v) in tags {
+                map_builder.keys().append_value(k);
+                match v {
+                    TagValue::Str(s) => map_builder.values().append_value(s),
+                    TagValue::Int(i) => map_builder.values().append_value(i.to_string()),
+                    TagValue::Float(f) => map_builder.values().append_value(f.to_string()),
+                    TagValue::Bool(b) => map_builder.values().append_value(b.to_string()),
+                }
+            }
+        }
+        map_builder.append(true).map_err(|e| format!("map build: {}", e))?;
+    }
+    let tags_arr = map_builder.finish();
+
+    let schema = Schema::new(vec![
+        Field::new("tile_x", DataType::UInt16, true),
+        Field::new("tile_y", DataType::UInt16, true),
+        Field::new("tile_d", DataType::UInt16, true),
+        Field::new("feature_id", DataType::UInt32, true),
+        Field::new("geom_type", DataType::UInt8, true),
+        Field::new("positions", DataType::LargeBinary, true),
+        Field::new("indices", DataType::LargeBinary, true),
+        Field::new("tags", tags_arr.data_type().clone(), true),
+    ]);
+
+    let columns: Vec<ArrayRef> = vec![
+        Arc::new(tile_x),
+        Arc::new(tile_y),
+        Arc::new(tile_d),
+        Arc::new(feature_id),
+        Arc::new(geom_type),
+        Arc::new(positions),
+        Arc::new(indices),
+        Arc::new(tags_arr),
+    ];
+    arrow::record_batch::RecordBatch::try_new(Arc::new(schema), columns)
+        .map_err(|e| format!("RecordBatch: {}", e))
+}
+
+/// `WriterProperties` for the native partitioned writer. CRITICAL: parquet-rs
+/// `Compression::ZSTD(Default)` is level 1; the Python path uses level 3, so we
+/// set `ZstdLevel(3)` explicitly. Dictionary encoding is disabled on the raw
+/// geometry blobs (positions/indices) to bound writer memory and speed encode;
+/// it stays on (default) for the small int/tag columns.
+fn native_writer_props(
+    compression: &str,
+    compression_level: i32,
+) -> Result<parquet::file::properties::WriterProperties, String> {
+    use parquet::basic::{Compression, ZstdLevel};
+    use parquet::file::properties::WriterProperties;
+    use parquet::schema::types::ColumnPath;
+
+    let comp = match compression {
+        "zstd" => Compression::ZSTD(
+            ZstdLevel::try_new(compression_level).map_err(|e| format!("zstd level: {}", e))?,
+        ),
+        "lz4" => Compression::LZ4_RAW,
+        "snappy" => Compression::SNAPPY,
+        _ => Compression::UNCOMPRESSED,
+    };
+    Ok(WriterProperties::builder()
+        .set_compression(comp)
+        .set_column_dictionary_enabled(ColumnPath::from("positions"), false)
+        .set_column_dictionary_enabled(ColumnPath::from("indices"), false)
+        .build())
+}
+
+/// Rust analogue of Python `_RotatingWriter`: appends row batches to
+/// `{dir}/part_{idx:03}.parquet`, rotating to a new part when the current part's
+/// cumulative uncompressed-binary bytes would exceed `max_file_bytes`. State
+/// persists across shard chunks, so one part file may span multiple chunks.
+///
+/// NOTE: superseded by `run_native_partitioned`'s per-zoom part-splitting (which
+/// fans ZSTD across cores). Retained for a possible single-writer-per-zoom mode.
+#[allow(dead_code)]
+struct RotatingWriterRs {
+    dir: std::path::PathBuf,
+    schema: std::sync::Arc<arrow::datatypes::Schema>,
+    props: std::sync::Arc<parquet::file::properties::WriterProperties>,
+    max_file_bytes: u64,
+    idx: u32,
+    cum_bytes: u64,
+    writer: Option<parquet::arrow::ArrowWriter<std::fs::File>>,
+}
+
+impl RotatingWriterRs {
+    fn new(
+        dir: std::path::PathBuf,
+        schema: std::sync::Arc<arrow::datatypes::Schema>,
+        props: std::sync::Arc<parquet::file::properties::WriterProperties>,
+        max_file_bytes: u64,
+    ) -> Self {
+        Self { dir, schema, props, max_file_bytes, idx: 0, cum_bytes: 0, writer: None }
+    }
+
+    /// Write one zoom's rows for one chunk, rotating first if the current part
+    /// would exceed `max_file_bytes` (never rotates on the first write).
+    fn write(
+        &mut self,
+        rows: &[ParquetRow],
+        tags: &HashMap<u32, Vec<(String, TagValue)>>,
+    ) -> Result<(), String> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        // Uncompressed binary size (mirrors Python `_estimate_binary_bytes`).
+        let batch_bytes: u64 = rows
+            .iter()
+            .map(|r| (r.positions.len() + r.indices.len()) as u64)
+            .sum();
+
+        if self.writer.is_some()
+            && self.cum_bytes > 0
+            && self.cum_bytes + batch_bytes > self.max_file_bytes
+        {
+            if let Some(w) = self.writer.take() {
+                w.close().map_err(|e| format!("close part: {}", e))?;
+            }
+            self.idx += 1;
+            self.cum_bytes = 0;
+        }
+        if self.writer.is_none() {
+            std::fs::create_dir_all(&self.dir)
+                .map_err(|e| format!("mkdir {}: {}", self.dir.display(), e))?;
+            let path = self.dir.join(format!("part_{:03}.parquet", self.idx));
+            let file = std::fs::File::create(&path)
+                .map_err(|e| format!("create {}: {}", path.display(), e))?;
+            let w = parquet::arrow::ArrowWriter::try_new(
+                file,
+                self.schema.clone(),
+                Some((*self.props).clone()),
+            )
+            .map_err(|e| format!("ArrowWriter: {}", e))?;
+            self.writer = Some(w);
+        }
+
+        // Split into sub-batches under the 1.5 GB Arrow LargeBinary offset guard.
+        const SUB_LIMIT: u64 = 1_500_000_000;
+        let w = self.writer.as_mut().unwrap();
+        let mut start = 0usize;
+        let mut acc = 0u64;
+        for i in 0..rows.len() {
+            let rb = (rows[i].positions.len() + rows[i].indices.len()) as u64;
+            if acc > 0 && acc + rb > SUB_LIMIT {
+                let batch = build_batch_no_zoom(&rows[start..i], tags)?;
+                w.write(&batch).map_err(|e| format!("write: {}", e))?;
+                start = i;
+                acc = 0;
+            }
+            acc += rb;
+        }
+        if start < rows.len() {
+            let batch = build_batch_no_zoom(&rows[start..], tags)?;
+            w.write(&batch).map_err(|e| format!("write: {}", e))?;
+        }
+        self.cum_bytes += batch_bytes;
+        Ok(())
+    }
+
+    fn close(&mut self) -> Result<(), String> {
+        if let Some(w) = self.writer.take() {
+            w.close().map_err(|e| format!("close: {}", e))?;
+        }
+        Ok(())
+    }
+}
+
+/// Drive the WHOLE partitioned consolidation in Rust (sequential chunks; Step 5
+/// adds internal read/write overlap). For each byte-budgeted shard chunk:
+/// parallel-read (`read_all_grouped_parallel`) → transform (`collect_parquet_rows`)
+/// → partition rows by zoom → write each zoom's rows to its persistent
+/// `RotatingWriterRs` in PARALLEL (lever-A: one ArrowWriter per zoom, moved onto
+/// a rayon task). Writers persist across chunks so part files span chunks.
+/// Returns total rows. Output: `{output_dir}/zoom=N/part_NNN.parquet`.
+/// Read one shard chunk in parallel and group+sort its fragments per tile.
+/// The per-tile sort_by_key(feature_id) is part of READ output (groups come
+/// unordered from the DashMap) and is done here while cache-hot.
+fn read_chunk_sorted(
+    chunk: Vec<PathBuf>,
+    io_threads: usize,
+) -> Result<Vec<((u32, u32, u32, u32), Vec<Fragment3D>)>, String> {
+    let reader = Fragment3DReader::from_paths(chunk);
+    let mut tiles: Vec<((u32, u32, u32, u32), Vec<Fragment3D>)> = reader
+        .read_all_grouped_parallel(io_threads, true)
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .collect();
+    for (_k, v) in tiles.iter_mut() {
+        v.sort_by(crate::fragment::frag_cmp);
+    }
+    Ok(tiles)
+}
+
+/// Transform one chunk's tiles -> rows, partition by zoom, and write each zoom's
+/// rows as ~cores parallel part files (parallel ZSTD). Mutates `part_counter`
+/// (deterministic, single-caller) and returns the chunk's row count. The
+/// `into_par_iter()` write uses the CURRENT rayon pool (the dedicated consumer
+/// pool when overlapping). Byte-identical to the sequential write path.
+#[allow(clippy::too_many_arguments)]
+fn consume_chunk(
+    tiles: &[((u32, u32, u32, u32), Vec<Fragment3D>)],
+    out: &std::path::Path,
+    schema: &std::sync::Arc<arrow::datatypes::Schema>,
+    props: &std::sync::Arc<parquet::file::properties::WriterProperties>,
+    tags: &HashMap<u32, Vec<(String, TagValue)>>,
+    world_bounds: (f64, f64, f64, f64, f64, f64),
+    max_zoom: u32,
+    base_cells: u32,
+    max_file_bytes: u64,
+    part_counter: &mut std::collections::HashMap<u32, u32>,
+) -> Result<u64, String> {
+    use rayon::prelude::*;
+    use std::collections::HashMap as StdHashMap;
+
+    let rows = collect_parquet_rows(tiles, &world_bounds, max_zoom, base_cells);
+    if rows.is_empty() {
+        return Ok(0);
+    }
+    let mut by_zoom: StdHashMap<u32, Vec<ParquetRow>> = StdHashMap::new();
+    for r in rows {
+        by_zoom.entry(r.zoom as u32).or_default().push(r);
+    }
+    let total_bytes: u64 = by_zoom
+        .values()
+        .flat_map(|v| v.iter())
+        .map(|r| (r.positions.len() + r.indices.len()) as u64)
+        .sum::<u64>()
+        .max(1);
+    let cores = rayon::current_num_threads().max(1) as u64;
+    let mut zoom_vecs: Vec<(u32, Vec<ParquetRow>)> = by_zoom.into_iter().collect();
+    zoom_vecs.sort_by_key(|(z, _)| *z);
+
+    let mut work: Vec<(u32, u32, &[ParquetRow])> = Vec::new();
+    for (z, zrows) in &zoom_vecs {
+        if zrows.is_empty() {
+            continue;
+        }
+        let zbytes: u64 = zrows
+            .iter()
+            .map(|r| (r.positions.len() + r.indices.len()) as u64)
+            .sum();
+        const MIN_PART_BYTES: u64 = 16 * 1024 * 1024;
+        let by_parallel = (cores * zbytes + total_bytes - 1) / total_bytes;
+        let by_size = (zbytes + max_file_bytes.max(1) - 1) / max_file_bytes.max(1);
+        let cap_minsize = (zbytes / MIN_PART_BYTES).max(1);
+        let n_parts = by_parallel
+            .max(by_size)
+            .max(1)
+            .min(cap_minsize)
+            .min(zrows.len() as u64) as usize;
+        let per = (zrows.len() + n_parts - 1) / n_parts;
+        let counter = part_counter.entry(*z).or_insert(0);
+        let mut s = 0usize;
+        while s < zrows.len() {
+            let e = (s + per).min(zrows.len());
+            work.push((*z, *counter, &zrows[s..e]));
+            *counter += 1;
+            s = e;
+        }
+    }
+
+    let results: Vec<Result<u64, String>> = work
+        .into_par_iter()
+        .map(|(z, idx, slice)| {
+            let dir = out.join(format!("zoom={}", z));
+            std::fs::create_dir_all(&dir)
+                .map_err(|e| format!("mkdir {}: {}", dir.display(), e))?;
+            let path = dir.join(format!("part_{:03}.parquet", idx));
+            let batch = build_batch_no_zoom(slice, tags)?;
+            let file = std::fs::File::create(&path)
+                .map_err(|e| format!("create {}: {}", path.display(), e))?;
+            let mut w = parquet::arrow::ArrowWriter::try_new(
+                file,
+                schema.clone(),
+                Some((**props).clone()),
+            )
+            .map_err(|e| format!("ArrowWriter: {}", e))?;
+            w.write(&batch).map_err(|e| format!("write: {}", e))?;
+            w.close().map_err(|e| format!("close: {}", e))?;
+            Ok(slice.len() as u64)
+        })
+        .collect();
+    let mut chunk_total = 0u64;
+    for r in results {
+        chunk_total += r?;
+    }
+    Ok(chunk_total)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_native_partitioned(
+    shard_paths: Vec<PathBuf>,
+    output_dir: &str,
+    world_bounds: (f64, f64, f64, f64, f64, f64),
+    max_zoom: u32,
+    base_cells: u32,
+    io_threads: usize,
+    tags: &HashMap<u32, Vec<(String, TagValue)>>,
+    max_batch_bytes: usize,
+    max_file_bytes: u64,
+    props: std::sync::Arc<parquet::file::properties::WriterProperties>,
+    overlap_read: bool,
+    channel_cap: usize,
+) -> Result<u64, String> {
+    use std::collections::HashMap as StdHashMap;
+
+    let out = std::path::Path::new(output_dir);
+    std::fs::create_dir_all(out).map_err(|e| format!("mkdir {}: {}", output_dir, e))?;
+    let schema = build_batch_no_zoom(&[], tags)?.schema();
+
+    // Precompute the byte-budget chunk path-lists (identical for both paths).
+    let mut chunks: Vec<Vec<PathBuf>> = Vec::new();
+    {
+        let n = shard_paths.len();
+        let mut cursor = 0usize;
+        while cursor < n {
+            let start = cursor;
+            let mut est = 0usize;
+            let mut end = start;
+            while end < n && (end == start || est < max_batch_bytes) {
+                est += std::fs::metadata(&shard_paths[end])
+                    .map(|m| m.len() as usize * 3)
+                    .unwrap_or(0);
+                end += 1;
+            }
+            chunks.push(shard_paths[start..end].to_vec());
+            cursor = end;
+        }
+    }
+
+    let t_scope = std::time::Instant::now();
+
+    let total: u64 = if overlap_read {
+        // PIPELINE: a producer OS thread reads chunk N+1 on its own scoped
+        // K-thread read pool (blocking idle, stealing nothing from the consumer)
+        // while the MAIN thread is the sole ORDERED consumer (transform+write,
+        // owns its part_counter -> byte-identical). The consumer runs on a
+        // DEDICATED (cores-K)-wide pool to avoid oversubscription with the read
+        // pool; build_global is NOT used (other call sites need the full pool).
+        let cores = rayon::current_num_threads().max(1);
+        let read_k = if io_threads == 0 { 12 } else { io_threads.min(16) };
+        let cpw = cores.saturating_sub(read_k).max(1);
+        let consumer_pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(cpw)
+            .build()
+            .map_err(|e| e.to_string())?;
+
+        // `move` so the scope owns chunks/schema/props; the producer then moves
+        // chunks, and the consumer borrows schema/props by reference (the only
+        // value that MUST move into the consumer is the !Sync channel Receiver).
+        std::thread::scope(move |sc| -> Result<u64, String> {
+            type Chunk = (usize, Vec<((u32, u32, u32, u32), Vec<Fragment3D>)>);
+            let (tx, rx) = std::sync::mpsc::sync_channel::<Chunk>(channel_cap.max(1));
+            let schema_ref = &schema;
+            let props_ref = &props;
+
+            let prod = sc.spawn(move || -> Result<(), String> {
+                for (idx, chunk) in chunks.into_iter().enumerate() {
+                    let tiles = read_chunk_sorted(chunk, read_k)?;
+                    if tx.send((idx, tiles)).is_err() {
+                        break; // consumer hung up (error path) — stop reading
+                    }
+                }
+                Ok(()) // drop tx on return -> consumer sees EOF
+            });
+
+            // Consumer on the dedicated pool. `move` takes rx by value (Receiver
+            // is !Sync) plus the Copy references; all captures are Send.
+            let consumed: Result<u64, String> = consumer_pool.install(move || {
+                let mut pc: StdHashMap<u32, u32> = StdHashMap::new();
+                let mut t: u64 = 0;
+                let mut expected = 0usize;
+                for (got, tiles) in rx {
+                    debug_assert_eq!(got, expected, "consumer received chunks out of order");
+                    expected += 1;
+                    t += consume_chunk(
+                        &tiles, out, schema_ref, props_ref, tags, world_bounds,
+                        max_zoom, base_cells, max_file_bytes, &mut pc,
+                    )?;
+                }
+                Ok(t)
+            });
+            let t = consumed?;
+            prod.join().map_err(|_| "producer thread panicked".to_string())??;
+            Ok(t)
+        })?
+    } else {
+        let mut part_counter: StdHashMap<u32, u32> = StdHashMap::new();
+        let mut t: u64 = 0;
+        for chunk in chunks {
+            let tiles = read_chunk_sorted(chunk, io_threads)?;
+            t += consume_chunk(
+                &tiles, out, &schema, &props, tags, world_bounds, max_zoom,
+                base_cells, max_file_bytes, &mut part_counter,
+            )?;
+        }
+        t
+    };
+
+    if std::env::var("MUDM_NATIVE_PROFILE").is_ok() {
+        use std::sync::atomic::Ordering::Relaxed;
+        eprintln!(
+            "[native] overlap={} scope={:.1}s rows={}",
+            overlap_read,
+            t_scope.elapsed().as_secs_f64(),
+            total
+        );
+        let geom = PROF_GEOM_NS.load(Relaxed) as f64 / 1e9;
+        let qem = PROF_QEM_NS.load(Relaxed) as f64 / 1e9;
+        let ser = PROF_SERIALIZE_NS.load(Relaxed) as f64 / 1e9;
+        eprintln!(
+            "[prof CPU-time sums] geom={:.1}s  qem={:.1}s  dedup+proj={:.1}s  serialize={:.1}s",
+            geom, qem, geom - qem, ser
+        );
+    }
+    Ok(total)
+}
+
 // ---------------------------------------------------------------------------
 // PyO3 helpers: extract features and tags from Python dicts
 // ---------------------------------------------------------------------------
 
+// Shared by both 2D (streaming2d.rs) and 3D ingestion. The reserved-key
+// promotion block below therefore covers both pipelines; no duplicate
+// exists in streaming2d.rs (which imports this function via
+// `use crate::streaming::extract_tags`).
 pub(crate) fn extract_tags(feat: &Bound<'_, PyDict>) -> PyResult<Vec<(String, TagValue)>> {
     let tags_obj = feat.get_item("tags")?;
     let mut result = Vec::new();
@@ -2414,6 +3255,31 @@ pub(crate) fn extract_tags(feat: &Bound<'_, PyDict>) -> PyResult<Vec<(String, Ta
                     result.push((key, TagValue::Int(i)));
                 }
             }
+        }
+    }
+
+    // Promote muDM-native top-level fields into the tags map under
+    // reserved keys so they round-trip through tiling to Parquet/GLB/etc.
+    // This repairs the pre-existing gap where MuDMFeature.parentId was
+    // documented in the Pydantic model but silently dropped by Rust.
+    for (src_key, dst_key) in [
+        ("parentId",     "_parent_id"),
+        ("ref",          "_ref"),
+        ("id",           "_id"),
+        ("featureClass", "_feature_class"),
+    ] {
+        if let Some(v) = feat.get_item(src_key)? {
+            if v.is_none() {
+                continue;
+            }
+            if v.is_instance_of::<PyString>() {
+                let s: String = v.extract()?;
+                result.push((dst_key.into(), TagValue::Str(s)));
+            } else if v.is_instance_of::<PyInt>() {
+                let i: i64 = v.extract()?;
+                result.push((dst_key.into(), TagValue::Int(i)));
+            }
+            // Non-string/non-int values silently skipped (e.g. lists).
         }
     }
 
@@ -2476,6 +3342,79 @@ pub struct StreamingTileGenerator {
     tiles_written: u32,
     fragment_reader: Option<Fragment3DReader>,
     parquet_stream_active: bool,
+    /// Sorted snapshot of shard paths for the parallel read path.
+    /// Populated by `_init_parquet_stream`; empty until then.
+    shard_paths_snapshot: Vec<PathBuf>,
+    /// Cursor into `shard_paths_snapshot` for the chunked parallel reader.
+    parallel_shard_cursor: usize,
+    /// I/O concurrency for the parallel read path. 0 == use the global rayon
+    /// pool; 1 == serial; N>1 == a scoped pool of N threads. Auto-detected at
+    /// construction via `detect_io_threads()`; the Python layer may override
+    /// it with `_set_io_threads`.
+    io_threads: usize,
+    /// Hard ceiling on resident decoded-fragment bytes per output path.
+    /// Resolved at construction via `detect_max_memory_bytes(0)` (env
+    /// `MUDM_MAX_MEMORY_GB` / 0.8×RAM / 8 GiB fallback). The Python layer may
+    /// override it with `_set_max_memory`.
+    max_memory_bytes: usize,
+    /// Optional run directory for the WS-D error-log facility. When `Some`,
+    /// each phase constructs an `ErrorCollector` that streams `errors.jsonl`
+    /// + `run_summary.json` here. `None` (the default) → in-memory only, no
+    /// files written, so existing callers see no behavior change. Set via the
+    /// PyO3 `_set_run_dir` setter (mirrors `_set_io_threads`/`_set_max_memory`).
+    run_dir: Option<PathBuf>,
+}
+
+/// Total physical RAM in bytes, cross-platform. Replaces the old
+/// `/proc/meminfo`-only path (which was macOS-broken and KB-unit-coupled).
+fn total_physical_ram_bytes() -> Option<usize> {
+    #[cfg(target_os = "linux")]
+    {
+        let s = std::fs::read_to_string("/proc/meminfo").ok()?;
+        // "MemTotal:  N kB"  → KB → bytes
+        for line in s.lines() {
+            if let Some(rest) = line.strip_prefix("MemTotal:") {
+                let kb: usize = rest.split_whitespace().next()?.parse().ok()?;
+                return Some(kb * 1024); // KB source
+            }
+        }
+        None
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // sysctl hw.memsize → BYTES (do NOT *1024)
+        let out = std::process::Command::new("sysctl").args(["-n", "hw.memsize"]).output().ok()?;
+        String::from_utf8(out.stdout).ok()?.trim().parse::<usize>().ok() // bytes source
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    { None }
+}
+
+/// Ceiling on resident decoded-fragment bytes per output path.
+/// (1) explicit>0; (2) env MUDM_MAX_MEMORY_GB; (3) 0.8 * RAM; (4) 8 GiB.
+fn detect_max_memory_bytes(explicit: usize) -> usize {
+    const GIB: usize = 1024 * 1024 * 1024;
+    if explicit > 0 { return explicit; }
+    if let Ok(v) = std::env::var("MUDM_MAX_MEMORY_GB") {
+        if let Ok(g) = v.parse::<f64>() { if g > 0.0 { return (g * GIB as f64) as usize; } }
+    }
+    total_physical_ram_bytes().map(|r| (r as f64 * 0.8) as usize).unwrap_or(8 * GIB)
+}
+
+/// Detect the default I/O concurrency for the parallel read path.
+///
+/// Honors the `MUDM_IO_THREADS` env override (an explicit `1` selects the
+/// serial fallback); otherwise uses `available_parallelism()`, falling back to
+/// 8 when the platform can't report it.
+fn detect_io_threads() -> usize {
+    if let Ok(v) = std::env::var("MUDM_IO_THREADS") {
+        if let Ok(n) = v.parse::<usize>() {
+            return n; // 1 == serial fallback
+        }
+    }
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(8)
 }
 
 #[pymethods]
@@ -2534,6 +3473,11 @@ impl StreamingTileGenerator {
             tiles_written: 0,
             fragment_reader: None,
             parquet_stream_active: false,
+            shard_paths_snapshot: Vec::new(),
+            parallel_shard_cursor: 0,
+            io_threads: detect_io_threads(),
+            max_memory_bytes: detect_max_memory_bytes(0),
+            run_dir: None,
         })
     }
 
@@ -2683,6 +3627,65 @@ impl StreamingTileGenerator {
         Ok(total)
     }
 
+    /// Drive the ENTIRE partitioned Parquet consolidation natively in Rust:
+    /// chunked parallel read + transform + parallel per-zoom ZSTD write, all
+    /// under ONE `py.allow_threads` (GIL-free, no Python dict bridge, no
+    /// `_dict_to_record_batch`, no Python-side rotation). Bounded memory via the
+    /// byte-budget shard cursor + persistent per-zoom rotating writers. Output is
+    /// `{output_dir}/zoom=N/part_NNN.parquet`, byte-identical (modulo within-tile
+    /// row order) to the pyarrow partitioned path. `overlap_read` runs the
+    /// producer/consumer read∥transform pipeline (default ON; measured ~23%
+    /// faster cold on oden, byte-identical) — pass `False` or set
+    /// `MUDM_NO_OVERLAP=1` to fall back to the strictly-sequential path.
+    #[pyo3(signature = (output_dir, world_bounds, compression="zstd", compression_level=3, max_batch_bytes=2_000_000_000, max_file_bytes=500_000_000, overlap_read=true))]
+    fn generate_parquet_native_partitioned(
+        &mut self,
+        py: Python<'_>,
+        output_dir: &str,
+        world_bounds: (f64, f64, f64, f64, f64, f64),
+        compression: &str,
+        compression_level: i32,
+        max_batch_bytes: usize,
+        max_file_bytes: u64,
+        overlap_read: bool,
+    ) -> PyResult<u64> {
+        // Read∥transform pipeline. Default ON (byte-identical to the sequential
+        // path, ~23% faster cold). MUDM_OVERLAP=1 force-enables even if a caller
+        // passes overlap_read=False; MUDM_NO_OVERLAP=1 is the kill switch (wins).
+        // MUDM_OVERLAP_CAP sets the in-flight chunk depth (default 1 = strict
+        // double-buffer, the measured optimum).
+        let overlap = (overlap_read || std::env::var("MUDM_OVERLAP").is_ok())
+            && std::env::var("MUDM_NO_OVERLAP").is_err();
+        let channel_cap = std::env::var("MUDM_OVERLAP_CAP")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(1)
+            .max(1);
+        self._init_parquet_stream()?;
+        let shard_paths = std::mem::take(&mut self.shard_paths_snapshot);
+        let max_zoom = self.max_zoom;
+        let base_cells = self.base_cells;
+        let io_threads = self.io_threads;
+        let tags = self.tags_registry.clone();
+        let props = std::sync::Arc::new(
+            native_writer_props(compression, compression_level)
+                .map_err(|e| pyo3::exceptions::PyValueError::new_err(e))?,
+        );
+        let out = output_dir.to_string();
+        let wb = world_bounds;
+
+        let result = py.allow_threads(|| {
+            run_native_partitioned(
+                shard_paths, &out, wb, max_zoom, base_cells, io_threads, &tags,
+                max_batch_bytes, max_file_bytes, props, overlap, channel_cap,
+            )
+        });
+        // Always close the stream, even on error (avoid leaking the active lock).
+        let _ = self._close_parquet_stream();
+        let total = result.map_err(|e| pyo3::exceptions::PyIOError::new_err(e))?;
+        Ok(total)
+    }
+
     /// Number of tiles written by the last generate_pbf3() call.
     fn tile_count(&self) -> u32 {
         self.tiles_written
@@ -2744,35 +3747,70 @@ impl StreamingTileGenerator {
         let tags_ref = &self.tags_registry;
         let comp = effective_compression.to_string();
 
-        // Memory budget: if 0, auto-detect from system RAM (80% of total)
+        // Memory budget: an explicit `max_memory_gb` wins; otherwise fall back
+        // to the generator's already-resolved ceiling (`self.max_memory_bytes`,
+        // from `detect_max_memory_bytes(0)` at construction or `_set_max_memory`).
+        // This replaces the old `/proc/meminfo`-only branch, which was
+        // macOS-broken and KB-unit-coupled (WS-0).
         let max_memory_bytes = if max_memory_gb > 0 {
-            max_memory_gb * 1024 * 1024 * 1024
+            detect_max_memory_bytes(max_memory_gb * 1024 * 1024 * 1024)
         } else {
-            // Read /proc/meminfo for total RAM, use 80%
-            let total_ram = std::fs::read_to_string("/proc/meminfo")
-                .ok()
-                .and_then(|s| {
-                    s.lines()
-                        .find(|l| l.starts_with("MemTotal:"))
-                        .and_then(|l| l.split_whitespace().nth(1))
-                        .and_then(|v| v.parse::<usize>().ok())
-                })
-                .unwrap_or(8 * 1024 * 1024); // fallback: 8 GB in KB
-            (total_ram * 1024) * 4 / 5 // 80% of total, convert KB to bytes
+            self.max_memory_bytes
         };
 
-        // Per-zoom batched in-memory pipeline
+        // WS-D error-log facility (D.3): streams `errors.jsonl`/`run_summary.json`
+        // to `run_dir` when set; in-memory only otherwise (no behavior change /
+        // no new file for existing callers). Constructed before the GIL is
+        // released so a dir-open failure is a normal early PyErr. GLB tile-write
+        // failures are NON-FATAL: recorded inside the rayon pool, the tile is
+        // pruned, and the rest continue — no PyErr is raised from the pool.
+        let collector = ErrorCollector::new(self.run_dir.clone())
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
+        let collector_ref = &collector;
+        let phase_start = std::time::Instant::now();
+
+        // Per-zoom batched in-memory pipeline. The read result is captured
+        // WITHOUT `?` so the collect-then-raise discipline holds: a Fatal
+        // `ceiling_floor` violation (WS-C Step 2b) is recorded in the collector
+        // inside `read_group_simplify_encode` (outside any rayon pool, under
+        // `allow_threads`); here in the GIL-held frame we write the honest
+        // summary, then raise the typed `PyErr`.
         let frag_dir = self.frag_dir.clone();
-        let (total_count, all_tile_keys) = py.allow_threads(|| {
+        // WS-C C.3 (Option A): hand the per-zoom read the configured I/O-thread
+        // count so it can cap its scoped read pool (≤16). Captured before
+        // `allow_threads` releases the GIL (no `self` borrow inside the closure).
+        let io_threads = self.io_threads;
+        let read_result = py.allow_threads(|| {
             read_group_simplify_encode(
                 &frag_dir, tags_ref, &out_dir,
                 xmin, ymin, zmin, dx, dy, dz,
                 max_zoom, base_cells, &comp,
                 max_memory_bytes,
+                io_threads,
+                collector_ref,
             )
-        }).map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
+        });
 
-        // Write tileset.json
+        // On a Fatal floor violation, write the summary then raise from here.
+        if collector.had_fatal() {
+            let _ = collector
+                .finish_summary("3dtiles", phase_start.elapsed().as_secs_f64());
+            let detail = read_result
+                .err()
+                .map(|e| e.to_string())
+                .unwrap_or_else(|| "ceiling_floor violation".to_string());
+            return Err(pyo3::exceptions::PyMemoryError::new_err(format!(
+                "generate_3dtiles: memory-ceiling floor violation \
+                 (a single tile exceeds the configured ceiling): {} (see errors.jsonl)",
+                detail,
+            )));
+        }
+
+        let (total_count, all_tile_keys) =
+            read_result.map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
+
+        // Write tileset.json (built from the PRUNED tile_keys → no dangling
+        // content URI referencing a missing .glb, GLB-4).
         let tileset = tileset_json::generate_tileset_json(
             &all_tile_keys, &wb, self.min_zoom, self.max_zoom,
         );
@@ -2780,6 +3818,11 @@ impl StreamingTileGenerator {
         let tileset_str = serde_json::to_string_pretty(&tileset)
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
         std::fs::write(&tileset_path, tileset_str)
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
+
+        // Honest summary (no-op when run_dir is None).
+        collector
+            .finish_summary("3dtiles", phase_start.elapsed().as_secs_f64())
             .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
 
         self.tiles_written = total_count;
@@ -2883,6 +3926,93 @@ impl StreamingTileGenerator {
     // Streaming Parquet batch API — O(batch_size) memory
     // ------------------------------------------------------------------
 
+    /// Override the I/O concurrency used by the parallel read path.
+    ///
+    /// `n == 0` means "use the global rayon pool"; `n == 1` means serial;
+    /// `n > 1` sizes a scoped pool to `n` threads. Stored as-is so the caller
+    /// (the Python layer in Task 5) keeps full control; `0` is the documented
+    /// "global pool" sentinel rather than a "use detect default" request.
+    fn _set_io_threads(&mut self, n: usize) {
+        self.io_threads = n;
+    }
+
+    /// Override the resolved per-output-path memory ceiling (in bytes).
+    ///
+    /// Stored as-is; `generate_3dtiles`/`generate_neuroglancer_multilod` and
+    /// the Python Parquet writer derive their per-path budgets from it when an
+    /// explicit per-call budget is not supplied. Mirrors `_set_io_threads`.
+    fn _set_max_memory(&mut self, max_memory_bytes: usize) {
+        self.max_memory_bytes = max_memory_bytes;
+    }
+
+    /// Set the run directory for the WS-D error-log facility.
+    ///
+    /// When set, each phase streams `errors.jsonl` + `run_summary.json` here.
+    /// Stored as `Some(PathBuf)`; left `None` by default so existing callers
+    /// see no new files and no behavior change. Mirrors `_set_io_threads` /
+    /// `_set_max_memory`.
+    fn _set_run_dir(&mut self, dir: &str) {
+        self.run_dir = Some(PathBuf::from(dir));
+    }
+
+    /// Read the resolved per-output-path memory ceiling (in bytes).
+    ///
+    /// Lets the Python layer derive the Parquet `max_batch_bytes` default from
+    /// the same ceiling without re-running the resolver.
+    fn _get_max_memory(&self) -> usize {
+        self.max_memory_bytes
+    }
+
+    /// WS-B test probe: the fragment temp dir, so tests can inject a corrupt
+    /// shard before `generate_neuroglancer_multilod` reads it (to exercise the
+    /// non-fatal parse-error → ErrorCollector folding).
+    fn _frag_dir(&self) -> String {
+        self.frag_dir.to_string_lossy().into_owned()
+    }
+
+    /// WS-B test probe: the bucket count `k` used by the last
+    /// `generate_neuroglancer_multilod` call. `k > 1` proves the bounded
+    /// feature-bucketed read actually split the corpus (e.g. under a tiny
+    /// `_set_max_memory`); `k == 1` is the whole-corpus-equivalent path.
+    fn _get_ng_bucket_count(&self) -> usize {
+        NG_LAST_BUCKET_COUNT.load(Ordering::Relaxed)
+    }
+
+    /// WS-C C.2 test probe: read the maximum *actual* resident decoded-fragment
+    /// bytes observed in any single GLB batch during the last
+    /// `read_group_simplify_encode` (after re-split). Process-global; pair with
+    /// `_reset_peak_resident_bytes` immediately before the `generate_3dtiles`
+    /// call under test. Used by the back-pressure / peak-RSS tests to assert the
+    /// batch stayed within the derived budget without a full RSS measurement.
+    fn _get_peak_resident_bytes(&self) -> usize {
+        PEAK_RESIDENT_BYTES.load(Ordering::Relaxed)
+    }
+
+    /// WS-C C.2 test probe: reset the peak-resident counter to 0. Call right
+    /// before the `generate_3dtiles` invocation whose peak is being measured.
+    fn _reset_peak_resident_bytes(&self) {
+        PEAK_RESIDENT_BYTES.store(0, Ordering::Relaxed);
+    }
+
+    /// WS-B test probe: read the maximum *actual* resident decoded-fragment
+    /// bytes held in any single bucket's RETAINED feature map during the last
+    /// `generate_neuroglancer_multilod` (Σ `Fragment3D::estimate_bytes` over the
+    /// kept features, `fetch_max` across buckets). With the bounded
+    /// filter-during-decode fix this scales ≈ corpus / k, so a tiny ceiling
+    /// (large k) yields a substantially smaller peak than a huge ceiling
+    /// (k == 1). Pair with `_reset_ng_peak_resident_bytes` immediately before
+    /// the `generate_neuroglancer_multilod` call under test.
+    fn _get_ng_peak_resident_bytes(&self) -> usize {
+        NG_PEAK_RESIDENT_BYTES.load(Ordering::Relaxed)
+    }
+
+    /// WS-B test probe: reset the NG peak-resident counter to 0. Call right
+    /// before the `generate_neuroglancer_multilod` invocation whose peak is
+    /// being measured.
+    fn _reset_ng_peak_resident_bytes(&self) {
+        NG_PEAK_RESIDENT_BYTES.store(0, Ordering::Relaxed);
+    }
+
     /// Initialize the streaming Parquet iterator.
     ///
     /// Flushes the fragment writer and opens a Fragment3DReader for sequential
@@ -2900,11 +4030,24 @@ impl StreamingTileGenerator {
                 .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
         }
 
-        // Open reader
+        // Open reader (serial fallback — unchanged)
         let reader = Fragment3DReader::open_dir(&self.frag_dir)
             .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
         self.fragment_reader = Some(reader);
         self.parquet_stream_active = true;
+
+        // Snapshot the sorted shard paths for the parallel read path. Mirrors
+        // the discovery + lexical sort in `Fragment3DReader::open_dir` so both
+        // paths visit shards in the same order.
+        let mut snapshot: Vec<PathBuf> = std::fs::read_dir(&self.frag_dir)
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().map_or(false, |ext| ext == "mjf"))
+            .collect();
+        snapshot.sort(); // deterministic order — same lexical sort as open_dir
+        self.shard_paths_snapshot = snapshot;
+        self.parallel_shard_cursor = 0;
 
         Ok(())
     }
@@ -2967,57 +4110,165 @@ impl StreamingTileGenerator {
         });
 
         // Build Python dict (same format as _collect_parquet_data)
-        let tags_ref = &self.tags_registry;
-        let n = rows.len();
+        Ok(Some(build_batch_dict(py, &rows, &self.tags_registry)?))
+    }
 
-        let zoom_list = pyo3::types::PyList::empty(py);
-        let tx_list = pyo3::types::PyList::empty(py);
-        let ty_list = pyo3::types::PyList::empty(py);
-        let td_list = pyo3::types::PyList::empty(py);
-        let fid_list = pyo3::types::PyList::empty(py);
-        let gt_list = pyo3::types::PyList::empty(py);
-        let pos_list = pyo3::types::PyList::empty(py);
-        let idx_list = pyo3::types::PyList::empty(py);
-        let tags_list = pyo3::types::PyList::empty(py);
-
-        for row in &rows {
-            zoom_list.append(row.zoom)?;
-            tx_list.append(row.tile_x)?;
-            ty_list.append(row.tile_y)?;
-            td_list.append(row.tile_d)?;
-            fid_list.append(row.feature_id)?;
-            gt_list.append(row.geom_type)?;
-            pos_list.append(pyo3::types::PyBytes::new(py, &row.positions))?;
-            idx_list.append(pyo3::types::PyBytes::new(py, &row.indices))?;
-
-            let tag_pairs = pyo3::types::PyList::empty(py);
-            if let Some(tags) = tags_ref.get(&row.feature_id) {
-                for (k, v) in tags {
-                    let vs = match v {
-                        TagValue::Str(s) => s.clone(),
-                        TagValue::Int(i) => i.to_string(),
-                        TagValue::Float(f) => f.to_string(),
-                        TagValue::Bool(b) => b.to_string(),
-                    };
-                    tag_pairs.append((k.as_str(), vs.as_str()))?;
-                }
-            }
-            tags_list.append(tag_pairs)?;
+    /// Parallel sibling of `_next_parquet_batch` (same signature + behaviour
+    /// contract; output equals serial modulo row order).
+    ///
+    /// Instead of reading one shard at a time through a single decoder, this
+    /// chunks the snapshotted shard paths (`shard_paths_snapshot`, taken in
+    /// `_init_parquet_stream`) by estimated uncompressed bytes and reads each
+    /// chunk via `Fragment3DReader::read_all_grouped_parallel` (par_iter +
+    /// DashMap merge). The `collect_parquet_rows` transform is byte-identical to
+    /// the serial path; each tile's `Vec` is sorted by `feature_id` first to
+    /// remove the only theoretical (tile, feature_id) ordering ambiguity.
+    ///
+    /// `io_threads` is read from `self.io_threads` (NOT an argument). EOF returns
+    /// `Ok(None)`. Empty chunks are skipped iteratively (no recursion).
+    ///
+    /// Memory: O(chunk) — peak ≈ `max_batch_bytes` uncompressed plus the row
+    /// staging for one chunk, independent of the total dataset size.
+    #[pyo3(signature = (batch_size, world_bounds, max_batch_bytes=2_000_000_000))]
+    fn _next_parquet_batch_parallel(
+        &mut self,
+        py: Python<'_>,
+        batch_size: usize,
+        world_bounds: (f64, f64, f64, f64, f64, f64),
+        max_batch_bytes: usize,
+    ) -> PyResult<Option<PyObject>> {
+        let _ = batch_size; // chunking is byte-budget driven; arg kept for signature parity
+        if !self.parquet_stream_active {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "Parquet stream not active — call _init_parquet_stream() first",
+            ));
         }
 
-        let dict = pyo3::types::PyDict::new(py);
-        dict.set_item("zoom", zoom_list)?;
-        dict.set_item("tile_x", tx_list)?;
-        dict.set_item("tile_y", ty_list)?;
-        dict.set_item("tile_d", td_list)?;
-        dict.set_item("feature_id", fid_list)?;
-        dict.set_item("geom_type", gt_list)?;
-        dict.set_item("positions", pos_list)?;
-        dict.set_item("indices", idx_list)?;
-        dict.set_item("tags", tags_list)?;
-        dict.set_item("row_count", n)?;
+        let wb = world_bounds;
+        let max_zoom = self.max_zoom;
+        let base_cells = self.base_cells;
+        let io_threads = self.io_threads;
 
-        Ok(Some(dict.into()))
+        // Iterative loop to skip chunks that produce zero rows (no recursion).
+        loop {
+            let start = self.parallel_shard_cursor;
+            let total = self.shard_paths_snapshot.len();
+            if start >= total {
+                return Ok(None); // EOF
+            }
+
+            // Accumulate shard paths until the estimated uncompressed bytes
+            // (disk size × 3 — the same ZSTD ratio used elsewhere) reach the
+            // budget. Always take at least one shard so we make progress.
+            let mut end = start;
+            let mut est = 0usize;
+            while end < total && (end == start || est < max_batch_bytes) {
+                est += std::fs::metadata(&self.shard_paths_snapshot[end])
+                    .map(|m| m.len() as usize * 3)
+                    .unwrap_or(0);
+                end += 1;
+            }
+            let chunk: Vec<PathBuf> = self.shard_paths_snapshot[start..end].to_vec();
+            self.parallel_shard_cursor = end;
+
+            // GIL-released: parallel shard read + the (unchanged) transform.
+            // Shard-read errors are propagated (matching the serial path's `?`),
+            // NOT swallowed — a failed/corrupt shard must surface, never be
+            // silently skipped with the cursor advancing past it (data loss).
+            let rows = py
+                .allow_threads(|| -> std::io::Result<Vec<ParquetRow>> {
+                    let reader = Fragment3DReader::from_paths(chunk);
+                    let groups = reader.read_all_grouped_parallel(io_threads, true)?;
+                    // Determinism belt-and-suspenders: sort each tile's Vec by
+                    // feature_id before the transform (cheap, deterministic).
+                    let mut tiles: Vec<((u32, u32, u32, u32), Vec<Fragment3D>)> =
+                        groups.into_iter().collect();
+                    for (_k, v) in tiles.iter_mut() {
+                        v.sort_by(crate::fragment::frag_cmp);
+                    }
+                    Ok(collect_parquet_rows(&tiles, &wb, max_zoom, base_cells))
+                })
+                .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
+
+            // Skip empty chunks while shards remain; otherwise emit the batch.
+            if rows.is_empty() {
+                continue;
+            }
+
+            // Build the SAME 9-column dict as the serial path (GIL held).
+            return Ok(Some(build_batch_dict(py, &rows, &self.tags_registry)?));
+        }
+    }
+
+    /// Like `_next_parquet_batch_parallel`, but builds the Arrow `RecordBatch`
+    /// in Rust (GIL-released) and returns it via the Arrow C-Data interface —
+    /// eliminating the GIL-held per-row `build_batch_dict` (PyList/PyBytes) and
+    /// the Python-side `_dict_to_record_batch` (`pa.array(list(...))`) copies.
+    /// Output is byte-identical modulo within-tile row order to the dict path.
+    #[pyo3(signature = (batch_size, world_bounds, max_batch_bytes=2_000_000_000))]
+    fn _next_parquet_batch_arrow(
+        &mut self,
+        py: Python<'_>,
+        batch_size: usize,
+        world_bounds: (f64, f64, f64, f64, f64, f64),
+        max_batch_bytes: usize,
+    ) -> PyResult<Option<arrow::pyarrow::PyArrowType<arrow::record_batch::RecordBatch>>> {
+        let _ = batch_size; // chunking is byte-budget driven; arg kept for signature parity
+        if !self.parquet_stream_active {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "Parquet stream not active — call _init_parquet_stream() first",
+            ));
+        }
+
+        let wb = world_bounds;
+        let max_zoom = self.max_zoom;
+        let base_cells = self.base_cells;
+        let io_threads = self.io_threads;
+
+        loop {
+            let start = self.parallel_shard_cursor;
+            let total = self.shard_paths_snapshot.len();
+            if start >= total {
+                return Ok(None); // EOF
+            }
+
+            let mut end = start;
+            let mut est = 0usize;
+            while end < total && (end == start || est < max_batch_bytes) {
+                est += std::fs::metadata(&self.shard_paths_snapshot[end])
+                    .map(|m| m.len() as usize * 3)
+                    .unwrap_or(0);
+                end += 1;
+            }
+            let chunk: Vec<PathBuf> = self.shard_paths_snapshot[start..end].to_vec();
+            self.parallel_shard_cursor = end;
+
+            let tags = &self.tags_registry;
+            // Everything (read + transform + RecordBatch build) is GIL-released.
+            let batch = py
+                .allow_threads(|| -> Result<Option<arrow::record_batch::RecordBatch>, String> {
+                    let reader = Fragment3DReader::from_paths(chunk);
+                    let groups = reader
+                        .read_all_grouped_parallel(io_threads, true)
+                        .map_err(|e| e.to_string())?;
+                    let mut tiles: Vec<((u32, u32, u32, u32), Vec<Fragment3D>)> =
+                        groups.into_iter().collect();
+                    for (_k, v) in tiles.iter_mut() {
+                        v.sort_by(crate::fragment::frag_cmp);
+                    }
+                    let rows = collect_parquet_rows(&tiles, &wb, max_zoom, base_cells);
+                    if rows.is_empty() {
+                        return Ok(None);
+                    }
+                    Ok(Some(build_batch_recordbatch(&rows, tags)?))
+                })
+                .map_err(|e| pyo3::exceptions::PyIOError::new_err(e))?;
+
+            match batch {
+                None => continue, // empty chunk — skip while shards remain
+                Some(b) => return Ok(Some(arrow::pyarrow::PyArrowType(b))),
+            }
+        }
     }
 
     /// Close the streaming Parquet iterator and release resources.
@@ -3197,6 +4448,20 @@ impl StreamingTileGenerator {
             size_b.cmp(&size_a)
         });
 
+        // WS-D error-log facility: streams `errors.jsonl` + `run_summary.json`
+        // to `run_dir` when set; in-memory only otherwise (no behavior change
+        // for existing callers). Constructed before the GIL is released so the
+        // dir-open failure is a normal early PyErr (collect-then-raise pattern
+        // is only for failures discovered inside the rayon pool).
+        let collector = ErrorCollector::new(self.run_dir.clone())
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
+        let collector_ref = &collector;
+        // Successful fids (honest count) — only files that parsed and wrote
+        // every fragment cleanly. Bounded O(n_files); rayon-safe.
+        let ok_fids: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+        let ok_fids_ref = &ok_fids;
+        let ingest_start = std::time::Instant::now();
+
         // Release GIL — parallel parse + project + clip + write
         // with_min_len(1) forces rayon to steal one file at a time.
         // No locks: each thread writes to its own file.
@@ -3209,8 +4474,19 @@ impl StreamingTileGenerator {
                 // Parse OBJ in Rust
                 let (vertices, faces) = match obj_parser::parse_obj(path) {
                     Ok(vf) => vf,
-                    Err(_) => return, // skip broken files
+                    Err(e) => {
+                        // Non-fatal: skip this broken file, record + continue.
+                        collector_ref.record_failure(
+                            "ingest", Severity::NonFatal, path, "parse", &e.to_string(),
+                        );
+                        return;
+                    }
                 };
+
+                // Tracks any fatal write failure for THIS file (incl. nested
+                // chunk writes). On any failure the file is not counted as ok
+                // and its fragments may be incomplete — recorded as Fatal.
+                let file_failed = std::sync::atomic::AtomicBool::new(false);
 
                 // Build indexed mesh in [0,1]³ normalized coords
                 let (positions, indices, bb) = build_indexed_mesh(
@@ -3223,14 +4499,14 @@ impl StreamingTileGenerator {
                 const PARALLEL_CLIP_THRESHOLD: usize = 500_000;
                 const CLIP_CHUNK_SIZE: usize = 50_000;
 
-                // Write helper closure for fragment output
+                // Write helper closure for fragment output. Returns the
+                // checked io::Result so the caller can record a Fatal write
+                // failure (writer-create / per-write / flush all checked —
+                // NOT Drop, which take()s the writer making Drop a no-op).
                 let write_clip_results = |clip_results: Vec<((u32,u32,u32,u32), ClipFeature)>,
                                           frag_path: PathBuf,
-                                          fid: u32| {
-                    let mut writer = match Fragment3DWriter::new(&frag_path) {
-                        Ok(w) => w,
-                        Err(_) => return,
-                    };
+                                          fid: u32| -> io::Result<()> {
+                    let mut writer = Fragment3DWriter::new(&frag_path)?;
                     for ((tz, tx_coord, ty, td), cf) in clip_results {
                         let frag = Fragment3D {
                             feature_id: fid,
@@ -3240,9 +4516,10 @@ impl StreamingTileGenerator {
                             z: cf.z.iter().map(|&v| v as f32).collect(),
                             ring_lengths: cf.ring_lengths,
                         };
-                        writer.write(&frag).ok();
+                        writer.write(&frag)?;
                     }
-                    writer.flush().ok();
+                    writer.flush()?;
+                    Ok(())
                 };
 
                 if n_tris >= PARALLEL_CLIP_THRESHOLD {
@@ -3267,7 +4544,12 @@ impl StreamingTileGenerator {
                         let frag_path = frag_dir.join(
                             format!("frag_{:05}_z{}.mjf", i, zoom)
                         );
-                        write_clip_results(clip_results, frag_path, fid);
+                        if let Err(e) = write_clip_results(clip_results, frag_path, fid) {
+                            collector_ref.record_failure(
+                                "ingest", Severity::Fatal, path, "write", &e.to_string(),
+                            );
+                            file_failed.store(true, std::sync::atomic::Ordering::Relaxed);
+                        }
                         cur_pos = sp;
                         cur_idx = si;
                     }
@@ -3308,7 +4590,12 @@ impl StreamingTileGenerator {
                         let frag_path = frag_dir.join(
                             format!("frag_{:05}_c{:04}.mjf", i, chunk_idx)
                         );
-                        write_clip_results(clip_results, frag_path, fid);
+                        if let Err(e) = write_clip_results(clip_results, frag_path, fid) {
+                            collector_ref.record_failure(
+                                "ingest", Severity::Fatal, path, "write", &e.to_string(),
+                            );
+                            file_failed.store(true, std::sync::atomic::Ordering::Relaxed);
+                        }
                     });
                 } else {
                     // Small file: pre-simplify per zoom, clip each LOD
@@ -3318,7 +4605,22 @@ impl StreamingTileGenerator {
                     );
 
                     let frag_path = frag_dir.join(format!("frag_{:05}.mjf", i));
-                    write_clip_results(clip_results, frag_path, fid);
+                    if let Err(e) = write_clip_results(clip_results, frag_path, fid) {
+                        collector_ref.record_failure(
+                            "ingest", Severity::Fatal, path, "write", &e.to_string(),
+                        );
+                        file_failed.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+
+                // Honest count: this file is OK only if it parsed and every
+                // fragment wrote cleanly. Failed files are recorded above and
+                // excluded from the returned fids.
+                if !file_failed.load(std::sync::atomic::Ordering::Relaxed) {
+                    collector_ref.inc_ok();
+                    if let Ok(mut v) = ok_fids_ref.lock() {
+                        v.push(fid);
+                    }
                 }
             });
             };
@@ -3334,7 +4636,25 @@ impl StreamingTileGenerator {
             }
         });
 
-        Ok(fids)
+        // GIL re-held — safe to raise a typed PyErr now (NEVER inside the
+        // rayon pool / allow_threads). Collect-then-raise: a Fatal write
+        // failure was recorded with plain data inside the pool; surface it
+        // here (mirrors the Parquet collect-then-? pattern).
+        let _ = fids; // pre-assigned ids superseded by the honest set below
+        let elapsed_s = ingest_start.elapsed().as_secs_f64();
+        collector.finish_summary("ingest", elapsed_s)
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
+        if collector.had_fatal() {
+            return Err(pyo3::exceptions::PyIOError::new_err(
+                "add_obj_files: fatal write error during ingest (see errors.jsonl)",
+            ));
+        }
+
+        // Return only the successfully-ingested fids, in ascending order so
+        // the result is deterministic regardless of rayon scheduling.
+        let mut ok = ok_fids.into_inner().unwrap_or_default();
+        ok.sort_unstable();
+        Ok(ok)
     }
 
     /// Add meshes from a Parquet file with pre-processed binary geometry.
@@ -4013,25 +5333,72 @@ impl StreamingTileGenerator {
     ///   {output_dir}/segment_properties/info (metadata from tags)
     ///
     /// Returns the number of segments written.
-    #[pyo3(signature = (output_dir, world_bounds, vertex_quantization_bits=10))]
+    #[pyo3(signature = (output_dir, world_bounds, vertex_quantization_bits=10, max_memory_bytes=0, sharded=false, minishard_bits=6, shard_bits=0))]
     fn generate_neuroglancer_multilod(
         &mut self,
         py: Python<'_>,
         output_dir: &str,
         world_bounds: (f64, f64, f64, f64, f64, f64),
         vertex_quantization_bits: u8,
+        max_memory_bytes: usize,
+        sharded: bool,
+        minishard_bits: u8,
+        shard_bits: u8,
     ) -> PyResult<u32> {
+        // WS-B: resolve the per-path memory ceiling (explicit arg wins, else the
+        // generator's resolved ceiling). Now USED to derive the feature-bucket
+        // count `k` so the read stays bounded to one bucket's decoded bytes.
+        let max_memory_bytes = if max_memory_bytes > 0 {
+            detect_max_memory_bytes(max_memory_bytes)
+        } else {
+            self.max_memory_bytes
+        };
+
         // Flush and close the fragment writer
         if let Some(mut writer) = self.fragment_writer.take() {
             writer.flush()
                 .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
         }
 
-        // Read all fragments grouped by feature_id
-        let mut reader = Fragment3DReader::open_dir(&self.frag_dir)
-            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
-        let feature_groups = reader.read_all_grouped_by_feature()
-            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
+        // WS-B: discover the sorted *.mjf shard paths (mirroring `open_dir`'s
+        // discovery, but kept as an explicit list we hand to `from_paths` per
+        // bucket). We do NOT open a whole-corpus reader.
+        let shard_paths: Vec<PathBuf> = {
+            let mut paths: Vec<PathBuf> = std::fs::read_dir(&self.frag_dir)
+                .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?
+                .filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .filter(|p| p.extension().map_or(false, |ext| ext == "mjf"))
+                .collect();
+            paths.sort(); // deterministic
+            paths
+        };
+
+        // WS-B: derive the bucket count `k` from the configured ceiling. Each
+        // bucket re-reads ALL shards (shards are unlabeled w.r.t. feature
+        // distribution) but keeps ONLY the features whose `hash(fid) % k == b`,
+        // so per-bucket resident bytes ≈ corpus_bytes / k. We fold the ZSTD
+        // decode expansion (`*3`, matching the Parquet chunker at the
+        // `len*3` estimate) into the residency estimate. `k` is capped at the
+        // shard-times-feature granularity implicitly by the loop; a huge ceiling
+        // yields k==1 (whole-corpus-equivalent, byte-identical path).
+        let est_resident_bytes: usize = shard_paths
+            .iter()
+            .map(|p| std::fs::metadata(p).map(|m| m.len() as usize * 3).unwrap_or(0))
+            .sum();
+        let budget = max_memory_bytes.max(1);
+        // ceil(est / budget), at least 1. Cap k so a pathologically tiny ceiling
+        // does not spin an unbounded number of full re-read passes (mirrors the
+        // Parquet `read_k <= 16` spirit, but here it bounds re-read PASSES).
+        let k = {
+            let raw = est_resident_bytes.div_ceil(budget).max(1);
+            raw.min(256)
+        };
+        NG_LAST_BUCKET_COUNT.store(k, Ordering::Relaxed);
+        // WS-B: reset the per-bucket peak-resident probe at the START of the
+        // generate (mirrors WS-C's reset-before-measure). The bucket loop below
+        // observes the RETAINED bucket map's bytes via `observe_ng_resident_bytes`.
+        NG_PEAK_RESIDENT_BYTES.store(0, Ordering::Relaxed);
 
         let (xmin, ymin, zmin, xmax, ymax, zmax) = world_bounds;
         let dx = if xmax != xmin { xmax - xmin } else { 1.0 };
@@ -4043,13 +5410,38 @@ impl StreamingTileGenerator {
         let qmax = ((1u32 << qbits) - 1) as f64;
         let out_dir = PathBuf::from(output_dir);
         let tags_ref = &self.tags_registry;
+        let io_threads = self.io_threads;
 
-        let features: Vec<(u32, Vec<Fragment3D>)> = feature_groups.into_iter().collect();
+        // WS-D: error-log facility. Streams to `run_dir` when set; in-memory only
+        // otherwise (no new file / no behavior change for existing callers).
+        // Built before the GIL is released so a dir-open failure is a normal
+        // early PyErr.
+        let collector = ErrorCollector::new(self.run_dir.clone())
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
+        let collector_ref = &collector;
+        let phase_start = std::time::Instant::now();
 
         // chunk_shape = world extent / 2^max_zoom (finest tile size in world coords)
         let n_tiles = (1u32 << max_zoom) as f64;
         let chunk_shape = [dx / n_tiles, dy / n_tiles, dz / n_tiles];
         let grid_origin = [xmin as f32, ymin as f32, zmin as f32];
+
+        // T6: opt-in `neuroglancer_uint64_sharded_v1` output. The loose
+        // per-segment files stay the default. In sharded mode each segment's
+        // (manifest, fragment bytes) is accumulated and packed into `.shard`
+        // files AFTER the bucket loop (the shard index can only be built once all
+        // per-feature bytes are known). NOTE: this accumulation holds the NG mesh
+        // corpus in RAM — it does NOT preserve WS-B's per-bucket memory bound, so
+        // it is an opt-in deploy-scale path; a streaming-to-disk writer is a
+        // follow-up. The loose path is unchanged and stays bounded.
+        let sharding_spec = crate::ng_sharded::ShardingSpec {
+            preshift_bits: 0,
+            minishard_bits: minishard_bits as u32,
+            shard_bits: shard_bits as u32,
+        };
+        let sharded_segments: std::sync::Mutex<Vec<(u64, Vec<u8>, Vec<u8>)>> =
+            std::sync::Mutex::new(Vec::new());
+        let sharded_ref = &sharded_segments;
 
         let count = py.allow_threads(|| {
             std::fs::create_dir_all(&out_dir).ok();
@@ -4063,18 +5455,120 @@ impl StreamingTileGenerator {
                 0.0, 1.0, 0.0, 0.0,
                 0.0, 0.0, 1.0, 0.0,
             ];
-            let info = serde_json::json!({
+            let mut info = serde_json::json!({
                 "@type": "neuroglancer_multilod_draco",
                 "vertex_quantization_bits": qbits,
                 "transform": transform,
                 "lod_scale_multiplier": 1.0,
                 "segment_properties": "segment_properties"
             });
+            if sharded {
+                info["sharding"] = serde_json::json!({
+                    "@type": "neuroglancer_uint64_sharded_v1",
+                    "preshift_bits": 0,
+                    "hash": "murmurhash3_x86_128",
+                    "minishard_bits": minishard_bits,
+                    "shard_bits": shard_bits,
+                    "minishard_index_encoding": "raw",
+                    "data_encoding": "raw"
+                });
+            }
             let info_str = serde_json::to_string_pretty(&info).unwrap_or_default();
             std::fs::write(out_dir.join("info"), info_str).ok();
 
-            // Process each feature (segment) in parallel
-            let segment_count: u32 = features.par_iter()
+            // WS-B feature-bucketed bounded read + sever the segment_properties
+            // re-borrow. For each bucket b in 0..k we re-read ALL shards in
+            // parallel (non-fatal: per-shard parse errors are folded into the
+            // ErrorCollector, not aborted), keep ONLY the features with
+            // `hash(fid) % k == b` (per-feature completeness — a feature is never
+            // split across buckets), encode+write each, then DROP the bucket map
+            // before the next bucket. Peak ≈ one bucket's decoded bytes, not the
+            // whole corpus.
+            //
+            // We accumulate ONLY a lightweight set of every feature_id seen
+            // across all buckets (geometry-independent) so segment_properties can
+            // be built in a SEPARATE final pass from `tags_ref` — the heavy
+            // per-feature geometry is dropped per bucket. The feature-bucket
+            // partition is now applied INSIDE the reader's decode loop (see the
+            // `(b, k)` args below), so no DefaultHasher is needed here.
+            let mut seen_fids: std::collections::BTreeSet<u32> =
+                std::collections::BTreeSet::new();
+            let mut segment_count: u32 = 0;
+
+            for b in 0..k {
+                let reader = Fragment3DReader::from_paths(shard_paths.clone());
+                // WS-B: pass (b, k) so the reader applies the feature-bucket
+                // filter DURING the per-shard decode loop — only features with
+                // `hash(fid) % k == b` are RETAINED, the rest are dropped before
+                // they ever enter the merged map. `k == 1` is the no-filter
+                // sentinel (whole-corpus-equivalent, byte-identical path). The
+                // returned `bucket_map` is therefore ALREADY this bucket's
+                // features — no post-filter pass is needed.
+                let (bucket_map, errs) = match reader
+                    .read_all_grouped_by_feature_parallel_collect_errors(io_threads, true, b, k)
+                {
+                    Ok(pair) => pair,
+                    Err(e) => {
+                        // Pool-build failure (not a per-shard parse error) — record
+                        // once and skip this bucket.
+                        collector_ref.record_failure(
+                            "neuroglancer",
+                            Severity::NonFatal,
+                            "<bucket read>",
+                            "read",
+                            &e.to_string(),
+                        );
+                        continue;
+                    }
+                };
+
+                // WS-B peak probe: measure the ACTUAL resident decoded-fragment
+                // bytes of the map returned by the reader for this bucket and
+                // take the max across buckets. With the filter-during-decode fix
+                // this map is ALREADY restricted to `hash(fid) % k == b`, so it
+                // scales ≈ corpus / k.
+                let bucket_resident: usize = bucket_map
+                    .values()
+                    .flat_map(|frags| frags.iter())
+                    .map(|f| f.estimate_bytes())
+                    .sum();
+                observe_ng_resident_bytes(bucket_resident);
+
+                // Fold per-shard parse errors into the ErrorCollector ONCE.
+                // Every bucket reads the identical shard set, so the error set is
+                // identical each pass; report only on bucket 0 to avoid k-fold
+                // double-reporting.
+                if b == 0 {
+                    for msg in &errs {
+                        // Split "<path>: <detail>" back into item / message.
+                        let (item, detail) = match msg.split_once(": ") {
+                            Some((p, d)) => (p, d),
+                            None => (msg.as_str(), msg.as_str()),
+                        };
+                        collector_ref.record_failure(
+                            "neuroglancer",
+                            Severity::NonFatal,
+                            item,
+                            "parse",
+                            detail,
+                        );
+                    }
+                }
+
+                // WS-B: `bucket_map` is ALREADY restricted to this bucket's
+                // features (the filter was applied during decode), so we no
+                // longer post-filter — we just materialize it for the parallel
+                // encode. Per-feature completeness still holds: a feature's
+                // fragments are merged across all shards within the one bucket
+                // that owns its hash. This is what bounds peak RSS to ≈ 1/k.
+                let bucket_features: Vec<(u32, Vec<Fragment3D>)> =
+                    bucket_map.into_iter().collect();
+
+                for (fid, _) in &bucket_features {
+                    seen_fids.insert(*fid);
+                }
+
+                let bucket_count: u32 = bucket_features.par_iter()
                 .map(|(feature_id, frags)| {
                     // Group fragments by tile_z → BTreeMap for ordered iteration
                     let mut by_zoom: std::collections::BTreeMap<u32, Vec<&Fragment3D>> = std::collections::BTreeMap::new();
@@ -4210,15 +5704,30 @@ impl StreamingTileGenerator {
                                 quant_positions.push(qz);
                             }
 
-                            // Encode with Draco
-                            match crate::encoder_draco::encode_draco_mesh(&quant_positions, &indices) {
+                            // Encode with Draco. Thread the SAME vertex_quantization_bits
+                            // used to pre-quantize above (`qbits`) into the encoder so the
+                            // lossless grid-identity transform spans [0, 2^qbits - 1].
+                            match crate::encoder_draco::encode_draco_mesh(&quant_positions, &indices, qbits) {
                                 Ok(draco_bytes) => {
                                     frag_positions.push([*tx, *ty, *td]);
                                     frag_offsets.push(draco_bytes.len() as u32);
                                     all_draco_data.extend_from_slice(&draco_bytes);
                                 }
-                                Err(_) => {
-                                    // Skip this fragment on encoding error
+                                Err(e) => {
+                                    // WS-D: a degenerate/un-encodable tile mesh is a
+                                    // NON-FATAL skip — report it (not silently
+                                    // dropped) and continue. The skip itself does
+                                    // not change healthy-feature geometry bytes.
+                                    collector_ref.record_failure(
+                                        "neuroglancer",
+                                        Severity::NonFatal,
+                                        &format!(
+                                            "feature {} tile ({},{},{})",
+                                            feature_id, tx, ty, td
+                                        ),
+                                        "draco_encode",
+                                        &e,
+                                    );
                                 }
                             }
                         }
@@ -4271,18 +5780,55 @@ impl StreamingTileGenerator {
                         for &off in fo { index_buf.extend_from_slice(&off.to_le_bytes()); }
                     }
 
-                    let index_path = out_dir.join(format!("{}.index", feature_id));
-                    std::fs::write(&index_path, &index_buf).ok();
-
-                    // Write concatenated Draco data
-                    let data_path = out_dir.join(feature_id.to_string());
-                    std::fs::write(&data_path, &all_draco_data).ok();
+                    if sharded {
+                        // Accumulate (label, manifest, fragment bytes) for the
+                        // final shard-assembly pass; loose files are NOT written
+                        // in this mode. write_sharded sorts internally, so the
+                        // parallel push order does not affect output.
+                        sharded_ref
+                            .lock()
+                            .unwrap()
+                            .push((*feature_id as u64, index_buf, all_draco_data));
+                    } else {
+                        let index_path = out_dir.join(format!("{}.index", feature_id));
+                        std::fs::write(&index_path, &index_buf).ok();
+                        // Write concatenated Draco data
+                        let data_path = out_dir.join(feature_id.to_string());
+                        std::fs::write(&data_path, &all_draco_data).ok();
+                    }
 
                     1u32
                 })
                 .sum::<u32>();
 
-            // Write segment_properties/info
+                segment_count += bucket_count;
+                // `bucket_features` (the heavy per-feature geometry for THIS
+                // bucket) is dropped here at the end of the loop iteration,
+                // before the next bucket is read — this is what bounds peak RSS.
+            }
+
+            // T6: assemble the sharded output now that every segment's bytes are
+            // known (the shard index references all minishard indexes). In loose
+            // mode the per-segment files were written inside the loop instead.
+            if sharded {
+                let segs = std::mem::take(&mut *sharded_ref.lock().unwrap());
+                if let Err(e) = crate::ng_sharded::write_sharded(&out_dir, segs, sharding_spec) {
+                    collector_ref.record_failure(
+                        "neuroglancer",
+                        Severity::Fatal,
+                        "<sharded write>",
+                        "write",
+                        &e.to_string(),
+                    );
+                }
+            }
+
+            // WS-B: build segment_properties in a SEPARATE final pass over the
+            // lightweight `seen_fids` (the union of every feature_id observed
+            // across all buckets), sorted by fid, preserving the EXACT first-seen
+            // (in fid-sorted order) column order the whole-corpus path produced.
+            // Geometry is already dropped; only `tags_ref` (geometry-independent)
+            // is read here.
             let sp_dir = out_dir.join("segment_properties");
             std::fs::create_dir_all(&sp_dir).ok();
 
@@ -4291,10 +5837,11 @@ impl StreamingTileGenerator {
             let mut seen_keys: AHashMap<String, usize> = AHashMap::new();
             let mut columns: Vec<Vec<serde_json::Value>> = Vec::new();
 
-            let mut sorted_features: Vec<&(u32, Vec<Fragment3D>)> = features.iter().collect();
-            sorted_features.sort_by_key(|(fid, _)| *fid);
+            // `seen_fids` is a BTreeSet → already fid-sorted, matching the prior
+            // `sorted_features.sort_by_key(fid)` order exactly.
+            let sorted_fids: Vec<u32> = seen_fids.iter().copied().collect();
 
-            for (fid, _) in &sorted_features {
+            for fid in &sorted_fids {
                 ids.push(fid.to_string());
                 if let Some(tags) = tags_ref.get(fid) {
                     for (key, _) in tags {
@@ -4308,28 +5855,73 @@ impl StreamingTileGenerator {
                 }
             }
 
-            for (fid, _) in &sorted_features {
+            // Track, per column, whether EVERY non-empty value is numeric (and
+            // whether all are integers) so we can emit `type:"number"` +
+            // `data_type` (T4 / B3). Mirrors `properties_writer.py:60-74`:
+            // all-int → uint32, any-float → float32, else → label.
+            let mut col_all_numeric: Vec<bool> = vec![true; all_keys.len()];
+            let mut col_all_int: Vec<bool> = vec![true; all_keys.len()];
+            let mut col_any_value: Vec<bool> = vec![false; all_keys.len()];
+
+            for fid in &sorted_fids {
                 let tags = tags_ref.get(fid);
                 for (ki, key) in all_keys.iter().enumerate() {
-                    let val = tags.and_then(|t| {
-                        t.iter().find(|(k, _)| k == key).map(|(_, v)| match v {
-                            TagValue::Str(s) => serde_json::json!(s),
-                            TagValue::Int(i) => serde_json::json!(i),
-                            TagValue::Float(f) => serde_json::json!(f),
-                            TagValue::Bool(b) => serde_json::json!(b),
-                        })
-                    }).unwrap_or(serde_json::json!(""));
+                    let found = tags.and_then(|t| {
+                        t.iter().find(|(k, _)| k == key).map(|(_, v)| v)
+                    });
+                    let val = match found {
+                        Some(TagValue::Str(s)) => {
+                            col_all_numeric[ki] = false;
+                            col_any_value[ki] = true;
+                            serde_json::json!(s)
+                        }
+                        Some(TagValue::Int(i)) => {
+                            col_any_value[ki] = true;
+                            serde_json::json!(i)
+                        }
+                        Some(TagValue::Float(f)) => {
+                            col_all_int[ki] = false;
+                            col_any_value[ki] = true;
+                            serde_json::json!(f)
+                        }
+                        Some(TagValue::Bool(b)) => {
+                            // bool is non-numeric for NG segment props.
+                            col_all_numeric[ki] = false;
+                            col_any_value[ki] = true;
+                            serde_json::json!(b)
+                        }
+                        None => {
+                            // Missing value: empty string sentinel, matching the
+                            // prior behavior AND `properties_writer.py` (which
+                            // ignores `""` when inferring the column type).
+                            serde_json::json!("")
+                        }
+                    };
                     columns[ki].push(val);
                 }
             }
 
             let mut properties = Vec::new();
             for (ki, key) in all_keys.iter().enumerate() {
-                properties.push(serde_json::json!({
-                    "id": key,
-                    "type": "label",
-                    "values": columns[ki]
-                }));
+                // A column is numeric only if it has at least one value and every
+                // non-empty value is numeric (matches the Python `all(...)` over
+                // non-`""` values, which is vacuously true but we additionally
+                // require a present value to avoid labeling an empty column).
+                if col_all_numeric[ki] && col_any_value[ki] {
+                    let data_type = if col_all_int[ki] { "uint32" } else { "float32" };
+                    properties.push(serde_json::json!({
+                        "id": key,
+                        "type": "number",
+                        "data_type": data_type,
+                        "values": columns[ki]
+                    }));
+                } else {
+                    properties.push(serde_json::json!({
+                        "id": key,
+                        "type": "label",
+                        "values": columns[ki]
+                    }));
+                }
             }
 
             let sp_info = serde_json::json!({
@@ -4344,6 +5936,11 @@ impl StreamingTileGenerator {
 
             segment_count
         });
+
+        // WS-D: honest summary (no-op when run_dir is None).
+        collector
+            .finish_summary("neuroglancer", phase_start.elapsed().as_secs_f64())
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
 
         self.tiles_written = count;
         Ok(count)
@@ -4750,5 +6347,37 @@ mod tests {
         let tag = TagValue::Str("hello".to_string());
         let encoded = encode_tag_value(&tag);
         assert!(!encoded.is_empty());
+    }
+
+    #[test]
+    fn test_detect_max_memory_env_override() {
+        std::env::set_var("MUDM_MAX_MEMORY_GB", "4");
+        assert_eq!(detect_max_memory_bytes(0), 4 * 1024 * 1024 * 1024);
+        std::env::remove_var("MUDM_MAX_MEMORY_GB");
+        // explicit arg wins over env + default
+        assert_eq!(detect_max_memory_bytes(2 * 1024 * 1024 * 1024), 2 * 1024 * 1024 * 1024);
+        // default is positive and not the bare KB-vs-bytes bug (must be >= 1 GiB)
+        assert!(detect_max_memory_bytes(0) >= 1024 * 1024 * 1024);
+    }
+
+    /// WS-C C.3 (Option A): `prefetch_advise` must be reachable from the
+    /// `streaming` module (it is the per-zoom read readahead hint) and must be
+    /// a safe best-effort no-op on every platform — including the non-Linux
+    /// (`memmap2` `madvise`) branch this host (macOS) compiles. Asserting it
+    /// compiles + runs here is the cross-module-visibility guard; the
+    /// I/O behavior itself is best-effort and produces no output change (the
+    /// byte-identity gate in `tests/test_tiling3d_3dtiles.py` proves that).
+    #[test]
+    fn test_prefetch_advise_is_callable_from_streaming() {
+        let dir = std::env::temp_dir()
+            .join(format!("mudm_prefetch_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("frag_00000.mjf");
+        std::fs::write(&p, b"not-a-real-shard-just-bytes-for-the-readahead-hint").unwrap();
+        // Reachable from `super::*` (i.e. re-exported from `fragment`) and a
+        // safe no-op; a missing/empty file must also not panic.
+        prefetch_advise(&p);
+        prefetch_advise(&dir.join("does_not_exist.mjf"));
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

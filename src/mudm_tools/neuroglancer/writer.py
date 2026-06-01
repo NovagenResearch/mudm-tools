@@ -20,9 +20,7 @@ from mudm.model import (
     MuDMFeature,
     MuDMFeatureCollection,
 )
-from mudm.transforms import AffineTransform
 from .annotation_writer import write_annotations
-from .skeleton_writer import write_skeleton
 from .state import (
     build_annotation_layer,
     build_viewer_state,

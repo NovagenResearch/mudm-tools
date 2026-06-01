@@ -10,10 +10,10 @@ from typing import Any, List, Literal, Optional
 
 from pydantic import BaseModel
 
-
 # ---------------------------------------------------------------------------
 # Skeleton info
 # ---------------------------------------------------------------------------
+
 
 class VertexAttributeInfo(BaseModel):
     """A per-vertex attribute in a skeleton (e.g. radius, type)."""
@@ -43,9 +43,7 @@ class SkeletonInfo(BaseModel):
         if self.transform is not None:
             d["transform"] = self.transform
         if self.vertex_attributes:
-            d["vertex_attributes"] = [
-                va.to_info_dict() for va in self.vertex_attributes
-            ]
+            d["vertex_attributes"] = [va.to_info_dict() for va in self.vertex_attributes]
         if self.segment_properties is not None:
             d["segment_properties"] = self.segment_properties
         return d
@@ -54,6 +52,7 @@ class SkeletonInfo(BaseModel):
 # ---------------------------------------------------------------------------
 # Annotation info
 # ---------------------------------------------------------------------------
+
 
 class AnnotationDimension(BaseModel):
     """Spatial dimension metadata for annotations."""
@@ -151,15 +150,16 @@ class AnnotationInfo(BaseModel):
 # Segment properties info
 # ---------------------------------------------------------------------------
 
+
 class SegmentPropertyField(BaseModel):
     """A single property field in segment_properties."""
 
     id: str
     description: Optional[str] = None
     type: Literal["label", "number", "string", "tags"]
-    data_type: Optional[Literal[
-        "float32", "int8", "uint8", "int16", "uint16", "int32", "uint32"
-    ]] = None
+    data_type: Optional[
+        Literal["float32", "int8", "uint8", "int16", "uint16", "int32", "uint32"]
+    ] = None
     values: List[Any] = []
     tags: Optional[List[str]] = None
 
@@ -180,9 +180,7 @@ class SegmentPropertyField(BaseModel):
 class SegmentPropertiesInfo(BaseModel):
     """Info JSON for ``neuroglancer_segment_properties``."""
 
-    at_type: Literal["neuroglancer_segment_properties"] = (
-        "neuroglancer_segment_properties"
-    )
+    at_type: Literal["neuroglancer_segment_properties"] = "neuroglancer_segment_properties"
     inline: Optional[SegmentPropertiesInline] = None  # type: ignore[name-defined]  # forward ref
 
     def to_info_dict(self) -> dict[str, Any]:

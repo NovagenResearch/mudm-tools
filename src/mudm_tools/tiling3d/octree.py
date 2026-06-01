@@ -7,8 +7,7 @@ recursion.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Any
+from dataclasses import dataclass
 
 from .clip3d import clip_3d
 from .tile3d import create_tile_3d
@@ -37,7 +36,12 @@ class OctreeConfig:
     """
 
     bounds: tuple[float, float, float, float, float, float] = (
-        0.0, 0.0, 0.0, 1.0, 1.0, 1.0,
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+        1.0,
+        1.0,
     )
     min_zoom: int = 0
     max_zoom: int = 4
@@ -138,10 +142,7 @@ class Octree:
 
     def tiles_at_zoom(self, z: int) -> list[dict]:
         """Return all non-empty tiles at a given zoom level."""
-        return [
-            tile for (tz, tx, ty, td), tile in self._tiles.items()
-            if tz == z
-        ]
+        return [tile for (tz, tx, ty, td), tile in self._tiles.items() if tz == z]
 
     @property
     def all_tiles(self) -> dict[tuple[int, int, int, int], dict]:

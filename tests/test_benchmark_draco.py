@@ -12,13 +12,13 @@ import pytest
 # Skip all tests if DracoPy is not installed
 DracoPy = pytest.importorskip("DracoPy")
 
-import sys
-from pathlib import Path
+import sys  # noqa: E402
+from pathlib import Path  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from benchmark_draco import (
+from benchmark_draco import (  # noqa: E402
     compute_l2_error,
     draco_decode,
     draco_encode,
@@ -67,8 +67,7 @@ class TestDracoRoundTrip:
         """20-bit quantization should have very low relative L2 error on a 3D mesh."""
         # Use a proper 3D mesh (not flat) so all bbox dimensions are non-zero
         verts = np.array(
-            [[0, 0, 0], [100, 0, 0], [100, 100, 0], [0, 100, 0],
-             [50, 50, 100], [0, 0, 50]],
+            [[0, 0, 0], [100, 0, 0], [100, 100, 0], [0, 100, 0], [50, 50, 100], [0, 0, 50]],
             dtype=np.float64,
         )
         faces = np.array(

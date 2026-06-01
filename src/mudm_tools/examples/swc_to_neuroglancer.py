@@ -63,12 +63,14 @@ def main() -> None:
         help="One or more .swc files to convert",
     )
     parser.add_argument(
-        "--output-dir", "-o",
+        "--output-dir",
+        "-o",
         default="neuroglancer_output",
         help="Output directory (default: neuroglancer_output)",
     )
     parser.add_argument(
-        "--port", "-p",
+        "--port",
+        "-p",
         type=int,
         default=9000,
         help="Port to serve on (default: 9000)",
@@ -158,8 +160,8 @@ def main() -> None:
     handler = functools.partial(CORSHandler, directory=str(output_dir))
     server = HTTPServer(("", args.port), handler)
     print(f"  Server running on http://localhost:{args.port}")
-    print(f"  Copy the Viewer URL above into your browser.")
-    print(f"  Press Ctrl+C to stop.\n")
+    print("  Copy the Viewer URL above into your browser.")
+    print("  Press Ctrl+C to stop.\n")
 
     try:
         server.serve_forever()

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from typing import Any
 
-import shapely
 from shapely.geometry import (
     GeometryCollection as ShapelyGeometryCollection,
     LineString as ShapelyLineString,
@@ -71,33 +70,31 @@ def shapely_to_microjson(geom: Any) -> Any:
         return None
 
     if isinstance(geom, ShapelyPoint):
-        return Point(type="Point", coordinates=_pos(geom.coords[0]))
+        return Point(type="Point", coordinates=_pos(geom.coords[0]))  # type: ignore[arg-type]  # geojson-pydantic accepts coord lists
 
     if isinstance(geom, ShapelyMultiPoint):
         return MultiPoint(
             type="MultiPoint",
-            coordinates=[_pos(p.coords[0]) for p in geom.geoms],
+            coordinates=[_pos(p.coords[0]) for p in geom.geoms],  # type: ignore[misc]  # geojson-pydantic accepts coord lists
         )
 
     if isinstance(geom, ShapelyLineString):
         return LineString(
             type="LineString",
-            coordinates=[_pos(c) for c in geom.coords],
+            coordinates=[_pos(c) for c in geom.coords],  # type: ignore[misc]  # geojson-pydantic accepts coord lists
         )
 
     if isinstance(geom, ShapelyMultiLineString):
         return MultiLineString(
             type="MultiLineString",
-            coordinates=[
-                [_pos(c) for c in line.coords] for line in geom.geoms
-            ],
+            coordinates=[[_pos(c) for c in line.coords] for line in geom.geoms],  # type: ignore[misc]  # geojson-pydantic accepts coord lists
         )
 
     if isinstance(geom, ShapelyPolygon):
         rings = [_ring_coords(geom.exterior)]
         for interior in geom.interiors:
             rings.append(_ring_coords(interior))
-        return Polygon(type="Polygon", coordinates=rings)
+        return Polygon(type="Polygon", coordinates=rings)  # type: ignore[arg-type]  # geojson-pydantic accepts coord lists
 
     if isinstance(geom, ShapelyMultiPolygon):
         if _is_tin(geom):
@@ -108,12 +105,10 @@ def shapely_to_microjson(geom: Any) -> Any:
             for interior in poly.interiors:
                 rings.append(_ring_coords(interior))
             polys.append(rings)
-        return MultiPolygon(type="MultiPolygon", coordinates=polys)
+        return MultiPolygon(type="MultiPolygon", coordinates=polys)  # type: ignore[arg-type]  # geojson-pydantic accepts coord lists
 
     if isinstance(geom, ShapelyGeometryCollection):
         parts = [shapely_to_microjson(g) for g in geom.geoms]
         return GeometryCollection(type="GeometryCollection", geometries=parts)
 
     raise TypeError(f"Unsupported Shapely geometry type: {type(geom)}")
-
-

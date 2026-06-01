@@ -54,6 +54,59 @@ impl Fragment3D {
     }
 }
 
+/// Deterministic TOTAL order over `Fragment3D`, used to canonicalize the order
+/// of the fragments a feature contributes to a tile.
+///
+/// The parallel grouped read merges per-shard thread-local maps via a `DashMap`,
+/// so the per-feature `Vec<Fragment3D>` order is nondeterministic across runs and
+/// between serial/parallel reads. Consumers that are sensitive to that order —
+/// notably the Neuroglancer multilod path, which merges a tile's fragments into
+/// ONE shared `vertex_map` with first-occurrence index assignment — then produce
+/// nondeterministic output bytes. Sorting each feature's fragments with this
+/// comparator before consumption removes that nondeterminism at the source.
+///
+/// It is a STRICT REFINEMENT of `feature_id` (the leading field), so substituting
+/// it for the existing `sort_by_key(|f| f.feature_id)` sites can only further-order
+/// fragments that previously tied — it never reorders distinct feature_ids — and
+/// therefore cannot change output that was already deterministic.
+///
+/// Distinct fragments never compare `Equal`: the geometry content (`ring_lengths`,
+/// then `xy`/`z` via the IEEE-754 `total_cmp` total order) is the tiebreak, so the
+/// sort is reproducible even for multiple distinct fragments sharing a tile.
+pub fn frag_cmp(a: &Fragment3D, b: &Fragment3D) -> std::cmp::Ordering {
+    a.feature_id
+        .cmp(&b.feature_id)
+        .then_with(|| a.tile_z.cmp(&b.tile_z))
+        .then_with(|| a.tile_x.cmp(&b.tile_x))
+        .then_with(|| a.tile_y.cmp(&b.tile_y))
+        .then_with(|| a.tile_d.cmp(&b.tile_d))
+        .then_with(|| a.geom_type.cmp(&b.geom_type))
+        // ring_lengths: Vec<u32> has a native lexicographic Ord (no floats).
+        .then_with(|| a.ring_lengths.cmp(&b.ring_lengths))
+        // Compare lengths BEFORE elements so a prefix sorts before its extension
+        // and the elementwise zip never under-reads.
+        .then_with(|| a.xy.len().cmp(&b.xy.len()))
+        .then_with(|| lex_f32(&a.xy, &b.xy))
+        .then_with(|| a.z.len().cmp(&b.z.len()))
+        .then_with(|| lex_f32(&a.z, &b.z))
+}
+
+/// Lexicographic compare of two f32 slices via the IEEE-754 totalOrder
+/// (`f32::total_cmp`): deterministic and platform-independent, distinguishes
+/// -0.0 < +0.0, and orders NaN without panicking — unlike `PartialOrd`. (Raw
+/// `to_bits()` integer compare would mis-order negatives; `total_cmp` applies the
+/// sign transform.) Lengths are compared by the caller before this is reached.
+#[inline]
+fn lex_f32(a: &[f32], b: &[f32]) -> std::cmp::Ordering {
+    for (x, y) in a.iter().zip(b.iter()) {
+        match x.total_cmp(y) {
+            std::cmp::Ordering::Equal => continue,
+            non_eq => return non_eq,
+        }
+    }
+    std::cmp::Ordering::Equal
+}
+
 /// Append-only fragment writer with f32 + ZSTD compression.
 ///
 /// Each writer owns one ZSTD-compressed file. For parallel ingestion,
@@ -198,6 +251,60 @@ impl ShardReader3D {
     }
 }
 
+/// Best-effort OS prefetch hint for a shard file.
+///
+/// Additive, non-load-bearing readahead to overlap open()+decode. Hints are
+/// best-effort and silently ignored on filesystems that don't support them.
+/// On Linux, uses `posix_fadvise(SEQUENTIAL|WILLNEED)`; elsewhere, an
+/// `mmap` + `madvise(WILLNEED)`. The handle is dropped immediately after the
+/// hint is issued — the kernel hint persists past close.
+#[cfg(target_os = "linux")]
+pub(crate) fn prefetch_advise(path: &Path) {
+    use std::os::unix::io::AsRawFd;
+    if let Ok(f) = File::open(path) {
+        let fd = f.as_raw_fd();
+        // best-effort; ignore errors. (0, 0) = whole file.
+        unsafe {
+            libc::posix_fadvise(fd, 0, 0, libc::POSIX_FADV_SEQUENTIAL);
+            libc::posix_fadvise(fd, 0, 0, libc::POSIX_FADV_WILLNEED);
+        }
+        // f drops here; hint persists in the kernel after close.
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn prefetch_advise(path: &Path) {
+    if let Ok(f) = File::open(path) {
+        // Safety: file is opened read-only and the mapping is not aliased
+        // mutably; we only issue an advisory hint and drop the mapping.
+        if let Ok(m) = unsafe { memmap2::Mmap::map(&f) } {
+            let _ = m.advise(memmap2::Advice::WillNeed); // best-effort
+        }
+    }
+}
+
+/// Parse one shard into a tile-keyed local map.
+///
+/// Uses the same byte loop as `ShardReader3D::read_next`. Each call opens its
+/// OWN `ShardReader3D` (which is `!Sync`) so it is safe to invoke from many
+/// rayon workers concurrently — no decoder is ever shared across threads.
+fn parse_shard_grouped(
+    path: &Path,
+    fadvise: bool,
+) -> io::Result<ahash::AHashMap<(u32, u32, u32, u32), Vec<Fragment3D>>> {
+    use ahash::AHashMap;
+    if fadvise {
+        prefetch_advise(path);
+    }
+    let mut reader = ShardReader3D::open(path)?; // each worker owns its own decoder
+    let mut local: AHashMap<(u32, u32, u32, u32), Vec<Fragment3D>> = AHashMap::new();
+    while let Some(frag) = reader.read_next()? {
+        let key = (frag.tile_z, frag.tile_x, frag.tile_y, frag.tile_d);
+        local.entry(key).or_default().push(frag);
+    }
+    Ok(local)
+}
+
 /// Fragment3D reader — reads 3D fragments from one or more ZSTD-compressed shard files.
 ///
 /// Transparently iterates through all shards in order.
@@ -298,6 +405,276 @@ impl Fragment3DReader {
             self.current_shard = None;
         }
         Ok(())
+    }
+
+    /// Build a reader from an explicit list of shard paths WITHOUT opening any
+    /// shard up front (lazy). The serial cursor starts at the beginning; the
+    /// parallel read methods read only `self.paths` and never touch the cursor.
+    ///
+    /// Used by the chunked parallel Parquet path to construct a reader over a
+    /// slice of the shard snapshot.
+    pub fn from_paths(paths: Vec<PathBuf>) -> Self {
+        Self {
+            paths,
+            current_shard: None,
+            current_index: 0,
+        }
+    }
+
+    /// Parallel sibling of `read_all_grouped`.
+    ///
+    /// Reads ONLY the immutable `self.paths` slice — never touches
+    /// `current_shard`/`current_index`. Each rayon worker opens its own
+    /// `ShardReader3D` (which is `!Sync`) via `parse_shard_grouped`, builds a
+    /// thread-local `AHashMap`, then bulk-merges into a shared `DashMap`
+    /// (mirroring `read_group_simplify_encode` at `streaming.rs:2018-2054`).
+    ///
+    /// Output equals the serial `read_all_grouped` as a multiset (same key set;
+    /// per key the same multiset of fragments), modulo non-deterministic order.
+    ///
+    /// Per-shard errors are collected and surfaced as an `Err` (the serial path
+    /// propagates via `?`; this matches that contract — errors are NOT swallowed).
+    ///
+    /// `io_threads == 0` uses the global rayon pool; `io_threads > 0` sizes a
+    /// scoped pool to that count (the measured I/O knee, not nproc).
+    pub fn read_all_grouped_parallel(
+        &self,
+        io_threads: usize,
+        fadvise: bool,
+    ) -> io::Result<ahash::AHashMap<(u32, u32, u32, u32), Vec<Fragment3D>>> {
+        use dashmap::DashMap;
+        use std::sync::Mutex;
+        if self.paths.is_empty() {
+            return Ok(ahash::AHashMap::new());
+        }
+        let groups: DashMap<(u32, u32, u32, u32), Vec<Fragment3D>> = DashMap::new();
+        let errors: Mutex<Vec<String>> = Mutex::new(Vec::new());
+        let run = || {
+            use rayon::prelude::*;
+            self.paths.par_iter().with_min_len(1).for_each(|p| {
+                match parse_shard_grouped(p, fadvise) {
+                    Ok(local) => {
+                        for (k, mut v) in local {
+                            groups.entry(k).or_default().extend(v.drain(..));
+                        }
+                    }
+                    Err(e) => {
+                        errors
+                            .lock()
+                            .unwrap()
+                            .push(format!("{}: {}", p.display(), e));
+                    }
+                }
+            });
+        };
+        if io_threads > 0 {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(io_threads)
+                .build()
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            pool.install(run);
+        } else {
+            run(); // global pool
+        }
+        let errs = errors.into_inner().unwrap();
+        if !errs.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!("{} shard(s) failed to parse: {}", errs.len(), errs.join("; ")),
+            ));
+        }
+        Ok(groups.into_iter().collect())
+    }
+
+    /// Parallel sibling of `read_all_grouped_by_feature`.
+    ///
+    /// Same par_iter + thread-local-map + `DashMap` merge pattern as
+    /// `read_all_grouped_parallel`, but keyed by `feature_id` (the
+    /// segment-centric grouping used by the Neuroglancer path). Reads ONLY
+    /// `self.paths`; collects and surfaces per-shard errors as `Err`.
+    pub fn read_all_grouped_by_feature_parallel(
+        &self,
+        io_threads: usize,
+        fadvise: bool,
+    ) -> io::Result<ahash::AHashMap<u32, Vec<Fragment3D>>> {
+        use ahash::AHashMap;
+        use dashmap::DashMap;
+        use std::sync::Mutex;
+        if self.paths.is_empty() {
+            return Ok(AHashMap::new());
+        }
+        let groups: DashMap<u32, Vec<Fragment3D>> = DashMap::new();
+        let errors: Mutex<Vec<String>> = Mutex::new(Vec::new());
+        let run = || {
+            use rayon::prelude::*;
+            self.paths.par_iter().with_min_len(1).for_each(|p| {
+                if fadvise {
+                    prefetch_advise(p);
+                }
+                let mut reader = match ShardReader3D::open(p) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        errors
+                            .lock()
+                            .unwrap()
+                            .push(format!("{}: {}", p.display(), e));
+                        return;
+                    }
+                };
+                let mut local: AHashMap<u32, Vec<Fragment3D>> = AHashMap::new();
+                loop {
+                    match reader.read_next() {
+                        Ok(Some(frag)) => {
+                            local.entry(frag.feature_id).or_default().push(frag);
+                        }
+                        Ok(None) => break,
+                        Err(e) => {
+                            errors
+                                .lock()
+                                .unwrap()
+                                .push(format!("{}: {}", p.display(), e));
+                            break;
+                        }
+                    }
+                }
+                for (k, mut v) in local {
+                    groups.entry(k).or_default().extend(v.drain(..));
+                }
+            });
+        };
+        if io_threads > 0 {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(io_threads)
+                .build()
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            pool.install(run);
+        } else {
+            run(); // global pool
+        }
+        let errs = errors.into_inner().unwrap();
+        if !errs.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!("{} shard(s) failed to parse: {}", errs.len(), errs.join("; ")),
+            ));
+        }
+        // Canonicalize each feature's fragment order — the DashMap merge above is
+        // nondeterministic, and the NG multilod consumer is order-sensitive.
+        let mut grouped: AHashMap<u32, Vec<Fragment3D>> = groups.into_iter().collect();
+        for v in grouped.values_mut() {
+            v.sort_by(frag_cmp);
+        }
+        Ok(grouped)
+    }
+
+    /// Non-fatal sibling of `read_all_grouped_by_feature_parallel`.
+    ///
+    /// Identical par_iter + thread-local-map + `DashMap` merge, keyed by
+    /// `feature_id`, but per-shard parse/open errors are **collected and
+    /// returned alongside the partial map** instead of aborting the read. The
+    /// healthy shards are still merged; the bad ones are skipped. The caller
+    /// (the WS-B feature-bucketed NG read) folds the returned errors into the
+    /// `ErrorCollector` and continues — a corrupt shard is reported, not
+    /// run-aborting, matching the non-fatal skip contract.
+    ///
+    /// WS-B BOUNDED READ: `(bucket_index, bucket_count)` apply a feature
+    /// partition filter **inside each worker's per-shard decode loop** so only
+    /// fragments whose feature_id hashes into this bucket are RETAINED — the
+    /// rest are dropped immediately, never entering the thread-local or merged
+    /// map. Thus per-bucket resident bytes ≈ corpus / k instead of the whole
+    /// corpus materialized then filtered. The hash MUST match the NG caller's
+    /// partition: `std::collections::hash_map::DefaultHasher`, `fid.hash(&mut
+    /// h)`, `(h.finish() as usize) % k == b`. `bucket_count <= 1` is a no-filter
+    /// sentinel (keep all) so non-bucketing callers are unaffected.
+    ///
+    /// Returns `(groups, errors)` where `errors` is `"<path>: <msg>"` strings,
+    /// one per failed shard (in nondeterministic order). The returned map is a
+    /// multiset equal to the healthy subset of the serial read RESTRICTED to
+    /// this bucket.
+    pub fn read_all_grouped_by_feature_parallel_collect_errors(
+        &self,
+        io_threads: usize,
+        fadvise: bool,
+        bucket_index: usize,
+        bucket_count: usize,
+    ) -> io::Result<(ahash::AHashMap<u32, Vec<Fragment3D>>, Vec<String>)> {
+        use ahash::AHashMap;
+        use dashmap::DashMap;
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        use std::sync::Mutex;
+        if self.paths.is_empty() {
+            return Ok((AHashMap::new(), Vec::new()));
+        }
+        // `bucket_count <= 1` => keep everything (whole-corpus-equivalent).
+        let filtering = bucket_count > 1;
+        let groups: DashMap<u32, Vec<Fragment3D>> = DashMap::new();
+        let errors: Mutex<Vec<String>> = Mutex::new(Vec::new());
+        let run = || {
+            use rayon::prelude::*;
+            self.paths.par_iter().with_min_len(1).for_each(|p| {
+                if fadvise {
+                    prefetch_advise(p);
+                }
+                let mut reader = match ShardReader3D::open(p) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        errors
+                            .lock()
+                            .unwrap()
+                            .push(format!("{}: {}", p.display(), e));
+                        return;
+                    }
+                };
+                let mut local: AHashMap<u32, Vec<Fragment3D>> = AHashMap::new();
+                loop {
+                    match reader.read_next() {
+                        Ok(Some(frag)) => {
+                            // WS-B: filter DURING decode — discard fragments not
+                            // in this bucket immediately so the thread-local +
+                            // merged maps hold only ~1/k of the corpus. Uses the
+                            // SAME DefaultHasher partition as the NG caller.
+                            if filtering {
+                                let mut h = DefaultHasher::new();
+                                frag.feature_id.hash(&mut h);
+                                if (h.finish() as usize) % bucket_count != bucket_index {
+                                    continue;
+                                }
+                            }
+                            local.entry(frag.feature_id).or_default().push(frag);
+                        }
+                        Ok(None) => break,
+                        Err(e) => {
+                            errors
+                                .lock()
+                                .unwrap()
+                                .push(format!("{}: {}", p.display(), e));
+                            break;
+                        }
+                    }
+                }
+                for (k, mut v) in local {
+                    groups.entry(k).or_default().extend(v.drain(..));
+                }
+            });
+        };
+        if io_threads > 0 {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(io_threads)
+                .build()
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            pool.install(run);
+        } else {
+            run(); // global pool
+        }
+        let errs = errors.into_inner().unwrap();
+        // Canonicalize each feature's fragment order (see frag_cmp) so the
+        // order-sensitive NG multilod consumer is run-to-run deterministic.
+        let mut grouped: AHashMap<u32, Vec<Fragment3D>> = groups.into_iter().collect();
+        for v in grouped.values_mut() {
+            v.sort_by(frag_cmp);
+        }
+        Ok((grouped, errs))
     }
 }
 
@@ -445,5 +822,392 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Canonicalise a tile-keyed group map into a comparable form: for each
+    /// key, the sorted multiset of feature_ids of its fragments. Order within
+    /// the parallel path is non-deterministic by design, so we sort.
+    fn canonical_grouped(
+        m: &ahash::AHashMap<(u32, u32, u32, u32), Vec<Fragment3D>>,
+    ) -> std::collections::BTreeMap<(u32, u32, u32, u32), Vec<u32>> {
+        let mut out: std::collections::BTreeMap<(u32, u32, u32, u32), Vec<u32>> =
+            std::collections::BTreeMap::new();
+        for (k, v) in m {
+            let mut fids: Vec<u32> = v.iter().map(|f| f.feature_id).collect();
+            fids.sort_unstable();
+            out.insert(*k, fids);
+        }
+        out
+    }
+
+    #[test]
+    fn test_read_all_grouped_parallel_matches_serial() {
+        let dir = std::env::temp_dir().join("test_frag_parallel_v2");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+
+        // Helper to build a fragment with a given feature/tile.
+        let mk = |feature_id: u32, tz: u32, tx: u32, ty: u32, td: u32| Fragment3D {
+            feature_id,
+            tile_z: tz,
+            tile_x: tx,
+            tile_y: ty,
+            tile_d: td,
+            geom_type: 5,
+            xy: vec![0.0f32, 0.0, 1.0, 0.0, 0.0, 1.0],
+            z: vec![0.0f32, 0.0, 0.0],
+            ring_lengths: vec![3],
+        };
+
+        // 3 shards with overlapping AND distinct tile keys so the merge path
+        // (entry().or_default().extend) is exercised across shards.
+        {
+            let mut w0 = Fragment3DWriter::new(&dir.join("shard_000.mjf")).unwrap();
+            w0.write(&mk(1, 0, 0, 0, 0)).unwrap();
+            w0.write(&mk(2, 0, 0, 0, 0)).unwrap(); // same tile as above (within shard)
+            w0.write(&mk(3, 1, 0, 0, 0)).unwrap();
+            w0.flush().unwrap();
+        }
+        {
+            let mut w1 = Fragment3DWriter::new(&dir.join("shard_001.mjf")).unwrap();
+            w1.write(&mk(4, 0, 0, 0, 0)).unwrap(); // shared tile (0,0,0,0) across shards
+            w1.write(&mk(5, 2, 1, 1, 0)).unwrap();
+            w1.flush().unwrap();
+        }
+        {
+            let mut w2 = Fragment3DWriter::new(&dir.join("shard_002.mjf")).unwrap();
+            w2.write(&mk(6, 1, 0, 0, 0)).unwrap(); // shared tile (1,0,0,0) across shards
+            w2.write(&mk(7, 3, 5, 5, 1)).unwrap();
+            w2.flush().unwrap();
+        }
+
+        // Serial baseline.
+        let mut serial_reader = Fragment3DReader::open_dir(&dir).unwrap();
+        let serial = serial_reader.read_all_grouped().unwrap();
+
+        // Parallel (io_threads=0 => global pool; fadvise off).
+        let par_reader = Fragment3DReader::open_dir(&dir).unwrap();
+        let parallel = par_reader.read_all_grouped_parallel(0, false).unwrap();
+
+        // Same key set + per-key same sorted multiset of feature_ids.
+        assert_eq!(canonical_grouped(&serial), canonical_grouped(&parallel));
+
+        // Also verify scoped-pool path (io_threads>0) and fadvise=true.
+        let par_reader2 = Fragment3DReader::open_dir(&dir).unwrap();
+        let parallel2 = par_reader2.read_all_grouped_parallel(4, true).unwrap();
+        assert_eq!(canonical_grouped(&serial), canonical_grouped(&parallel2));
+
+        // by_feature parallel matches serial by_feature.
+        let mut serial_feat_reader = Fragment3DReader::open_dir(&dir).unwrap();
+        let serial_feat = serial_feat_reader.read_all_grouped_by_feature().unwrap();
+        let par_feat_reader = Fragment3DReader::open_dir(&dir).unwrap();
+        let parallel_feat = par_feat_reader
+            .read_all_grouped_by_feature_parallel(0, false)
+            .unwrap();
+        let canon_feat = |m: &ahash::AHashMap<u32, Vec<Fragment3D>>| {
+            let mut out: std::collections::BTreeMap<u32, usize> =
+                std::collections::BTreeMap::new();
+            for (k, v) in m {
+                out.insert(*k, v.len());
+            }
+            out
+        };
+        assert_eq!(canon_feat(&serial_feat), canon_feat(&parallel_feat));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_read_all_grouped_parallel_single_shard() {
+        let dir = std::env::temp_dir().join("test_frag_parallel_single_v2");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+
+        let frag = Fragment3D {
+            feature_id: 99,
+            tile_z: 2,
+            tile_x: 3,
+            tile_y: 4,
+            tile_d: 0,
+            geom_type: 5,
+            xy: vec![0.1f32, 0.2, 0.3, 0.4, 0.5, 0.6],
+            z: vec![0.7f32, 0.8, 0.9],
+            ring_lengths: vec![3],
+        };
+        {
+            let mut w = Fragment3DWriter::new(&dir.join("only.mjf")).unwrap();
+            w.write(&frag).unwrap();
+            w.write(&frag).unwrap();
+            w.flush().unwrap();
+        }
+
+        let mut serial_reader = Fragment3DReader::open_dir(&dir).unwrap();
+        let serial = serial_reader.read_all_grouped().unwrap();
+        let par_reader = Fragment3DReader::open_dir(&dir).unwrap();
+        let parallel = par_reader.read_all_grouped_parallel(2, false).unwrap();
+
+        assert_eq!(parallel.len(), 1);
+        assert_eq!(parallel[&(2, 3, 4, 0)].len(), 2);
+        assert_eq!(canonical_grouped(&serial), canonical_grouped(&parallel));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_read_all_grouped_parallel_empty_dir() {
+        let dir = std::env::temp_dir().join("test_frag_parallel_empty_v2");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+
+        // open_dir on an empty dir => empty paths.
+        let reader = Fragment3DReader::open_dir(&dir).unwrap();
+        let parallel = reader.read_all_grouped_parallel(4, true).unwrap();
+        assert!(parallel.is_empty());
+
+        let parallel_feat = reader
+            .read_all_grouped_by_feature_parallel(0, false)
+            .unwrap();
+        assert!(parallel_feat.is_empty());
+
+        // from_paths with empty vec => empty map, no panic.
+        let empty_reader = Fragment3DReader::from_paths(Vec::new());
+        assert!(empty_reader
+            .read_all_grouped_parallel(0, false)
+            .unwrap()
+            .is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_read_all_grouped_parallel_propagates_shard_error() {
+        // A corrupt/truncated shard must surface as Err, never be silently
+        // skipped (matches the serial read_next `?` contract; guards against
+        // the parquet cursor advancing past a broken shard = silent data loss).
+        let dir = std::env::temp_dir().join("test_frag_parallel_corrupt_v2");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+
+        let frag = Fragment3D {
+            feature_id: 1,
+            tile_z: 0,
+            tile_x: 0,
+            tile_y: 0,
+            tile_d: 0,
+            geom_type: 5,
+            xy: vec![0.1f32, 0.2, 0.3, 0.4, 0.5, 0.6],
+            z: vec![0.7f32, 0.8, 0.9],
+            ring_lengths: vec![3],
+        };
+        {
+            let mut w = Fragment3DWriter::new(&dir.join("a_valid.mjf")).unwrap();
+            for _ in 0..3 {
+                w.write(&frag).unwrap();
+            }
+            w.flush().unwrap();
+        }
+        // A second .mjf that is NOT a valid ZSTD stream: the decoder fails on
+        // first read with a non-EOF error, which read_next propagates as Err
+        // (a clean trailing truncation, by contrast, decodes as graceful EOF).
+        std::fs::write(
+            dir.join("b_corrupt.mjf"),
+            b"NOT_A_VALID_ZSTD_FRAME________________________________",
+        )
+        .unwrap();
+
+        let reader = Fragment3DReader::open_dir(&dir).unwrap();
+        let res = reader.read_all_grouped_parallel(2, false);
+        assert!(
+            res.is_err(),
+            "a corrupt/truncated shard must produce Err, not be silently skipped"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_read_by_feature_parallel_collect_errors_is_nonfatal() {
+        // The NON-FATAL sibling used by the WS-B NG bucketed read must return the
+        // HEALTHY shard's fragments AND a per-shard error string for the corrupt
+        // shard — NOT abort. This is what lets the NG caller report a bad shard
+        // exactly once while still emitting healthy-feature geometry.
+        let dir = std::env::temp_dir().join("test_frag_by_feature_collect_errors");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+
+        let frag = Fragment3D {
+            feature_id: 7,
+            tile_z: 0,
+            tile_x: 0,
+            tile_y: 0,
+            tile_d: 0,
+            geom_type: 5,
+            xy: vec![0.1f32, 0.2, 0.3, 0.4, 0.5, 0.6],
+            z: vec![0.7f32, 0.8, 0.9],
+            ring_lengths: vec![3],
+        };
+        {
+            let mut w = Fragment3DWriter::new(&dir.join("a_valid.mjf")).unwrap();
+            for _ in 0..3 {
+                w.write(&frag).unwrap();
+            }
+            w.flush().unwrap();
+        }
+        std::fs::write(
+            dir.join("b_corrupt.mjf"),
+            b"NOT_A_VALID_ZSTD_FRAME________________________________",
+        )
+        .unwrap();
+
+        let reader = Fragment3DReader::open_dir(&dir).unwrap();
+        // bucket_count == 0 => no-filter sentinel (keep all).
+        let (groups, errs) = reader
+            .read_all_grouped_by_feature_parallel_collect_errors(2, false, 0, 0)
+            .expect("non-fatal variant must not abort on a bad shard");
+
+        // Healthy shard's fragments survive.
+        assert_eq!(groups.get(&7).map(|v| v.len()), Some(3));
+        // The corrupt shard is reported exactly once.
+        assert_eq!(errs.len(), 1, "expected one per-shard error, got {:?}", errs);
+        assert!(errs[0].contains("b_corrupt.mjf"), "error must name the bad shard: {:?}", errs);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_by_feature_collect_errors_bucket_filter_partitions() {
+        // WS-B: the (bucket_index, bucket_count) filter applied DURING decode
+        // must partition the corpus — each bucket retains only the features
+        // whose feature_id hashes into it, and the disjoint union over all
+        // buckets reconstructs the full no-filter read EXACTLY (same key set,
+        // same per-key fragment count). Hashing must match the NG caller.
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let dir = std::env::temp_dir().join("test_frag_bucket_filter_partition");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+
+        // Several distinct feature_ids spread across two shards.
+        let mk = |fid: u32| Fragment3D {
+            feature_id: fid,
+            tile_z: 0,
+            tile_x: 0,
+            tile_y: 0,
+            tile_d: 0,
+            geom_type: 5,
+            xy: vec![0.1f32, 0.2, 0.3, 0.4, 0.5, 0.6],
+            z: vec![0.7f32, 0.8, 0.9],
+            ring_lengths: vec![3],
+        };
+        {
+            let mut w0 = Fragment3DWriter::new(&dir.join("s0.mjf")).unwrap();
+            let mut w1 = Fragment3DWriter::new(&dir.join("s1.mjf")).unwrap();
+            for fid in 0u32..20 {
+                // Two fragments per feature, split across the two shards, so the
+                // per-feature count is shard-independent (tests cross-shard merge
+                // under filtering).
+                w0.write(&mk(fid)).unwrap();
+                w1.write(&mk(fid)).unwrap();
+            }
+            w0.flush().unwrap();
+            w1.flush().unwrap();
+        }
+
+        // No-filter (sentinel) baseline.
+        let base_reader = Fragment3DReader::open_dir(&dir).unwrap();
+        let (base, base_errs) = base_reader
+            .read_all_grouped_by_feature_parallel_collect_errors(2, false, 0, 0)
+            .unwrap();
+        assert!(base_errs.is_empty());
+        // 20 features, 2 fragments each.
+        assert_eq!(base.len(), 20);
+        for fid in 0u32..20 {
+            assert_eq!(base[&fid].len(), 2);
+        }
+
+        let k = 4usize;
+        let mut union: std::collections::BTreeMap<u32, usize> =
+            std::collections::BTreeMap::new();
+        for b in 0..k {
+            let reader = Fragment3DReader::open_dir(&dir).unwrap();
+            let (bucket, errs) = reader
+                .read_all_grouped_by_feature_parallel_collect_errors(2, false, b, k)
+                .unwrap();
+            assert!(errs.is_empty());
+            for (fid, frags) in &bucket {
+                // Every retained feature MUST belong to this bucket.
+                let mut h = DefaultHasher::new();
+                fid.hash(&mut h);
+                assert_eq!(
+                    (h.finish() as usize) % k,
+                    b,
+                    "feature {} leaked into bucket {}",
+                    fid,
+                    b
+                );
+                let prev = union.insert(*fid, frags.len());
+                assert!(prev.is_none(), "feature {} appeared in two buckets", fid);
+            }
+        }
+        // Disjoint union over buckets == full no-filter read.
+        assert_eq!(union.len(), base.len());
+        for fid in 0u32..20 {
+            assert_eq!(union[&fid], 2, "feature {} lost fragments under bucketing", fid);
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn frag_cmp_is_deterministic_total_order() {
+        use std::cmp::Ordering;
+        let mk = |fid: u32, gt: u8, xy: Vec<f32>, z: Vec<f32>, rl: Vec<u32>| Fragment3D {
+            feature_id: fid,
+            tile_z: 1,
+            tile_x: 1,
+            tile_y: 1,
+            tile_d: 1,
+            geom_type: gt,
+            xy,
+            z,
+            ring_lengths: rl,
+        };
+
+        // (1) leads with feature_id — strict refinement of the old sort_by_key key.
+        let a = mk(1, 5, vec![9.0], vec![9.0], vec![9]);
+        let b = mk(2, 4, vec![0.0], vec![0.0], vec![1]);
+        assert_eq!(frag_cmp(&a, &b), Ordering::Less);
+
+        // (2) tie on the 6-tuple -> ring_lengths breaks it.
+        let c = mk(1, 5, vec![0.0], vec![0.0], vec![3]);
+        let d = mk(1, 5, vec![0.0], vec![0.0], vec![4]);
+        assert_eq!(frag_cmp(&c, &d), Ordering::Less);
+
+        // (3) tie through ring_lengths -> xy content breaks it.
+        let e = mk(1, 5, vec![0.0, 0.0], vec![0.0], vec![3]);
+        let f = mk(1, 5, vec![0.0, 1.0], vec![0.0], vec![3]);
+        assert_eq!(frag_cmp(&e, &f), Ordering::Less);
+
+        // (4) prefix sorts before extension (length compared before elements).
+        let g = mk(1, 5, vec![0.0], vec![0.0], vec![3]);
+        let h = mk(1, 5, vec![0.0, 0.0], vec![0.0], vec![3]);
+        assert_eq!(frag_cmp(&g, &h), Ordering::Less);
+
+        // (5) -0.0 vs +0.0 resolves deterministically (total_cmp: -0.0 < +0.0),
+        //     and is NOT Equal (harmless: such a pair encodes to identical bytes).
+        let i = mk(1, 5, vec![-0.0], vec![0.0], vec![3]);
+        let j = mk(1, 5, vec![0.0], vec![0.0], vec![3]);
+        assert_eq!(frag_cmp(&i, &j), Ordering::Less);
+
+        // (6) byte-identical fragments compare Equal; distinct ones never do.
+        let k1 = mk(7, 5, vec![1.0, 2.0], vec![3.0], vec![3]);
+        let k2 = mk(7, 5, vec![1.0, 2.0], vec![3.0], vec![3]);
+        assert_eq!(frag_cmp(&k1, &k2), Ordering::Equal);
+
+        // antisymmetry: cmp(a,b) == cmp(b,a).reverse() for every pair.
+        for (x, y) in [(&a, &b), (&c, &d), (&e, &f), (&g, &h), (&i, &j)] {
+            assert_eq!(frag_cmp(x, y), frag_cmp(y, x).reverse());
+        }
     }
 }

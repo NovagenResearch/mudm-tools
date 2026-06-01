@@ -7,6 +7,7 @@
 import math
 from abc import ABC, abstractmethod
 from .feature import Slice, create_feature
+from .simplify import simplify
 
 # converts Microjson feature into an intermediate projected JSON vector format
 # with simplification data
@@ -20,9 +21,7 @@ def convert(data, options):
     bounds = options.get("bounds")
     if projector is None:
         projector = (
-            CartesianProjector(options.get("bounds"))
-            if bounds is not None
-            else MercatorProjector()
+            CartesianProjector(options.get("bounds")) if bounds is not None else MercatorProjector()
         )
 
     return projector.convert(data, options)
@@ -74,8 +73,7 @@ class AbstractProjector(ABC):
 
         type_ = geojson.get("geometry").get("type")
         tolerance = math.pow(
-            options.get("tolerance")
-            / ((1 << options.get("maxZoom")) * options.get("extent")),
+            options.get("tolerance") / ((1 << options.get("maxZoom")) * options.get("extent")),
             2,
         )
         geometry = Slice([])
@@ -103,9 +101,7 @@ class AbstractProjector(ABC):
                     geometry = Slice([])
                     self.convert_line(line, geometry, tolerance, False)
                     features.append(
-                        create_feature(
-                            id_, "LineString", geometry, geojson.get("properties")
-                        )
+                        create_feature(id_, "LineString", geometry, geojson.get("properties"))
                     )
                 return
             else:
@@ -156,9 +152,7 @@ class AbstractProjector(ABC):
                 if isPolygon:
                     size += (x0 * y - x * y0) / 2  # area
                 else:
-                    size += math.sqrt(
-                        math.pow(x - x0, 2) + math.pow(y - y0, 2)
-                    )  # length
+                    size += math.sqrt(math.pow(x - x0, 2) + math.pow(y - y0, 2))  # length
             x0 = x
             y0 = y
 
@@ -166,8 +160,8 @@ class AbstractProjector(ABC):
         dosimplify = False
         if dosimplify:
             simplified_line = simplify(
-                [[x, y] for x, y in zip(out[0::3], out[1::3])],
-                tolerance)  # New call
+                [[x, y] for x, y in zip(out[0::3], out[1::3])], tolerance
+            )  # New call
             out.clear()  # clear existing data
             # check if simplified_line has at least 3 points
             if len(simplified_line) < 3:

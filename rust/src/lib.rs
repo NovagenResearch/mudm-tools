@@ -8,12 +8,14 @@ mod simplify;
 mod tile_transform;
 mod encoder_pbf3;
 mod fragment;
+mod error_log;
 mod encoder_glb;
 mod tileset_json;
 mod streaming;
 mod morton;
 mod encoder_draco;
 mod encoder_meshopt;
+mod ng_sharded;
 mod types2d;
 mod projector2d;
 mod clip2d;
@@ -22,6 +24,7 @@ mod simplify2d;
 mod streaming2d;
 mod encoder_mvt;
 mod decoder_mvt;
+mod gltf_decode;
 
 /// The main Python module implemented in Rust.
 #[pymodule]
@@ -49,6 +52,8 @@ fn _rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     // Draco encoder
     m.add_function(wrap_pyfunction!(encoder_draco::draco_encode_mesh, m)?)?;
+    // Test-only: direct NG (u32) Draco path for lossless round-trip tests.
+    m.add_function(wrap_pyfunction!(encoder_draco::draco_encode_ng_u32, m)?)?;
 
     // 2D tiling pipeline
     m.add_class::<projector2d::CartesianProjector2D>()?;
@@ -56,6 +61,9 @@ fn _rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     // MVT PBF reader
     m.add_function(wrap_pyfunction!(decoder_mvt::read_pbf, m)?)?;
+
+    // glTF decoder (head-to-head with pygltflib)
+    m.add_function(wrap_pyfunction!(gltf_decode::decode_glb_buffer, m)?)?;
 
     Ok(())
 }

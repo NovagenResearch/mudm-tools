@@ -54,12 +54,14 @@ class TileReader3DTiles:
         """Recursively collect all tile nodes with their depth."""
         result = []
         if "content" in node:
-            result.append({
-                "uri": node["content"]["uri"],
-                "depth": depth,
-                "boundingVolume": node.get("boundingVolume"),
-                "geometricError": node.get("geometricError", 0.0),
-            })
+            result.append(
+                {
+                    "uri": node["content"]["uri"],
+                    "depth": depth,
+                    "boundingVolume": node.get("boundingVolume"),
+                    "geometricError": node.get("geometricError", 0.0),
+                }
+            )
         for child in node.get("children", []):
             result.extend(self._collect_tiles(child, depth + 1))
         return result

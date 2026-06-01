@@ -1,7 +1,6 @@
 """Tests for polygon triangulation."""
 
 import numpy as np
-import pytest
 from shapely.geometry import MultiPolygon, Polygon
 
 from mudm_tools.gltf.triangulator import multipolygon_to_mesh, polygon_to_mesh
@@ -49,6 +48,7 @@ class TestPolygonToMesh:
             cx = tri_coords[:, 0].mean()
             cy = tri_coords[:, 1].mean()
             from shapely.geometry import Point
+
             assert not hole_poly.contains(Point(cx, cy)), "Triangle inside hole"
 
     def test_empty_polygon(self):

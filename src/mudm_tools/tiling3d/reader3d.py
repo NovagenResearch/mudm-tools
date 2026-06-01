@@ -49,8 +49,7 @@ class _LazyMeshXY(Sequence):
             n_floats = self._n_verts * 3
             floats = struct.unpack(f"<{n_floats}f", self._data)
             self._cache = [
-                (int(floats[i * 3]), int(floats[i * 3 + 1]))
-                for i in range(self._n_verts)
+                (int(floats[i * 3]), int(floats[i * 3 + 1])) for i in range(self._n_verts)
             ]
         return self._cache
 
@@ -114,7 +113,7 @@ class _LazyMeshZ(Sequence):
 
 def _decode_commands(geometry: list[int]) -> list[tuple[int, list[tuple[int, int]]]]:
     """Decode MVT command stream to list of (cmd, [(dx, dy), ...])."""
-    result = []
+    result: list[tuple[int, list[tuple[int, int]]]] = []
     i = 0
     while i < len(geometry):
         cmd_int = geometry[i]
@@ -153,7 +152,9 @@ def _decode_z(z_deltas: list[int]) -> list[int]:
 
 
 def _decode_tags(
-    tag_indices: list[int], keys: list[str], values: list[Any],
+    tag_indices: list[int],
+    keys: list[str],
+    values: list[Any],
 ) -> dict[str, Any]:
     """Decode key/value tag pairs from indices."""
     tags = {}
@@ -180,7 +181,7 @@ def decode_tile(data: bytes) -> list[dict]:
 
     Returns a list of decoded feature dicts per layer.
     """
-    tile = pb.Tile()
+    tile = pb.Tile()  # type: ignore[attr-defined]  # generated protobuf
     tile.ParseFromString(data)
 
     layers = []
@@ -198,8 +199,10 @@ def decode_tile(data: bytes) -> list[dict]:
                 # Return raw bytes — consumer uses struct/numpy/torch
                 # xy/z are lazy — only materialized on first access
                 n_verts = len(mesh_pos_bytes) // 12  # 3 floats × 4 bytes
-                xy_points = _LazyMeshXY(mesh_pos_bytes, n_verts)
-                z_abs = _LazyMeshZ(mesh_pos_bytes, n_verts)
+                xy_points: _LazyMeshXY | list[tuple[int, int]] = _LazyMeshXY(
+                    mesh_pos_bytes, n_verts
+                )
+                z_abs: _LazyMeshZ | list[int] = _LazyMeshZ(mesh_pos_bytes, n_verts)
             else:
                 # Ring-based decode path (Point, Line, Polygon)
                 commands = _decode_commands(list(feat.geometry))
@@ -216,25 +219,29 @@ def decode_tile(data: bytes) -> list[dict]:
 
                 z_abs = _decode_z(list(feat.geometry_z))
 
-            features.append({
-                "id": feat.id,
-                "type": feat.type,
-                "type_name": _GEOM_TYPE_NAMES.get(feat.type, "Unknown"),
-                "tags": _decode_tags(list(feat.tags), keys, values),
-                "xy": xy_points,
-                "z": z_abs,
-                "mesh_positions": mesh_pos_bytes,
-                "mesh_indices": mesh_idx_bytes,
-                "radii": list(feat.radii) if feat.radii else [],
-            })
+            features.append(
+                {
+                    "id": feat.id,
+                    "type": feat.type,
+                    "type_name": _GEOM_TYPE_NAMES.get(feat.type, "Unknown"),
+                    "tags": _decode_tags(list(feat.tags), keys, values),
+                    "xy": xy_points,
+                    "z": z_abs,
+                    "mesh_positions": mesh_pos_bytes,
+                    "mesh_indices": mesh_idx_bytes,
+                    "radii": list(feat.radii) if feat.radii else [],
+                }
+            )
 
-        layers.append({
-            "name": layer.name,
-            "version": layer.version,
-            "extent": layer.extent,
-            "extent_z": layer.extent_z,
-            "features": features,
-        })
+        layers.append(
+            {
+                "name": layer.name,
+                "version": layer.version,
+                "extent": layer.extent,
+                "extent_z": layer.extent_z,
+                "features": features,
+            }
+        )
 
     return layers
 
@@ -259,7 +266,11 @@ class TileReader3D:
         return self._meta
 
     def read_tile(
-        self, z: int, x: int, y: int, d: int,
+        self,
+        z: int,
+        x: int,
+        y: int,
+        d: int,
     ) -> list[dict] | None:
         """Read and decode a single tile.
 
@@ -275,7 +286,7 @@ class TileReader3D:
 
         Returns list of (z, x, y, d, decoded_layers).
         """
-        results = []
+        results: list[tuple[int, int, int, int, list[dict]]] = []
         z_dir = self._base_dir / str(z)
         if not z_dir.exists():
             return results
@@ -290,9 +301,15 @@ class TileReader3D:
                     if tile_file.suffix == ".pbf3":
                         d_val = int(tile_file.stem)
                         layers = decode_tile(tile_file.read_bytes())
-                        results.append((
-                            z, int(x_dir.name), int(y_dir.name), d_val, layers,
-                        ))
+                        results.append(
+                            (
+                                z,
+                                int(x_dir.name),
+                                int(y_dir.name),
+                                d_val,
+                                layers,
+                            )
+                        )
         return results
 
     def tiles2microjson(
@@ -340,11 +357,12 @@ class TileReader3D:
                     tags = feat.get("tags", {})
 
                     # Reconstruct GeoJSON geometry
+                    geom: Point | LineString | Polygon
                     if geom_type == 1:  # POINT3D
                         if len(coords_3d) == 1:
                             geom = Point(
                                 type="Point",
-                                coordinates=list(coords_3d[0]),
+                                coordinates=list(coords_3d[0]),  # type: ignore[arg-type]  # geojson-pydantic accepts coord lists
                             )
                         else:
                             continue  # skip multi-point for now
@@ -352,7 +370,7 @@ class TileReader3D:
                         if len(coords_3d) >= 2:
                             geom = LineString(
                                 type="LineString",
-                                coordinates=[list(c) for c in coords_3d],
+                                coordinates=[list(c) for c in coords_3d],  # type: ignore[misc]  # geojson-pydantic accepts coord lists
                             )
                         else:
                             continue
@@ -364,16 +382,18 @@ class TileReader3D:
                                 ring.append(ring[0])
                             geom = Polygon(
                                 type="Polygon",
-                                coordinates=[ring],
+                                coordinates=[ring],  # type: ignore[list-item]  # geojson-pydantic accepts coord lists
                             )
                         else:
                             continue
 
-                    features.append(MuDMFeature(
-                        type="Feature",
-                        geometry=geom,
-                        properties=tags if tags else {},
-                    ))
+                    features.append(
+                        MuDMFeature(
+                            type="Feature",
+                            geometry=geom,
+                            properties=tags if tags else {},
+                        )
+                    )
 
         return MuDMFeatureCollection(
             type="FeatureCollection",

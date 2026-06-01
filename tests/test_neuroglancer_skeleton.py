@@ -2,7 +2,6 @@
 
 import json
 import struct
-from pathlib import Path
 
 import pytest
 
@@ -15,10 +14,10 @@ from mudm_tools.neuroglancer.skeleton_writer import (
     write_skeleton,
 )
 
-
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
+
 
 @pytest.fixture
 def simple_neuron():
@@ -61,6 +60,7 @@ def identity_transform():
 # Tests: binary encoding
 # ---------------------------------------------------------------------------
 
+
 class TestNeuronToSkeletonBinary:
     def test_header(self, simple_neuron):
         data = neuron_to_skeleton_binary(simple_neuron)
@@ -100,9 +100,7 @@ class TestNeuronToSkeletonBinary:
         assert len(data) == 84
 
     def test_no_attributes(self, simple_neuron):
-        data = neuron_to_skeleton_binary(
-            simple_neuron, include_radius=False, include_type=False
-        )
+        data = neuron_to_skeleton_binary(simple_neuron, include_radius=False, include_type=False)
         # 8 (header) + 36 (verts) + 16 (edges) = 60
         assert len(data) == 60
 
@@ -118,6 +116,7 @@ class TestNeuronToSkeletonBinary:
 # ---------------------------------------------------------------------------
 # Tests: affine transform conversion
 # ---------------------------------------------------------------------------
+
 
 class TestAffineToNgTransform:
     def test_identity(self, identity_transform):
@@ -165,6 +164,7 @@ class TestAffineToNgTransform:
 # Tests: build_skeleton_info
 # ---------------------------------------------------------------------------
 
+
 class TestBuildSkeletonInfo:
     def test_defaults(self):
         info = build_skeleton_info()
@@ -189,6 +189,7 @@ class TestBuildSkeletonInfo:
 # ---------------------------------------------------------------------------
 # Tests: write_skeleton (disk I/O)
 # ---------------------------------------------------------------------------
+
 
 class TestWriteSkeleton:
     def test_creates_directory(self, simple_neuron, tmp_path):

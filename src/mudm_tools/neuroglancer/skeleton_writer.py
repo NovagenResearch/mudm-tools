@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import List, Optional
+from typing import Optional
 
 from ..swc import NeuronMorphology
 from mudm.transforms import AffineTransform
@@ -119,13 +119,9 @@ def build_skeleton_info(
     """
     vertex_attributes: list[VertexAttributeInfo] = []
     if include_radius:
-        vertex_attributes.append(
-            VertexAttributeInfo(id="radius", data_type="float32")
-        )
+        vertex_attributes.append(VertexAttributeInfo(id="radius", data_type="float32"))
     if include_type:
-        vertex_attributes.append(
-            VertexAttributeInfo(id="type", data_type="float32")
-        )
+        vertex_attributes.append(VertexAttributeInfo(id="type", data_type="float32"))
 
     ng_transform: Optional[list[float]] = None
     if transform is not None:

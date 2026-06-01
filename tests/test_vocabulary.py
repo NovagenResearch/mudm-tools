@@ -1,6 +1,5 @@
 """Tests for ontology vocabulary support on MuDM models."""
 
-import pytest
 from geojson_pydantic import Point
 
 from mudm.model import (
@@ -10,10 +9,10 @@ from mudm.model import (
     Vocabulary,
 )
 
-
 # ---------------------------------------------------------------------------
 # OntologyTerm basics
 # ---------------------------------------------------------------------------
+
 
 class TestOntologyTerm:
     def test_create_full(self):
@@ -45,6 +44,7 @@ class TestOntologyTerm:
 # ---------------------------------------------------------------------------
 # Vocabulary basics
 # ---------------------------------------------------------------------------
+
 
 class TestVocabulary:
     def test_create(self):
@@ -82,6 +82,7 @@ class TestVocabulary:
 # ---------------------------------------------------------------------------
 # Collection-level vocabularies
 # ---------------------------------------------------------------------------
+
 
 class TestCollectionVocabularies:
     def test_inline_vocabularies(self):
@@ -157,12 +158,16 @@ class TestCollectionVocabularies:
         data = fc.model_dump()
         fc2 = MuDMFeatureCollection(**data)
         assert "cell_type" in fc2.vocabularies
-        assert fc2.vocabularies["cell_type"].terms["pyramidal"].uri == "http://purl.obolibrary.org/obo/CL_0000598"
+        assert (
+            fc2.vocabularies["cell_type"].terms["pyramidal"].uri
+            == "http://purl.obolibrary.org/obo/CL_0000598"
+        )
 
 
 # ---------------------------------------------------------------------------
 # Feature-level vocabularies (override)
 # ---------------------------------------------------------------------------
+
 
 class TestFeatureVocabularies:
     def test_feature_level_override(self):
@@ -219,6 +224,7 @@ class TestFeatureVocabularies:
 # Multiple vocabularies on same collection
 # ---------------------------------------------------------------------------
 
+
 class TestMultipleVocabularies:
     def test_multiple_property_vocabularies(self):
         fc = MuDMFeatureCollection(
@@ -240,10 +246,15 @@ class TestMultipleVocabularies:
                 "brain_region": Vocabulary(
                     namespace="http://purl.obolibrary.org/obo/UBERON_",
                     terms={
-                        "hippocampus_CA1": OntologyTerm(uri="http://purl.obolibrary.org/obo/UBERON_0003881"),
+                        "hippocampus_CA1": OntologyTerm(
+                            uri="http://purl.obolibrary.org/obo/UBERON_0003881"
+                        ),
                     },
                 ),
             },
         )
         assert len(fc.vocabularies) == 2
-        assert fc.vocabularies["brain_region"].terms["hippocampus_CA1"].uri == "http://purl.obolibrary.org/obo/UBERON_0003881"
+        assert (
+            fc.vocabularies["brain_region"].terms["hippocampus_CA1"].uri
+            == "http://purl.obolibrary.org/obo/UBERON_0003881"
+        )

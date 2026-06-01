@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import List, Literal, Optional, Sequence, Tuple
+from typing import List, Literal, Sequence, Tuple
 
 from geojson_pydantic import LineString, Point
 
@@ -139,7 +139,7 @@ def write_annotations(
     lower, upper = _compute_bounds(features, annotation_type)
 
     # Chunk size = full extent
-    extent = [u - l if u > l else 1.0 for l, u in zip(lower, upper)]
+    extent = [high - low if high > low else 1.0 for low, high in zip(lower, upper)]
 
     # Build info — Neuroglancer expects UPPERCASE annotation_type
     ng_type = _NG_ANNOTATION_TYPE[annotation_type]
@@ -181,10 +181,16 @@ def write_annotations(
                     c0, c1 = coords[j], coords[j + 1]
                     z0 = float(c0[2]) if len(c0) > 2 else 0.0
                     z1 = float(c1[2]) if len(c1) > 2 else 0.0
-                    line_data.append((
-                        float(c0[0]), float(c0[1]), z0,
-                        float(c1[0]), float(c1[1]), z1,
-                    ))
+                    line_data.append(
+                        (
+                            float(c0[0]),
+                            float(c0[1]),
+                            z0,
+                            float(c1[0]),
+                            float(c1[1]),
+                            z1,
+                        )
+                    )
                     ids.append(i)
         binary = lines_to_annotation_binary(line_data, ids)
 

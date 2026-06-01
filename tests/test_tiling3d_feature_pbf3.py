@@ -7,24 +7,23 @@ point features, and empty features.
 
 import json
 import struct
-from pathlib import Path
 
 import pytest
 
 try:
     from mudm_tools._rs import StreamingTileGenerator
+
     RUST_AVAILABLE = True
 except ImportError:
     RUST_AVAILABLE = False
 
-pytestmark = pytest.mark.skipif(
-    not RUST_AVAILABLE, reason="Rust extensions not compiled"
-)
+pytestmark = pytest.mark.skipif(not RUST_AVAILABLE, reason="Rust extensions not compiled")
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _make_tin_feature(xy, z, ring_lengths, tags=None, feature_id=None):
     """Build a TIN feature dict in normalized [0,1]³ space."""
@@ -51,8 +50,12 @@ def _make_point_feature(x, y, z, tags=None):
         "geometry_z": [z],
         "type": 1,  # POINT3D
         "tags": tags or {},
-        "minX": x, "minY": y, "minZ": z,
-        "maxX": x, "maxY": y, "maxZ": z,
+        "minX": x,
+        "minY": y,
+        "minZ": z,
+        "maxX": x,
+        "maxY": y,
+        "maxZ": z,
     }
 
 
@@ -89,6 +92,7 @@ def _build_generator_with_features(features, min_zoom=0, max_zoom=2):
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
+
 
 class TestFeaturePbf3ProducesFiles:
     """Test that generate_feature_pbf3 creates the expected files."""
@@ -221,6 +225,7 @@ class TestFeaturePbf3WorldCoordinates:
 
         data = (tmp_path / "features" / "0.pbf3").read_bytes()
         from mudm_tools.tiling3d.reader3d import decode_tile
+
         layers = decode_tile(data)
         feat = layers[0]["features"][0]
 
@@ -251,8 +256,7 @@ class TestFeaturePbf3VertexCountMatchesNeuroglancer:
         """Same geometry from both outputs."""
         features = [
             _make_tin_feature(
-                [0.1, 0.1, 0.3, 0.1, 0.2, 0.3, 0.1, 0.1,
-                 0.4, 0.4, 0.6, 0.4, 0.5, 0.6, 0.4, 0.4],
+                [0.1, 0.1, 0.3, 0.1, 0.2, 0.3, 0.1, 0.1, 0.4, 0.4, 0.6, 0.4, 0.5, 0.6, 0.4, 0.4],
                 [0.1, 0.2, 0.3, 0.1, 0.4, 0.5, 0.6, 0.4],
                 [4, 4],
                 tags={"name": "test"},
@@ -271,6 +275,7 @@ class TestFeaturePbf3VertexCountMatchesNeuroglancer:
 
         # Decode feature PBF3
         from mudm_tools.tiling3d.reader3d import decode_tile
+
         pbf3_data = (tmp_path / "features" / "0.pbf3").read_bytes()
         layers = decode_tile(pbf3_data)
         pbf3_feat = layers[0]["features"][0]
@@ -307,6 +312,7 @@ class TestFeaturePbf3BboxCorrect:
 
         # Extract actual positions from PBF3 file
         from mudm_tools.tiling3d.reader3d import decode_tile
+
         data = (tmp_path / "features" / "0.pbf3").read_bytes()
         layers = decode_tile(data)
         feat = layers[0]["features"][0]
@@ -441,20 +447,25 @@ class TestFeaturePbf3MultipleFeatures:
 # Multi-LOD tests
 # ---------------------------------------------------------------------------
 
+
 def _make_dense_tin_feature(n_triangles=20):
     """Build a TIN feature with many triangles spread across [0.1, 0.9]³."""
     import random
+
     random.seed(42)
     xy = []
     z = []
     ring_lengths = []
     for _ in range(n_triangles):
-        cx, cy, cz = random.uniform(0.15, 0.85), random.uniform(0.15, 0.85), random.uniform(0.15, 0.85)
+        cx, cy, cz = (
+            random.uniform(0.15, 0.85),
+            random.uniform(0.15, 0.85),
+            random.uniform(0.15, 0.85),
+        )
         d = 0.05
         xy.extend([cx - d, cy - d, cx + d, cy - d, cx, cy + d])
         z.extend([cz - d, cz + d, cz])
         ring_lengths.append(3)
-    n = len(z)
     return _make_tin_feature(xy, z, ring_lengths, tags={"name": "dense"})
 
 
@@ -470,6 +481,7 @@ class TestMultilodLayerCount:
         gen.generate_feature_pbf3(out, WORLD_BOUNDS)
 
         from mudm_tools.tiling3d.reader3d import decode_tile
+
         data = (tmp_path / "features" / "0.pbf3").read_bytes()
         layers = decode_tile(data)
         # Should have up to max_zoom + 1 layers (zoom 0, 1, 2)
@@ -488,9 +500,10 @@ class TestMultilodLayerNames:
         gen.generate_feature_pbf3(out, WORLD_BOUNDS)
 
         from mudm_tools.tiling3d.reader3d import decode_tile
+
         data = (tmp_path / "features" / "0.pbf3").read_bytes()
         layers = decode_tile(data)
-        names = [l["name"] for l in layers]
+        names = [layer["name"] for layer in layers]
         assert names == ["lod_0", "lod_1", "lod_2"]
 
 
@@ -505,6 +518,7 @@ class TestMultilodVertexReduction:
         gen.generate_feature_pbf3(out, WORLD_BOUNDS)
 
         from mudm_tools.tiling3d.reader3d import decode_tile
+
         data = (tmp_path / "features" / "0.pbf3").read_bytes()
         layers = decode_tile(data)
 
@@ -518,13 +532,13 @@ class TestMultilodVertexReduction:
 
         # lod_0 (finest) should have >= lod_1 >= lod_2 (coarsest) vertices
         for i in range(len(vertex_counts) - 1):
-            assert vertex_counts[i] >= vertex_counts[i + 1], (
-                f"lod_{i} ({vertex_counts[i]} verts) < lod_{i+1} ({vertex_counts[i+1]} verts)"
-            )
+            assert (
+                vertex_counts[i] >= vertex_counts[i + 1]
+            ), f"lod_{i} ({vertex_counts[i]} verts) < lod_{i+1} ({vertex_counts[i+1]} verts)"
         # Coarsest should have strictly fewer than finest (with 50 triangles)
-        assert vertex_counts[-1] < vertex_counts[0], (
-            f"Expected coarsest ({vertex_counts[-1]}) < finest ({vertex_counts[0]})"
-        )
+        assert (
+            vertex_counts[-1] < vertex_counts[0]
+        ), f"Expected coarsest ({vertex_counts[-1]}) < finest ({vertex_counts[0]})"
 
 
 class TestMultilodWorldCoords:
@@ -538,6 +552,7 @@ class TestMultilodWorldCoords:
         gen.generate_feature_pbf3(out, WORLD_BOUNDS)
 
         from mudm_tools.tiling3d.reader3d import decode_tile
+
         data = (tmp_path / "features" / "0.pbf3").read_bytes()
         layers = decode_tile(data)
 
@@ -571,6 +586,7 @@ class TestMultilodFalseBackwardCompat:
         gen.generate_feature_pbf3(out, WORLD_BOUNDS, multilod=False)
 
         from mudm_tools.tiling3d.reader3d import decode_tile
+
         data = (tmp_path / "features" / "0.pbf3").read_bytes()
         layers = decode_tile(data)
         assert len(layers) == 1

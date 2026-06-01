@@ -4,9 +4,6 @@ Covers: generate_parquet(), read_parquet(), schema, row groups, mesh data,
 tags, filtering, world coordinates, multi-feature, edge cases, compression.
 """
 
-import struct
-from pathlib import Path
-
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -14,6 +11,7 @@ import pytest
 
 try:
     from mudm_tools._rs import StreamingTileGenerator
+
     RUST_AVAILABLE = True
 except ImportError:
     RUST_AVAILABLE = False
@@ -22,14 +20,13 @@ from mudm_tools.tiling3d.parquet_writer import generate_parquet
 from mudm_tools.tiling3d.parquet_reader import read_parquet
 from mudm_tools.tiling3d.parquet_prime import prime_parquet, deprime_parquet, repartition_parquet
 
-pytestmark = pytest.mark.skipif(
-    not RUST_AVAILABLE, reason="Rust extensions not compiled"
-)
+pytestmark = pytest.mark.skipif(not RUST_AVAILABLE, reason="Rust extensions not compiled")
 
 
 # ---------------------------------------------------------------------------
 # Helpers (same patterns as test_tiling3d_feature_pbf3.py)
 # ---------------------------------------------------------------------------
+
 
 def _make_tin_feature(xy, z, ring_lengths, tags=None):
     """Build a TIN feature dict in normalized [0,1]³ space."""
@@ -56,8 +53,12 @@ def _make_point_feature(x, y, z, tags=None):
         "geometry_z": [z],
         "type": 1,
         "tags": tags or {},
-        "minX": x, "minY": y, "minZ": z,
-        "maxX": x, "maxY": y, "maxZ": z,
+        "minX": x,
+        "minY": y,
+        "minZ": z,
+        "maxX": x,
+        "maxY": y,
+        "maxZ": z,
     }
 
 
@@ -94,6 +95,7 @@ def _build_generator_with_features(features, min_zoom=0, max_zoom=2):
 def _make_dense_tin_feature(n_triangles=20):
     """Build a TIN feature with many triangles spread across [0.1, 0.9]³."""
     import random
+
     random.seed(42)
     xy = []
     z = []
@@ -112,6 +114,7 @@ def _make_dense_tin_feature(n_triangles=20):
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
+
 
 class TestParquetProducesFile:
     """Test that generate_parquet creates a valid Parquet file."""
@@ -167,8 +170,17 @@ class TestParquetSchema:
         generate_parquet(gen, out, WORLD_BOUNDS)
 
         table = pq.read_table(str(out))
-        expected = {"zoom", "tile_x", "tile_y", "tile_d", "feature_id",
-                    "geom_type", "positions", "indices", "tags"}
+        expected = {
+            "zoom",
+            "tile_x",
+            "tile_y",
+            "tile_d",
+            "feature_id",
+            "geom_type",
+            "positions",
+            "indices",
+            "tags",
+        }
         assert set(table.column_names) == expected
 
     def test_column_types(self, tmp_path):
@@ -282,8 +294,7 @@ class TestParquetMeshData:
         """TIN features produce triangle indices (multiples of 3)."""
         features = [
             _make_tin_feature(
-                [0.1, 0.2, 0.3, 0.4, 0.5, 0.6,
-                 0.6, 0.7, 0.8, 0.8, 0.7, 0.9],
+                [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.6, 0.7, 0.8, 0.8, 0.7, 0.9],
                 [0.1, 0.2, 0.3, 0.4, 0.5, 0.6],
                 [3, 3],
             ),
@@ -529,6 +540,7 @@ class TestParquetCompression:
 # Streaming Parquet tests
 # ---------------------------------------------------------------------------
 
+
 class TestParquetStreaming:
     """Test streaming batch Parquet generation (single-file mode)."""
 
@@ -630,6 +642,7 @@ class TestParquetStreaming:
 # Partitioned Parquet tests
 # ---------------------------------------------------------------------------
 
+
 class TestParquetPartitioned:
     """Test partitioned Parquet output (one file per zoom level)."""
 
@@ -650,7 +663,11 @@ class TestParquetPartitioned:
         gen, _ = _build_generator_with_features(features, min_zoom=0, max_zoom=2)
         out_dir = tmp_path / "partitioned_read"
         total = generate_parquet(
-            gen, out_dir, WORLD_BOUNDS, partitioned=True, batch_size=10,
+            gen,
+            out_dir,
+            WORLD_BOUNDS,
+            partitioned=True,
+            batch_size=10,
         )
 
         rows = read_parquet(out_dir)
@@ -662,7 +679,11 @@ class TestParquetPartitioned:
         gen, _ = _build_generator_with_features(features, min_zoom=0, max_zoom=2)
         out_dir = tmp_path / "partitioned_filter"
         total = generate_parquet(
-            gen, out_dir, WORLD_BOUNDS, partitioned=True, batch_size=10,
+            gen,
+            out_dir,
+            WORLD_BOUNDS,
+            partitioned=True,
+            batch_size=10,
         )
 
         rows_z2 = read_parquet(out_dir, zoom=2)
@@ -694,7 +715,11 @@ class TestParquetPartitioned:
         gen2, fids2 = _build_generator_with_features(features, min_zoom=0, max_zoom=2)
         out_part = tmp_path / "partitioned_cmp"
         count_part = generate_parquet(
-            gen2, out_part, WORLD_BOUNDS, partitioned=True, batch_size=10,
+            gen2,
+            out_part,
+            WORLD_BOUNDS,
+            partitioned=True,
+            batch_size=10,
         )
 
         assert count_single == count_part
@@ -705,10 +730,77 @@ class TestParquetPartitioned:
         fids_p = sorted(set(r["feature_id"] for r in rows_p))
         assert fids_s == fids_p
 
+    def test_overlap_matches_serial(self, tmp_path):
+        """Native read∥transform overlap pipeline is byte-identical (modulo
+        within-tile row order) to the sequential native path. Forced to >=2
+        chunks via max_batch_bytes=1 so the producer/consumer handoff runs."""
+        # Spatially-spread TINs so ingestion produces several fragment shards.
+        centers = [
+            (0.2, 0.2, 0.2),
+            (0.8, 0.2, 0.2),
+            (0.2, 0.8, 0.2),
+            (0.2, 0.2, 0.8),
+            (0.8, 0.8, 0.8),
+            (0.5, 0.5, 0.5),
+            (0.3, 0.7, 0.4),
+            (0.7, 0.3, 0.6),
+        ]
+        d = 0.05
+        feats = [
+            _make_tin_feature(
+                [cx - d, cy - d, cx + d, cy - d, cx, cy + d],
+                [cz - d, cz + d, cz],
+                [3],
+                tags={"name": f"c{i}"},
+            )
+            for i, (cx, cy, cz) in enumerate(centers)
+        ]
+
+        def _run(out_dir, overlap):
+            gen, _ = _build_generator_with_features(feats, min_zoom=0, max_zoom=2)
+            # (output_dir, world_bounds, compression, level, max_batch_bytes,
+            #  max_file_bytes, overlap_read) -> one shard per chunk.
+            return gen.generate_parquet_native_partitioned(
+                str(out_dir),
+                WORLD_BOUNDS,
+                "zstd",
+                3,
+                1,
+                500_000_000,
+                overlap,
+            )
+
+        out_serial = tmp_path / "serial"
+        out_overlap = tmp_path / "overlap"
+        n_serial = _run(out_serial, False)
+        n_overlap = _run(out_overlap, True)
+        assert n_serial == n_overlap > 0
+
+        def _canon(rows):
+            sig = []
+            for r in rows:
+                sig.append(
+                    (
+                        r["zoom"],
+                        r["tile_x"],
+                        r["tile_y"],
+                        r["tile_d"],
+                        r["feature_id"],
+                        r["geom_type"],
+                        r["positions"].tobytes(),
+                        r["indices"].tobytes(),
+                        tuple(sorted(r["tags"].items())),
+                    )
+                )
+            return sorted(sig)
+
+        assert _canon(read_parquet(out_serial)) == _canon(read_parquet(out_overlap))
+
 
 # ---------------------------------------------------------------------------
 # Streaming API low-level tests
 # ---------------------------------------------------------------------------
+
 
 class TestParquetStreamingAPI:
     """Test the low-level _init/_next/_close Parquet streaming API."""
@@ -766,10 +858,167 @@ class TestParquetStreamingAPI:
         with pytest.raises(RuntimeError):
             gen._next_parquet_batch(100, WORLD_BOUNDS)
 
+    # --- Parallel batch read equivalence ---
+
+    @staticmethod
+    def _canonical_rows(rows):
+        """Sort rows on the 5-key canonical order for order-insensitive compare."""
+        return sorted(
+            rows,
+            key=lambda r: (r["zoom"], r["tile_x"], r["tile_y"], r["tile_d"], r["feature_id"]),
+        )
+
+    @staticmethod
+    def _multi_shard_features():
+        """A multi-feature fixture spread across many tiles (multiple shards)."""
+        feats = []
+        # Several dense TINs placed in different regions of [0,1]^3 so they
+        # land in distinct tiles across zoom levels -> multiple shards/tiles.
+        for i in range(6):
+            base = 0.1 + 0.12 * i
+            xy = []
+            z = []
+            ring_lengths = []
+            for j in range(8):
+                cx = base + 0.01 * j
+                cy = 0.15 + 0.09 * i + 0.005 * j
+                cz = 0.2 + 0.08 * ((i + j) % 5)
+                d = 0.02
+                xy.extend([cx - d, cy - d, cx + d, cy - d, cx, cy + d])
+                z.extend([cz - d, cz + d, cz])
+                ring_lengths.append(3)
+            feats.append(_make_tin_feature(xy, z, ring_lengths, tags={"name": f"f{i}"}))
+        return feats
+
+    @pytest.mark.parametrize("partitioned", [False, True])
+    def test_parallel_batch_matches_serial(self, tmp_path, partitioned):
+        """parallel=True produces byte-identical positions/indices (mod row order)."""
+        feats = self._multi_shard_features()
+
+        gen_s, _ = _build_generator_with_features(feats, min_zoom=0, max_zoom=2)
+        gen_p, _ = _build_generator_with_features(feats, min_zoom=0, max_zoom=2)
+
+        out_s = tmp_path / ("serial_dir" if partitioned else "serial.parquet")
+        out_p = tmp_path / ("parallel_dir" if partitioned else "parallel.parquet")
+
+        n_s = generate_parquet(
+            gen_s,
+            out_s,
+            WORLD_BOUNDS,
+            partitioned=partitioned,
+            batch_size=4,
+            parallel=False,
+        )
+        n_p = generate_parquet(
+            gen_p,
+            out_p,
+            WORLD_BOUNDS,
+            partitioned=partitioned,
+            batch_size=4,
+            parallel=True,
+        )
+
+        assert n_s == n_p
+        assert n_s > 0  # fixture must actually produce rows
+
+        rows_s = self._canonical_rows(read_parquet(out_s))
+        rows_p = self._canonical_rows(read_parquet(out_p))
+
+        assert len(rows_s) == len(rows_p)
+        # Must exercise multiple tiles to be a meaningful crux test.
+        assert len({(r["zoom"], r["tile_x"], r["tile_y"], r["tile_d"]) for r in rows_s}) > 1
+
+        for rs, rp in zip(rows_s, rows_p):
+            assert rs["zoom"] == rp["zoom"]
+            assert rs["tile_x"] == rp["tile_x"]
+            assert rs["tile_y"] == rp["tile_y"]
+            assert rs["tile_d"] == rp["tile_d"]
+            assert rs["feature_id"] == rp["feature_id"]
+            np.testing.assert_array_equal(rs["positions"], rp["positions"])
+            np.testing.assert_array_equal(rs["indices"], rp["indices"])
+
+    def test_parallel_empty(self, tmp_path):
+        """Empty generator -> both paths produce empty, equal output."""
+        gen_s, _ = _build_generator_with_features([], min_zoom=0, max_zoom=1)
+        gen_p, _ = _build_generator_with_features([], min_zoom=0, max_zoom=1)
+
+        out_s = tmp_path / "empty_serial.parquet"
+        out_p = tmp_path / "empty_parallel.parquet"
+
+        n_s = generate_parquet(gen_s, out_s, WORLD_BOUNDS, parallel=False)
+        n_p = generate_parquet(gen_p, out_p, WORLD_BOUNDS, parallel=True)
+
+        assert n_s == 0
+        assert n_p == 0
+        assert read_parquet(out_s) == []
+        assert read_parquet(out_p) == []
+
+    def test_parallel_single_shard(self, tmp_path):
+        """A single small feature (one shard) matches between serial and parallel."""
+        feats = [
+            _make_tin_feature(
+                [0.1, 0.2, 0.3, 0.4, 0.5, 0.6],
+                [0.1, 0.2, 0.3],
+                [3],
+                tags={"name": "single"},
+            ),
+        ]
+        gen_s, _ = _build_generator_with_features(feats, min_zoom=0, max_zoom=1)
+        gen_p, _ = _build_generator_with_features(feats, min_zoom=0, max_zoom=1)
+
+        out_s = tmp_path / "one_serial.parquet"
+        out_p = tmp_path / "one_parallel.parquet"
+
+        n_s = generate_parquet(gen_s, out_s, WORLD_BOUNDS, parallel=False)
+        n_p = generate_parquet(gen_p, out_p, WORLD_BOUNDS, parallel=True)
+
+        assert n_s == n_p
+        assert n_s > 0
+
+        rows_s = self._canonical_rows(read_parquet(out_s))
+        rows_p = self._canonical_rows(read_parquet(out_p))
+        assert len(rows_s) == len(rows_p)
+        for rs, rp in zip(rows_s, rows_p):
+            np.testing.assert_array_equal(rs["positions"], rp["positions"])
+            np.testing.assert_array_equal(rs["indices"], rp["indices"])
+
+    def test_parallel_io_threads_one_equals_serial(self, tmp_path):
+        """MUDM_IO_THREADS=1 (serial fallback inside the parallel path) matches serial."""
+        import os
+
+        feats = self._multi_shard_features()
+
+        gen_s, _ = _build_generator_with_features(feats, min_zoom=0, max_zoom=2)
+        out_s = tmp_path / "ser.parquet"
+        n_s = generate_parquet(gen_s, out_s, WORLD_BOUNDS, batch_size=4, parallel=False)
+
+        prev = os.environ.get("MUDM_IO_THREADS")
+        os.environ["MUDM_IO_THREADS"] = "1"
+        try:
+            gen_p, _ = _build_generator_with_features(feats, min_zoom=0, max_zoom=2)
+            out_p = tmp_path / "par.parquet"
+            n_p = generate_parquet(gen_p, out_p, WORLD_BOUNDS, batch_size=4, parallel=True)
+        finally:
+            if prev is None:
+                os.environ.pop("MUDM_IO_THREADS", None)
+            else:
+                os.environ["MUDM_IO_THREADS"] = prev
+
+        assert n_s == n_p
+        assert n_s > 0
+
+        rows_s = self._canonical_rows(read_parquet(out_s))
+        rows_p = self._canonical_rows(read_parquet(out_p))
+        assert len(rows_s) == len(rows_p)
+        for rs, rp in zip(rows_s, rows_p):
+            np.testing.assert_array_equal(rs["positions"], rp["positions"])
+            np.testing.assert_array_equal(rs["indices"], rp["indices"])
+
 
 # ---------------------------------------------------------------------------
 # Prime / Deprime tests
 # ---------------------------------------------------------------------------
+
 
 def _make_partitioned_pyramid(tmp_path, min_zoom=0, max_zoom=2):
     """Helper: generate a partitioned Parquet pyramid and return (dir, total_rows)."""
@@ -812,8 +1061,7 @@ class TestParquetPrimeDeprime:
         """prime_parquet does not remove or modify original parquet files."""
         out_dir, _ = _make_partitioned_pyramid(tmp_path)
         sizes_before = {
-            z: (out_dir / f"zoom={z}" / "part_000.parquet").stat().st_size
-            for z in range(3)
+            z: (out_dir / f"zoom={z}" / "part_000.parquet").stat().st_size for z in range(3)
         }
         prime_parquet(out_dir)
         for z in range(3):
@@ -827,6 +1075,7 @@ class TestParquetPrimeDeprime:
         assert count == 3
         # Verify files are readable
         import pyarrow.feather as feather
+
         for z in range(3):
             table = feather.read_table(str(out_dir / f"zoom={z}" / "part_000.arrow"))
             assert table.num_rows > 0
@@ -935,7 +1184,9 @@ class TestParquetPrimeDeprime:
         assert len(rows_pq) == len(rows_arrow)
 
         # Sort both by (zoom, tile_x, tile_y, feature_id) for deterministic comparison
-        key = lambda r: (r["zoom"], r["tile_x"], r["tile_y"], r["feature_id"])
+        def key(r):
+            return (r["zoom"], r["tile_x"], r["tile_y"], r["feature_id"])
+
         rows_pq.sort(key=key)
         rows_arrow.sort(key=key)
 
@@ -975,6 +1226,7 @@ class TestParquetPrimeDeprime:
 # File splitting tests (writer-side rotation)
 # ---------------------------------------------------------------------------
 
+
 class TestParquetFileSplitting:
     """Test size-based file rotation in partitioned output."""
 
@@ -983,9 +1235,18 @@ class TestParquetFileSplitting:
         features = [_make_dense_tin_feature(50)]
         gen, _ = _build_generator_with_features(features, min_zoom=0, max_zoom=2)
         out_dir = tmp_path / "split"
+        # Writer-rotation test: pin parallel=False so the reader yields fine-grained
+        # batch_size-driven batches (many write() calls -> rotation). The parallel
+        # reader chunks by max_batch_bytes (coarse byte-budget batches), which yields
+        # the same rows but different part-file split points.
         generate_parquet(
-            gen, out_dir, WORLD_BOUNDS,
-            partitioned=True, batch_size=5, max_file_bytes=1,  # 1 byte → always rotate
+            gen,
+            out_dir,
+            WORLD_BOUNDS,
+            partitioned=True,
+            batch_size=5,
+            max_file_bytes=1,  # 1 byte → always rotate
+            parallel=False,
         )
 
         # At least one zoom level should have >1 part file
@@ -1001,11 +1262,17 @@ class TestParquetFileSplitting:
         gen, _ = _build_generator_with_features(features, min_zoom=0, max_zoom=2)
         out_dir = tmp_path / "naming"
         generate_parquet(
-            gen, out_dir, WORLD_BOUNDS,
-            partitioned=True, batch_size=5, max_file_bytes=1,
+            gen,
+            out_dir,
+            WORLD_BOUNDS,
+            partitioned=True,
+            batch_size=5,
+            max_file_bytes=1,
+            parallel=False,  # writer-rotation test; see test_rotation_creates_multiple_parts
         )
 
         import re
+
         for z in range(3):
             parts = sorted((out_dir / f"zoom={z}").glob("part_*.parquet"))
             for p in parts:
@@ -1017,8 +1284,12 @@ class TestParquetFileSplitting:
         gen, _ = _build_generator_with_features(features, min_zoom=0, max_zoom=2)
         out_dir = tmp_path / "readable"
         total = generate_parquet(
-            gen, out_dir, WORLD_BOUNDS,
-            partitioned=True, batch_size=5, max_file_bytes=1,
+            gen,
+            out_dir,
+            WORLD_BOUNDS,
+            partitioned=True,
+            batch_size=5,
+            max_file_bytes=1,
         )
 
         rows = read_parquet(out_dir)
@@ -1030,8 +1301,12 @@ class TestParquetFileSplitting:
         gen, _ = _build_generator_with_features(features, min_zoom=0, max_zoom=2)
         out_dir = tmp_path / "filter"
         total = generate_parquet(
-            gen, out_dir, WORLD_BOUNDS,
-            partitioned=True, batch_size=5, max_file_bytes=1,
+            gen,
+            out_dir,
+            WORLD_BOUNDS,
+            partitioned=True,
+            batch_size=5,
+            max_file_bytes=1,
         )
 
         rows = read_parquet(out_dir, zoom=2)
@@ -1046,15 +1321,23 @@ class TestParquetFileSplitting:
         gen1, fids1 = _build_generator_with_features(features, min_zoom=0, max_zoom=2)
         out_big = tmp_path / "big"
         count_big = generate_parquet(
-            gen1, out_big, WORLD_BOUNDS,
-            partitioned=True, batch_size=10, max_file_bytes=10**18,  # effectively no split
+            gen1,
+            out_big,
+            WORLD_BOUNDS,
+            partitioned=True,
+            batch_size=10,
+            max_file_bytes=10**18,  # effectively no split
         )
 
         gen2, fids2 = _build_generator_with_features(features, min_zoom=0, max_zoom=2)
         out_split = tmp_path / "split"
         count_split = generate_parquet(
-            gen2, out_split, WORLD_BOUNDS,
-            partitioned=True, batch_size=10, max_file_bytes=1,  # always split
+            gen2,
+            out_split,
+            WORLD_BOUNDS,
+            partitioned=True,
+            batch_size=10,
+            max_file_bytes=1,  # always split
         )
 
         assert count_big == count_split
@@ -1088,6 +1371,7 @@ class TestParquetFileSplitting:
 # Repartition tests
 # ---------------------------------------------------------------------------
 
+
 class TestRepartitionParquet:
     """Test repartition_parquet() for splitting existing pyramids."""
 
@@ -1107,6 +1391,7 @@ class TestRepartitionParquet:
 
         # Verify all files are part_NNN.parquet
         import re
+
         for z in range(3):
             parts = sorted((out_dir / f"zoom={z}").glob("*.parquet"))
             assert len(parts) == result[z]
@@ -1143,37 +1428,33 @@ class TestRepartitionParquet:
         # Manually write a legacy data.parquet
         zoom_dir = out_dir / "zoom=0"
         zoom_dir.mkdir()
-        from mudm_tools.tiling3d.parquet_writer import generate_parquet as gen_pq
-        gen2, _ = _build_generator_with_features([
-            _make_tin_feature(
-                [0.1, 0.2, 0.3, 0.4, 0.5, 0.6],
-                [0.1, 0.2, 0.3],
-                [3],
-            ),
-        ], min_zoom=0, max_zoom=0)
+        gen2, _ = _build_generator_with_features(
+            [
+                _make_tin_feature(
+                    [0.1, 0.2, 0.3, 0.4, 0.5, 0.6],
+                    [0.1, 0.2, 0.3],
+                    [3],
+                ),
+            ],
+            min_zoom=0,
+            max_zoom=0,
+        )
 
         # Write using old-style naming by creating a fake data.parquet
         import pyarrow as pa
-        schema = pa.schema([
-            pa.field("tile_x", pa.uint16()),
-            pa.field("tile_y", pa.uint16()),
-            pa.field("tile_d", pa.uint16()),
-            pa.field("feature_id", pa.uint32()),
-            pa.field("geom_type", pa.uint8()),
-            pa.field("positions", pa.large_binary()),
-            pa.field("indices", pa.large_binary()),
-            pa.field("tags", pa.map_(pa.utf8(), pa.utf8())),
-        ])
-        table = pa.table({
-            "tile_x": pa.array([0], type=pa.uint16()),
-            "tile_y": pa.array([0], type=pa.uint16()),
-            "tile_d": pa.array([0], type=pa.uint16()),
-            "feature_id": pa.array([0], type=pa.uint32()),
-            "geom_type": pa.array([5], type=pa.uint8()),
-            "positions": pa.array([b"\x00" * 12], type=pa.large_binary()),
-            "indices": pa.array([b"\x00" * 12], type=pa.large_binary()),
-            "tags": pa.array([[(b"k", b"v")]], type=pa.map_(pa.utf8(), pa.utf8())),
-        })
+
+        table = pa.table(
+            {
+                "tile_x": pa.array([0], type=pa.uint16()),
+                "tile_y": pa.array([0], type=pa.uint16()),
+                "tile_d": pa.array([0], type=pa.uint16()),
+                "feature_id": pa.array([0], type=pa.uint32()),
+                "geom_type": pa.array([5], type=pa.uint8()),
+                "positions": pa.array([b"\x00" * 12], type=pa.large_binary()),
+                "indices": pa.array([b"\x00" * 12], type=pa.large_binary()),
+                "tags": pa.array([[(b"k", b"v")]], type=pa.map_(pa.utf8(), pa.utf8())),
+            }
+        )
         pq.write_table(table, str(zoom_dir / "data.parquet"), compression="zstd")
 
         assert (zoom_dir / "data.parquet").exists()
@@ -1207,3 +1488,95 @@ class TestRepartitionParquet:
         f.write_text("hi")
         with pytest.raises(NotADirectoryError):
             repartition_parquet(f)
+
+
+class TestMemoryCeilingPlumbing:
+    """WS-0 Task 0.2: the resolved memory ceiling is plumbed into the
+    generators + Python without changing default behavior."""
+
+    def test_set_and_get_max_memory(self, tmp_path):
+        """_set_max_memory / _get_max_memory round-trip; default is sane."""
+        gen, _ = _build_generator_with_features([_make_dense_tin_feature()])
+        # Default resolves via detect_max_memory_bytes(0) -> >= 1 GiB.
+        assert gen._get_max_memory() >= 1024 * 1024 * 1024
+        gen._set_max_memory(4 * 1024 * 1024 * 1024)
+        assert gen._get_max_memory() == 4 * 1024 * 1024 * 1024
+
+    def test_generate_3dtiles_default_unchanged(self, tmp_path):
+        """generate_3dtiles still succeeds with the resolver-backed default
+        (max_memory_gb=0) — behavior preserved."""
+        gen, _ = _build_generator_with_features([_make_dense_tin_feature()])
+        out = tmp_path / "tiles3d"
+        n = gen.generate_3dtiles(str(out), WORLD_BOUNDS)
+        assert n > 0
+        assert (out / "tileset.json").exists()
+
+    def test_generate_neuroglancer_multilod_accepts_max_memory(self, tmp_path):
+        """generate_neuroglancer_multilod accepts the new max_memory_bytes
+        kwarg (default 0 -> resolver) without changing behavior."""
+        gen, _ = _build_generator_with_features([_make_dense_tin_feature()])
+        out = tmp_path / "ng"
+        # Explicit default and an explicit value both succeed identically.
+        n = gen.generate_neuroglancer_multilod(
+            str(out),
+            WORLD_BOUNDS,
+            10,
+            0,
+        )
+        assert n > 0
+
+    def test_parquet_default_derives_from_generator_ceiling(self, tmp_path):
+        """A tiny generator ceiling makes the partitioned writer chunk, but
+        output stays byte-identical to the explicit-budget path."""
+        feat = _make_dense_tin_feature(n_triangles=12)
+        gen_a, _ = _build_generator_with_features([feat])
+        gen_b, _ = _build_generator_with_features([feat])
+        # gen_a uses the default (derived) budget; gen_b forces a tiny ceiling.
+        gen_b._set_max_memory(1)
+
+        out_a = tmp_path / "a.parquet"
+        out_b = tmp_path / "b.parquet"
+        n_a = generate_parquet(gen_a, out_a, WORLD_BOUNDS)
+        n_b = generate_parquet(gen_b, out_b, WORLD_BOUNDS)
+        assert n_a == n_b > 0
+
+        def _canon(rows):
+            return sorted(
+                (
+                    r["zoom"],
+                    r["tile_x"],
+                    r["tile_y"],
+                    r["tile_d"],
+                    r["feature_id"],
+                    r["geom_type"],
+                    r["positions"].tobytes(),
+                    r["indices"].tobytes(),
+                )
+                for r in rows
+            )
+
+        assert _canon(read_parquet(out_a)) == _canon(read_parquet(out_b))
+
+
+def test_parentid_survives_parquet(tmp_path):
+    """Top-level MuDMFeature.parentId must round-trip into Parquet tags as _parent_id."""
+    feat = _make_tin_feature(
+        [0.1, 0.1, 0.2, 0.1, 0.2, 0.2],
+        [0.1, 0.1, 0.1],
+        [3],
+        tags={"color": "red"},
+    )
+    # Add the top-level muDM field that the Rust extractor should promote.
+    feat["parentId"] = "neuron_17"
+
+    gen, _ = _build_generator_with_features([feat])
+    out = tmp_path / "neurons.parquet"
+    generate_parquet(gen, out, WORLD_BOUNDS)
+
+    table = pq.read_table(str(out))
+    tags_col = table.column("tags").to_pylist()
+    assert len(tags_col) > 0
+    for tags in tags_col:
+        kv = {k: v for k, v in tags}
+        assert kv.get("_parent_id") == "neuron_17", f"got {kv}"
+        assert kv.get("color") == "red"

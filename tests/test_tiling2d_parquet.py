@@ -3,13 +3,11 @@
 from __future__ import annotations
 
 import json
-import struct
 import tempfile
 from pathlib import Path
 
 import numpy as np
 import pyarrow as pa
-import pyarrow.parquet as pq
 import pytest
 
 from mudm_tools._rs import CartesianProjector2D, StreamingTileGenerator2D
@@ -17,10 +15,10 @@ from mudm_tools.tiling2d.parquet_writer import generate_parquet, _parquet_schema
 from mudm_tools.tiling2d.parquet_reader import read_parquet
 from mudm_tools.tiling2d.parquet_prime import prime_parquet, deprime_parquet, repartition_parquet
 
-
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
+
 
 @pytest.fixture
 def tmp_dir():
@@ -34,8 +32,10 @@ def _make_point_feature(x: float, y: float, tags: dict | None = None):
         "xy": [x, y],
         "geom_type": 1,
         "ring_lengths": [],
-        "min_x": x, "min_y": y,
-        "max_x": x, "max_y": y,
+        "min_x": x,
+        "min_y": y,
+        "max_x": x,
+        "max_y": y,
         "tags": tags or {},
     }
 
@@ -55,8 +55,10 @@ def _make_line_feature(coords: list[tuple[float, float]], tags: dict | None = No
         "xy": xy,
         "geom_type": 2,
         "ring_lengths": [],
-        "min_x": min_x, "min_y": min_y,
-        "max_x": max_x, "max_y": max_y,
+        "min_x": min_x,
+        "min_y": min_y,
+        "max_x": max_x,
+        "max_y": max_y,
         "tags": tags or {},
     }
 
@@ -79,8 +81,10 @@ def _make_polygon_feature(rings: list[list[tuple[float, float]]], tags: dict | N
         "xy": xy,
         "geom_type": 3,
         "ring_lengths": ring_lengths,
-        "min_x": min_x, "min_y": min_y,
-        "max_x": max_x, "max_y": max_y,
+        "min_x": min_x,
+        "min_y": min_y,
+        "max_x": max_x,
+        "max_y": max_y,
         "tags": tags or {},
     }
 
@@ -89,14 +93,21 @@ def _make_polygon_feature(rings: list[list[tuple[float, float]]], tags: dict | N
 # Schema validation
 # ---------------------------------------------------------------------------
 
+
 class TestSchema:
     def test_schema_columns(self):
         schema = _parquet_schema()
         names = [f.name for f in schema]
         assert names == [
-            "zoom", "tile_x", "tile_y", "feature_id",
-            "geom_type", "positions", "indices",
-            "ring_lengths", "tags",
+            "zoom",
+            "tile_x",
+            "tile_y",
+            "feature_id",
+            "geom_type",
+            "positions",
+            "indices",
+            "ring_lengths",
+            "tags",
         ]
 
     def test_schema_types(self):
@@ -115,6 +126,7 @@ class TestSchema:
 # ---------------------------------------------------------------------------
 # Point encoding
 # ---------------------------------------------------------------------------
+
 
 class TestPointEncoding:
     def test_single_point(self, tmp_dir):
@@ -170,6 +182,7 @@ class TestPointEncoding:
 # LineString encoding
 # ---------------------------------------------------------------------------
 
+
 class TestLineStringEncoding:
     def test_linestring_indices(self, tmp_dir):
         gen = StreamingTileGenerator2D(min_zoom=0, max_zoom=0)
@@ -193,6 +206,7 @@ class TestLineStringEncoding:
 # ---------------------------------------------------------------------------
 # Polygon encoding
 # ---------------------------------------------------------------------------
+
 
 class TestPolygonEncoding:
     def test_polygon_ring_lengths(self, tmp_dir):
@@ -236,6 +250,7 @@ class TestPolygonEncoding:
 # Quadtree tiling correctness
 # ---------------------------------------------------------------------------
 
+
 class TestQuadtreeTiling:
     def test_point_correct_tile(self, tmp_dir):
         gen = StreamingTileGenerator2D(min_zoom=0, max_zoom=2)
@@ -272,6 +287,7 @@ class TestQuadtreeTiling:
 # World-coordinate round-trip
 # ---------------------------------------------------------------------------
 
+
 class TestWorldCoordRoundtrip:
     def test_round_trip(self, tmp_dir):
         bounds = (10.0, 20.0, 110.0, 220.0)
@@ -295,6 +311,7 @@ class TestWorldCoordRoundtrip:
 # ---------------------------------------------------------------------------
 # Streaming API
 # ---------------------------------------------------------------------------
+
 
 class TestStreamingAPI:
     def test_streaming_single_file(self, tmp_dir):
@@ -322,8 +339,11 @@ class TestStreamingAPI:
 
         out = tmp_dir / "partitioned"
         n = generate_parquet(
-            gen, out, (0.0, 0.0, 1.0, 1.0),
-            partitioned=True, batch_size=5,
+            gen,
+            out,
+            (0.0, 0.0, 1.0, 1.0),
+            partitioned=True,
+            batch_size=5,
         )
         assert n > 0
 
@@ -338,6 +358,7 @@ class TestStreamingAPI:
 # ---------------------------------------------------------------------------
 # Predicate pushdown
 # ---------------------------------------------------------------------------
+
 
 class TestPredicatePushdown:
     def test_filter_zoom(self, tmp_dir):
@@ -374,14 +395,17 @@ class TestPredicatePushdown:
 # GeoJSON ingestion
 # ---------------------------------------------------------------------------
 
+
 class TestGeoJsonIngestion:
     def test_add_geojson_point(self, tmp_dir):
         gen = StreamingTileGenerator2D(min_zoom=0, max_zoom=1)
-        geojson = json.dumps({
-            "type": "Feature",
-            "geometry": {"type": "Point", "coordinates": [50.0, 50.0]},
-            "properties": {"label": "center"},
-        })
+        geojson = json.dumps(
+            {
+                "type": "Feature",
+                "geometry": {"type": "Point", "coordinates": [50.0, 50.0]},
+                "properties": {"label": "center"},
+            }
+        )
         fids = gen.add_geojson(geojson, (0.0, 0.0, 100.0, 100.0))
         assert len(fids) == 1
 
@@ -395,21 +419,26 @@ class TestGeoJsonIngestion:
 
     def test_add_geojson_feature_collection(self, tmp_dir):
         gen = StreamingTileGenerator2D(min_zoom=0, max_zoom=0)
-        geojson = json.dumps({
-            "type": "FeatureCollection",
-            "features": [
-                {
-                    "type": "Feature",
-                    "geometry": {"type": "Point", "coordinates": [25.0, 25.0]},
-                    "properties": {"name": "a"},
-                },
-                {
-                    "type": "Feature",
-                    "geometry": {"type": "LineString", "coordinates": [[0.0, 0.0], [100.0, 100.0]]},
-                    "properties": {"name": "b"},
-                },
-            ],
-        })
+        geojson = json.dumps(
+            {
+                "type": "FeatureCollection",
+                "features": [
+                    {
+                        "type": "Feature",
+                        "geometry": {"type": "Point", "coordinates": [25.0, 25.0]},
+                        "properties": {"name": "a"},
+                    },
+                    {
+                        "type": "Feature",
+                        "geometry": {
+                            "type": "LineString",
+                            "coordinates": [[0.0, 0.0], [100.0, 100.0]],
+                        },
+                        "properties": {"name": "b"},
+                    },
+                ],
+            }
+        )
         fids = gen.add_geojson(geojson, (0.0, 0.0, 100.0, 100.0))
         assert len(fids) == 2
 
@@ -419,14 +448,16 @@ class TestGeoJsonIngestion:
 
     def test_add_geojson_polygon(self, tmp_dir):
         gen = StreamingTileGenerator2D(min_zoom=0, max_zoom=0)
-        geojson = json.dumps({
-            "type": "Feature",
-            "geometry": {
-                "type": "Polygon",
-                "coordinates": [[[0.0, 0.0], [100.0, 0.0], [100.0, 100.0], [0.0, 100.0]]],
-            },
-            "properties": {},
-        })
+        geojson = json.dumps(
+            {
+                "type": "Feature",
+                "geometry": {
+                    "type": "Polygon",
+                    "coordinates": [[[0.0, 0.0], [100.0, 0.0], [100.0, 100.0], [0.0, 100.0]]],
+                },
+                "properties": {},
+            }
+        )
         fids = gen.add_geojson(geojson, (0.0, 0.0, 100.0, 100.0))
         assert len(fids) == 1
 
@@ -439,17 +470,19 @@ class TestGeoJsonIngestion:
 
     def test_add_geojson_multipolygon(self, tmp_dir):
         gen = StreamingTileGenerator2D(min_zoom=0, max_zoom=0)
-        geojson = json.dumps({
-            "type": "Feature",
-            "geometry": {
-                "type": "MultiPolygon",
-                "coordinates": [
-                    [[[0.0, 0.0], [50.0, 0.0], [50.0, 50.0], [0.0, 50.0]]],
-                    [[[50.0, 50.0], [100.0, 50.0], [100.0, 100.0], [50.0, 100.0]]],
-                ],
-            },
-            "properties": {"name": "multi"},
-        })
+        geojson = json.dumps(
+            {
+                "type": "Feature",
+                "geometry": {
+                    "type": "MultiPolygon",
+                    "coordinates": [
+                        [[[0.0, 0.0], [50.0, 0.0], [50.0, 50.0], [0.0, 50.0]]],
+                        [[[50.0, 50.0], [100.0, 50.0], [100.0, 100.0], [50.0, 100.0]]],
+                    ],
+                },
+                "properties": {"name": "multi"},
+            }
+        )
         fids = gen.add_geojson(geojson, (0.0, 0.0, 100.0, 100.0))
         assert len(fids) == 1
 
@@ -466,6 +499,7 @@ class TestGeoJsonIngestion:
 # ---------------------------------------------------------------------------
 # Edge cases
 # ---------------------------------------------------------------------------
+
 
 class TestEdgeCases:
     def test_empty_generator(self, tmp_dir):
@@ -498,6 +532,7 @@ class TestEdgeCases:
 # ---------------------------------------------------------------------------
 # Prime / deprime / repartition
 # ---------------------------------------------------------------------------
+
 
 class TestPrime:
     def test_prime_deprime(self, tmp_dir):
@@ -544,6 +579,7 @@ class TestPrime:
 # CartesianProjector2D
 # ---------------------------------------------------------------------------
 
+
 class TestProjector2D:
     def test_project_unproject(self):
         proj = CartesianProjector2D((10.0, 20.0, 110.0, 220.0))
@@ -559,6 +595,7 @@ class TestProjector2D:
 # ---------------------------------------------------------------------------
 # Integration: load example.json
 # ---------------------------------------------------------------------------
+
 
 class TestIntegration:
     @pytest.fixture
@@ -619,6 +656,7 @@ class TestSimplify:
     def _make_jagged_polygon(self):
         """Create a polygon with many vertices that simplification can reduce."""
         import math
+
         # Jagged circle — lots of small deviations from a smooth curve
         n = 60
         ring = []
@@ -661,8 +699,11 @@ class TestSimplify:
 
         out = tmp_dir / "stream_no_simplify"
         n = generate_parquet(
-            gen, out, (0.0, 0.0, 1.0, 1.0),
-            partitioned=True, simplify=False,
+            gen,
+            out,
+            (0.0, 0.0, 1.0, 1.0),
+            partitioned=True,
+            simplify=False,
         )
         assert n > 0
 

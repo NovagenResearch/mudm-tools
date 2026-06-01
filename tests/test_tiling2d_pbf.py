@@ -14,10 +14,10 @@ from mudm_tools._rs import StreamingTileGenerator2D
 from mudm_tools.tiling2d.pbf_writer import generate_pbf
 from mudm_tools.tiling2d.pbf_reader import read_pbf
 
-
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
+
 
 @pytest.fixture
 def tmp_dir():
@@ -30,8 +30,10 @@ def _make_point_feature(x: float, y: float, tags: dict | None = None):
         "xy": [x, y],
         "geom_type": 1,
         "ring_lengths": [],
-        "min_x": x, "min_y": y,
-        "max_x": x, "max_y": y,
+        "min_x": x,
+        "min_y": y,
+        "max_x": x,
+        "max_y": y,
         "tags": tags or {},
     }
 
@@ -50,8 +52,10 @@ def _make_line_feature(coords: list[tuple[float, float]], tags: dict | None = No
         "xy": xy,
         "geom_type": 2,
         "ring_lengths": [],
-        "min_x": min_x, "min_y": min_y,
-        "max_x": max_x, "max_y": max_y,
+        "min_x": min_x,
+        "min_y": min_y,
+        "max_x": max_x,
+        "max_y": max_y,
         "tags": tags or {},
     }
 
@@ -73,8 +77,10 @@ def _make_polygon_feature(rings: list[list[tuple[float, float]]], tags: dict | N
         "xy": xy,
         "geom_type": 3,
         "ring_lengths": ring_lengths,
-        "min_x": min_x, "min_y": min_y,
-        "max_x": max_x, "max_y": max_y,
+        "min_x": min_x,
+        "min_y": min_y,
+        "max_x": max_x,
+        "max_y": max_y,
         "tags": tags or {},
     }
 
@@ -82,6 +88,7 @@ def _make_polygon_feature(rings: list[list[tuple[float, float]]], tags: dict | N
 # ---------------------------------------------------------------------------
 # Point round-trip
 # ---------------------------------------------------------------------------
+
 
 class TestPointRoundtrip:
     def test_single_point(self, tmp_dir):
@@ -120,6 +127,7 @@ class TestPointRoundtrip:
 # LineString round-trip
 # ---------------------------------------------------------------------------
 
+
 class TestLineStringRoundtrip:
     def test_linestring(self, tmp_dir):
         gen = StreamingTileGenerator2D(min_zoom=0, max_zoom=0)
@@ -144,6 +152,7 @@ class TestLineStringRoundtrip:
 # ---------------------------------------------------------------------------
 # Polygon round-trip
 # ---------------------------------------------------------------------------
+
 
 class TestPolygonRoundtrip:
     def test_polygon(self, tmp_dir):
@@ -184,6 +193,7 @@ class TestPolygonRoundtrip:
 # ---------------------------------------------------------------------------
 # Directory structure
 # ---------------------------------------------------------------------------
+
 
 class TestDirectoryStructure:
     def test_tile_paths(self, tmp_dir):
@@ -231,6 +241,7 @@ class TestDirectoryStructure:
 # Multi-tile tiling
 # ---------------------------------------------------------------------------
 
+
 class TestMultiTile:
     def test_polygon_spans_tiles(self, tmp_dir):
         gen = StreamingTileGenerator2D(min_zoom=0, max_zoom=1)
@@ -240,7 +251,7 @@ class TestMultiTile:
         gen.add_feature(feat)
 
         out = tmp_dir / "pbf_multi"
-        n = generate_pbf(gen, out, (0.0, 0.0, 1.0, 1.0))
+        generate_pbf(gen, out, (0.0, 0.0, 1.0, 1.0))
 
         # At zoom 1, should have tiles in all 4 quadrants
         rows_z1 = read_pbf(out, (0.0, 0.0, 1.0, 1.0), zoom=1)
@@ -251,6 +262,7 @@ class TestMultiTile:
 # ---------------------------------------------------------------------------
 # Zoom / tile filtering
 # ---------------------------------------------------------------------------
+
 
 class TestFiltering:
     def test_zoom_filter(self, tmp_dir):
@@ -286,6 +298,7 @@ class TestFiltering:
 # ---------------------------------------------------------------------------
 # Simplification
 # ---------------------------------------------------------------------------
+
 
 class TestSimplify:
     def _make_jagged_polygon(self):
@@ -323,27 +336,32 @@ class TestSimplify:
 # GeoJSON ingestion + PBF output
 # ---------------------------------------------------------------------------
 
+
 class TestGeoJsonIngestion:
     def test_geojson_to_pbf(self, tmp_dir):
         gen = StreamingTileGenerator2D(min_zoom=0, max_zoom=1)
-        geojson = json.dumps({
-            "type": "FeatureCollection",
-            "features": [
-                {
-                    "type": "Feature",
-                    "geometry": {"type": "Point", "coordinates": [50.0, 50.0]},
-                    "properties": {"label": "center"},
-                },
-                {
-                    "type": "Feature",
-                    "geometry": {
-                        "type": "Polygon",
-                        "coordinates": [[[0.0, 0.0], [100.0, 0.0], [100.0, 100.0], [0.0, 100.0]]],
+        geojson = json.dumps(
+            {
+                "type": "FeatureCollection",
+                "features": [
+                    {
+                        "type": "Feature",
+                        "geometry": {"type": "Point", "coordinates": [50.0, 50.0]},
+                        "properties": {"label": "center"},
                     },
-                    "properties": {"label": "box"},
-                },
-            ],
-        })
+                    {
+                        "type": "Feature",
+                        "geometry": {
+                            "type": "Polygon",
+                            "coordinates": [
+                                [[0.0, 0.0], [100.0, 0.0], [100.0, 100.0], [0.0, 100.0]]
+                            ],
+                        },
+                        "properties": {"label": "box"},
+                    },
+                ],
+            }
+        )
         fids = gen.add_geojson(geojson, (0.0, 0.0, 100.0, 100.0))
         assert len(fids) == 2
 
@@ -363,6 +381,7 @@ class TestGeoJsonIngestion:
 # ---------------------------------------------------------------------------
 # Edge cases
 # ---------------------------------------------------------------------------
+
 
 class TestEdgeCases:
     def test_empty_generator(self, tmp_dir):

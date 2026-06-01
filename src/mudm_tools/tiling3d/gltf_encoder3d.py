@@ -7,7 +7,6 @@ back to MuDMFeatures in world coordinates and delegates to the existing
 
 from __future__ import annotations
 
-from typing import Any
 
 from geojson_pydantic import LineString, Point, Polygon
 
@@ -36,7 +35,7 @@ def _rebuild_point(feat: dict, proj: CartesianProjector3D) -> MuDMFeature:
     coords = _unproject_coords(feat, proj)
     return MuDMFeature(
         type="Feature",
-        geometry=Point(type="Point", coordinates=coords[0]),
+        geometry=Point(type="Point", coordinates=coords[0]),  # type: ignore[arg-type]  # geojson-pydantic accepts coord lists
         properties=feat.get("tags", {}),
     )
 
@@ -45,7 +44,7 @@ def _rebuild_line(feat: dict, proj: CartesianProjector3D) -> MuDMFeature:
     coords = _unproject_coords(feat, proj)
     return MuDMFeature(
         type="Feature",
-        geometry=LineString(type="LineString", coordinates=coords),
+        geometry=LineString(type="LineString", coordinates=coords),  # type: ignore[arg-type]  # geojson-pydantic accepts coord lists
         properties=feat.get("tags", {}),
     )
 
@@ -55,7 +54,7 @@ def _rebuild_polygon(feat: dict, proj: CartesianProjector3D) -> MuDMFeature:
     rings = _split_rings(coords, feat.get("ring_lengths", [len(coords)]))
     return MuDMFeature(
         type="Feature",
-        geometry=Polygon(type="Polygon", coordinates=rings),
+        geometry=Polygon(type="Polygon", coordinates=rings),  # type: ignore[arg-type]  # geojson-pydantic accepts coord lists
         properties=feat.get("tags", {}),
     )
 
@@ -83,19 +82,21 @@ def _rebuild_polyhedral(feat: dict, proj: CartesianProjector3D) -> MuDMFeature:
 
 
 def _split_rings(
-    coords: list[list[float]], ring_lengths: list[int],
+    coords: list[list[float]],
+    ring_lengths: list[int],
 ) -> list[list[list[float]]]:
     """Split flat coord list into rings by ring_lengths."""
     rings: list[list[list[float]]] = []
     offset = 0
     for length in ring_lengths:
-        rings.append(coords[offset:offset + length])
+        rings.append(coords[offset : offset + length])
         offset += length
     return rings
 
 
 def _split_faces(
-    coords: list[list[float]], ring_lengths: list[int],
+    coords: list[list[float]],
+    ring_lengths: list[int],
 ) -> list[list[list[list[float]]]]:
     """Split flat coord list into TIN/PolyhedralSurface faces.
 
@@ -104,7 +105,7 @@ def _split_faces(
     faces: list[list[list[list[float]]]] = []
     offset = 0
     for length in ring_lengths:
-        ring = coords[offset:offset + length]
+        ring = coords[offset : offset + length]
         faces.append([ring])
         offset += length
     return faces
@@ -168,8 +169,10 @@ def tile_to_glb(
             geom = mf.geometry
             if isinstance(geom, (TIN, PolyhedralSurface)):
                 simplified = decimate_tin(
-                    geom.coordinates, simplify_ratio,
-                    world_bounds=world_bounds, zoom=zoom,
+                    geom.coordinates,
+                    simplify_ratio,
+                    world_bounds=world_bounds,
+                    zoom=zoom,
                 )
                 geom.coordinates = simplified
 

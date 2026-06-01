@@ -14,10 +14,10 @@ from mudm.model import MuDMFeature, MuDMFeatureCollection, TIN
 from mudm_tools.tiling3d import TileGenerator3D, OctreeConfig
 from mudm_tools.tiling3d.generator3d import _MIN_TILES_FOR_MP
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _point_feature(x: float, y: float, z: float, **props) -> MuDMFeature:
     return MuDMFeature(
@@ -85,6 +85,7 @@ def _collect_tiles(output_dir: Path, ext: str) -> dict[str, bytes]:
 # Tests: workers parameter
 # ---------------------------------------------------------------------------
 
+
 class TestWorkersParameter:
     """Test that the workers parameter is accepted and stored."""
 
@@ -118,6 +119,7 @@ class TestWorkersParameter:
 # ---------------------------------------------------------------------------
 # Tests: serial fallback for small tile counts
 # ---------------------------------------------------------------------------
+
 
 class TestSerialFallback:
     """Small collections should use serial path even with workers > 1."""
@@ -155,6 +157,7 @@ class TestSerialFallback:
 # Tests: bit-identical output (serial vs parallel)
 # ---------------------------------------------------------------------------
 
+
 class TestBitIdentical:
     """Parallel output must match serial output byte-for-byte."""
 
@@ -180,18 +183,18 @@ class TestBitIdentical:
         count_parallel = gen_parallel.generate(parallel_dir)
 
         assert count_serial == count_parallel
-        assert count_serial >= _MIN_TILES_FOR_MP, (
-            f"Need >= {_MIN_TILES_FOR_MP} tiles to test parallel path, got {count_serial}"
-        )
+        assert (
+            count_serial >= _MIN_TILES_FOR_MP
+        ), f"Need >= {_MIN_TILES_FOR_MP} tiles to test parallel path, got {count_serial}"
 
         serial_tiles = _collect_tiles(serial_dir, "pbf3")
         parallel_tiles = _collect_tiles(parallel_dir, "pbf3")
 
         assert set(serial_tiles.keys()) == set(parallel_tiles.keys())
         for path in serial_tiles:
-            assert serial_tiles[path] == parallel_tiles[path], (
-                f"Tile {path} differs between serial and parallel"
-            )
+            assert (
+                serial_tiles[path] == parallel_tiles[path]
+            ), f"Tile {path} differs between serial and parallel"
 
     def test_pbf3_tin_bit_identical(self, tmp_path):
         collection = _large_tin_collection(30)
@@ -219,9 +222,9 @@ class TestBitIdentical:
 
         assert set(serial_tiles.keys()) == set(parallel_tiles.keys())
         for path in serial_tiles:
-            assert serial_tiles[path] == parallel_tiles[path], (
-                f"TIN tile {path} differs between serial and parallel"
-            )
+            assert (
+                serial_tiles[path] == parallel_tiles[path]
+            ), f"TIN tile {path} differs between serial and parallel"
 
     def test_3dtiles_bit_identical(self, tmp_path):
         collection = _large_point_collection(50)
@@ -251,14 +254,15 @@ class TestBitIdentical:
 
         assert set(serial_tiles.keys()) == set(parallel_tiles.keys())
         for path in serial_tiles:
-            assert serial_tiles[path] == parallel_tiles[path], (
-                f"3dtiles tile {path} differs between serial and parallel"
-            )
+            assert (
+                serial_tiles[path] == parallel_tiles[path]
+            ), f"3dtiles tile {path} differs between serial and parallel"
 
 
 # ---------------------------------------------------------------------------
 # Tests: auto-detect workers
 # ---------------------------------------------------------------------------
+
 
 class TestAutoDetect:
     """workers=None should auto-detect and still produce correct output."""
@@ -289,6 +293,7 @@ class TestAutoDetect:
 # ---------------------------------------------------------------------------
 # Tests: workers=1 matches original behavior
 # ---------------------------------------------------------------------------
+
 
 class TestWorkersOneMatchesOriginal:
     """workers=1 should produce identical results to not specifying workers."""

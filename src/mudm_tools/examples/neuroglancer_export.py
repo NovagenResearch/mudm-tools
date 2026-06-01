@@ -15,7 +15,6 @@ served via HTTP and loaded with `precomputed://http://localhost:8080/...`
 from __future__ import annotations
 
 import argparse
-import json
 from pathlib import Path
 
 from mudm.model import (
@@ -25,7 +24,6 @@ from mudm.model import (
 from mudm_tools.swc import NeuronMorphology, SWCSample
 from mudm_tools.neuroglancer import (
     to_neuroglancer,
-    write_annotations,
     write_skeleton,
 )
 from mudm_tools.neuroglancer.state import (
@@ -35,10 +33,10 @@ from mudm_tools.neuroglancer.state import (
     viewer_state_to_url,
 )
 
-
 # ---------------------------------------------------------------------------
 # Sample data — coordinates in micrometers (realistic neuron scale)
 # ---------------------------------------------------------------------------
+
 
 def make_pyramidal_neuron() -> NeuronMorphology:
     """Create a sample pyramidal neuron (soma + dendrites + axon).
@@ -82,6 +80,7 @@ def make_interneuron() -> NeuronMorphology:
 # Example 1: Single skeleton export
 # ---------------------------------------------------------------------------
 
+
 def example_single_skeleton(output_dir: Path) -> None:
     """Export a single neuron as a Neuroglancer skeleton."""
     print("=== Example 1: Single skeleton export ===")
@@ -92,13 +91,14 @@ def example_single_skeleton(output_dir: Path) -> None:
     write_skeleton(skel_dir, segment_id=1, morphology=neuron)
 
     print(f"  Written to: {skel_dir}/")
-    print(f"  Files: info (JSON), 1 (binary skeleton)")
+    print("  Files: info (JSON), 1 (binary skeleton)")
     print()
 
 
 # ---------------------------------------------------------------------------
 # Example 2: Mixed collection export (orchestrator)
 # ---------------------------------------------------------------------------
+
 
 def example_mixed_collection(output_dir: Path) -> None:
     """Export a collection with neurons + point markers + line traces."""
@@ -145,7 +145,7 @@ def example_mixed_collection(output_dir: Path) -> None:
     # Export Point/LineString annotations via orchestrator
     result = to_neuroglancer(collection, mixed_dir)
 
-    print(f"  Output paths:")
+    print("  Output paths:")
     print(f"    skeletons: {skel_dir}/")
     for key, path in result["paths"].items():
         print(f"    {key}: {path}/")
@@ -155,6 +155,7 @@ def example_mixed_collection(output_dir: Path) -> None:
 # ---------------------------------------------------------------------------
 # Example 3: Viewer URL generation
 # ---------------------------------------------------------------------------
+
 
 def example_viewer_url(output_dir: Path) -> None:
     """Generate a Neuroglancer viewer state URL."""
@@ -195,10 +196,9 @@ def example_viewer_url(output_dir: Path) -> None:
 # Main
 # ---------------------------------------------------------------------------
 
+
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Export MuDM to Neuroglancer precomputed format"
-    )
+    parser = argparse.ArgumentParser(description="Export MuDM to Neuroglancer precomputed format")
     parser.add_argument(
         "--output-dir",
         default="neuroglancer_output",

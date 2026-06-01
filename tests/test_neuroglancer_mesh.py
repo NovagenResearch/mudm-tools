@@ -27,7 +27,6 @@ from mudm_tools.neuroglancer.mesh_writer import (
     write_mesh_info,
 )
 
-
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -279,7 +278,9 @@ class TestFragmentsToMesh:
         verts, _ = fragments_to_mesh([frag], bounds)
         # v0: (10 + 0.5*100, 20 + 0.5*100, 30 + 0.5*100) = (60, 70, 80)
         np.testing.assert_array_almost_equal(
-            verts[0], [60.0, 70.0, 80.0], decimal=0,
+            verts[0],
+            [60.0, 70.0, 80.0],
+            decimal=0,
         )
 
 
@@ -293,7 +294,6 @@ class TestEndToEnd:
 
     def _make_tin_feature(self, xy, z, ring_lengths, tags=None):
         """Build a feature dict for add_feature()."""
-        import numpy as np
         xs = [xy[i * 2] for i in range(len(z))]
         ys = [xy[i * 2 + 1] for i in range(len(z))]
         return {

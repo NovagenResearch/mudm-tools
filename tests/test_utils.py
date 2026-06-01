@@ -2,6 +2,7 @@
 
 Set up all data used in tests.
 """
+
 import shutil
 import tempfile
 from pathlib import Path
@@ -10,7 +11,8 @@ import pytest
 
 HAS_BFIO = False
 try:
-    import bfio
+    import bfio  # noqa: F401
+
     HAS_BFIO = True
     import numpy as np
     import skimage as sk
@@ -39,6 +41,7 @@ def inp_dir() -> Union[str, Path]:
     """Create directory for saving intensity images."""
     return Path(tempfile.mkdtemp(dir=Path.cwd()))
 
+
 @pytest.fixture()
 def output_directory() -> Union[str, Path]:
     """Create output directory."""
@@ -52,6 +55,7 @@ def image_sizes(request: pytest.FixtureRequest) -> pytest.FixtureRequest:
     """To get the parameter of the fixture."""
     return request.param
 
+
 @pytest.fixture()
 def synthetic_images(
     inp_dir: Union[str, Path],
@@ -62,7 +66,6 @@ def synthetic_images(
         im = np.zeros((image_sizes, image_sizes))
         blobs = sk.data.binary_blobs(
             length=image_sizes, volume_fraction=0.02, blob_size_fraction=0.03
-
         )
         im[blobs > 0] = 1
         binary_img = f"x01_y01_r{i}_c1.tif"
@@ -77,14 +80,14 @@ def get_params(request: pytest.FixtureRequest) -> pytest.FixtureRequest:
     """To get the parameter of the ome to json."""
     return request.param
 
-@pytest.mark.skipif(
-        not HAS_BFIO,
-        reason="Skipping test because 'bfio' extra is not installed.")
+
+@pytest.mark.skipif(not HAS_BFIO, reason="Skipping test because 'bfio' extra is not installed.")
 def test_OmeMicrojsonModel(synthetic_images: Path, output_directory: Path, get_params) -> None:
     from mudm_tools.utils import OmeMicrojsonModel
+
     """Testing of converting binary images to mudm objects polygon
     coordinates."""
-    
+
     inp_dir = synthetic_images
     for file in Path(inp_dir).iterdir():
         try:
@@ -98,16 +101,19 @@ def test_OmeMicrojsonModel(synthetic_images: Path, output_directory: Path, get_p
             print(e)
 
     if get_params == "encoding":
-        assert len(list(output_directory.rglob('*encoding*.json'))) == 5
+        assert len(list(output_directory.rglob("*encoding*.json"))) == 5
     else:
-        assert len(list(output_directory.rglob('*rectangle*.json'))) == 5
+        assert len(list(output_directory.rglob("*rectangle*.json"))) == 5
 
 
 @pytest.mark.skipif(not HAS_BFIO, reason="Skipping test because 'bfio' extra is not installed.")
-def test_MicrojsonBinaryModel(synthetic_images: Path, output_directory: Path, get_params:list[str]) -> None:
+def test_MicrojsonBinaryModel(
+    synthetic_images: Path, output_directory: Path, get_params: list[str]
+) -> None:
     from mudm_tools.utils import OmeMicrojsonModel, MicrojsonBinaryModel
+
     """Testing of converting mudm polygon coordinates of objects back to binary images."""
-    
+
     inp_dir = synthetic_images
     for file in Path(inp_dir).iterdir():
         model = OmeMicrojsonModel(
@@ -118,24 +124,23 @@ def test_MicrojsonBinaryModel(synthetic_images: Path, output_directory: Path, ge
         model.write_single_json()
 
     for file in Path(output_directory).iterdir():
-        model = MicrojsonBinaryModel(
-            out_dir=output_directory,
-            file_path=file
-        )
+        model = MicrojsonBinaryModel(out_dir=output_directory, file_path=file)
         model.microjson_to_binary()
 
-    assert len(list(output_directory.rglob('*tif'))) == 5
-    assert len(np.unique(sk.io.imread(list(output_directory.rglob('*tif'))[0]))) == 2
+    assert len(list(output_directory.rglob("*tif"))) == 5
+    assert len(np.unique(sk.io.imread(list(output_directory.rglob("*tif"))[0]))) == 2
 
 
 def XOR(x, y):
     return x ^ y
 
+
 @pytest.mark.skipif(not HAS_BFIO, reason="Skipping test because 'bfio' extra is not installed.")
 def test_roundtrip(synthetic_images: Path, output_directory: Path) -> None:
     from mudm_tools.utils import OmeMicrojsonModel, MicrojsonBinaryModel
+
     """Testing of reconstructed images from polygon coordinates with original images."""
-    
+
     inp_dir = synthetic_images
     for file in Path(inp_dir).iterdir():
         model = OmeMicrojsonModel(
@@ -159,4 +164,4 @@ def test_roundtrip(synthetic_images: Path, output_directory: Path) -> None:
             recimage = sk.io.imread(rec)
             ## Testing bitwise operation and return 1 if the two array are unique while 0 if they are similar
             byt_test = XOR(inpimage, recimage)
-            assert np.unique(byt_test)[0]== 0
+            assert np.unique(byt_test)[0] == 0

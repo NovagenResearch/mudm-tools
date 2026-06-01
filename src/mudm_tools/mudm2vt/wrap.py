@@ -13,9 +13,7 @@ def wrap(features, options):
     buffer = options.get("buffer") / options.get("extent")
     merged = features
     left = clip(features, 1, -1 - buffer, buffer, 0, -1, 2, options)  # left world copy
-    right = clip(
-        features, 1, 1 - buffer, 2 + buffer, 0, -1, 2, options
-    )  # right world copy
+    right = clip(features, 1, 1 - buffer, 2 + buffer, 0, -1, 2, options)  # right world copy
 
     if left is not None or right is not None:
         c = clip(features, 1, -buffer, 1 + buffer, 0, -1, 2, options)

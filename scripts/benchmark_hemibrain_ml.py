@@ -23,11 +23,14 @@ from __future__ import annotations
 import argparse
 import gc
 import json
+import os
 import platform
+import random
 import sys
 import time
 import tracemalloc
 from collections import Counter
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
@@ -38,6 +41,7 @@ import pyarrow.feather as feather
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from scipy.stats import ttest_rel
 from sklearn.metrics import f1_score
 from sklearn.model_selection import train_test_split
 from torch.utils.data import DataLoader, Dataset
@@ -594,16 +598,50 @@ def _build_label_map_and_splits(
 # ---------------------------------------------------------------------------
 
 
+def _parse_seeds(value: str) -> list[int]:
+    """Parse a comma-separated seed list to ``list[int]``.
+
+    Raises ``argparse.ArgumentTypeError`` if any entry is not a valid integer.
+    """
+    if not value or not value.strip():
+        raise argparse.ArgumentTypeError("--seeds must contain at least one integer")
+    out: list[int] = []
+    for tok in value.split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        try:
+            out.append(int(tok))
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError(
+                f"invalid integer in --seeds: {tok!r}"
+            ) from exc
+    if not out:
+        raise argparse.ArgumentTypeError("--seeds must contain at least one integer")
+    return out
+
+
 def run_benchmark(args: argparse.Namespace) -> dict:
     """Run the full benchmark across multiple seeds."""
 
     parquet_dir = Path(args.parquet_dir)
     obj_dir = Path(args.obj_dir)
     metadata_path = Path(args.metadata)
+    # ``args.seeds`` is parsed by argparse via ``_parse_seeds`` and is already
+    # a list[int].  Fall back to the legacy ``--seed`` / ``--num-seeds`` form
+    # only when the parsed list is empty (should never happen with type=).
     if args.seeds:
-        seeds = [int(s) for s in args.seeds.split(",")]
+        seeds = list(args.seeds)
     else:
         seeds = [args.seed + i for i in range(args.num_seeds)]
+
+    # --quick: shrink the workload for smoke tests.  Two epochs and a tiny
+    # cell-type cap keeps the run under a couple of minutes while still
+    # exercising the full code path (load -> train -> evaluate).
+    if args.quick:
+        args.epochs = min(args.epochs, 2)
+        if args.max_classes == 0:
+            args.max_classes = 3
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
@@ -628,17 +666,23 @@ def run_benchmark(args: argparse.Namespace) -> dict:
     parquet_runs: list[dict] = []
     arrow_runs: list[dict] = []
     obj_runs: list[dict] = []
+    # Nested per-seed view: per_seed_results[seed][loader_key] = {accuracy,
+    # macro_f1, load_time_s, epoch_time_s} -- used by the multi-seed
+    # aggregation block below.
+    per_seed_results: dict[int, dict[str, dict[str, float]]] = {}
 
     for run_idx, seed in enumerate(seeds):
         print(f"\n{'='*60}")
         print(f"Run {run_idx + 1}/{len(seeds)}  (seed={seed})")
         print(f"{'='*60}")
 
-        # Set seeds for reproducibility
+        # Set seeds for reproducibility (Python random, NumPy, Torch, CUDA)
+        random.seed(seed)
         np.random.seed(seed)
         torch.manual_seed(seed)
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(seed)
+        per_seed_results[seed] = {}
 
         # Re-split with this seed (keeps same label_map but shuffles splits)
         _, _, train_ids, val_ids, test_ids = _build_label_map_and_splits(
@@ -670,10 +714,17 @@ def run_benchmark(args: argparse.Namespace) -> dict:
         )
         pq_metrics["dataset_load_time_s"] = round(pq_load_time, 2)
         parquet_runs.append(pq_metrics)
+        per_seed_results[seed]["parquet"] = {
+            "accuracy": float(pq_metrics["test_accuracy"]),
+            "macro_f1": float(pq_metrics["test_f1_macro"]),
+            "load_time_s": float(pq_load_time),
+            "epoch_time_s": float(pq_metrics["mean_epoch_time_s"]),
+        }
         del train_pq, val_pq, test_pq
 
         # --- OBJ loader ---
         print(f"\n--- OBJ loader (seed={seed}) ---", flush=True)
+        random.seed(seed)
         np.random.seed(seed)
         torch.manual_seed(seed)
         if torch.cuda.is_available():
@@ -701,10 +752,17 @@ def run_benchmark(args: argparse.Namespace) -> dict:
         )
         obj_metrics["dataset_load_time_s"] = round(obj_load_time, 2)
         obj_runs.append(obj_metrics)
+        per_seed_results[seed]["raw_obj"] = {
+            "accuracy": float(obj_metrics["test_accuracy"]),
+            "macro_f1": float(obj_metrics["test_f1_macro"]),
+            "load_time_s": float(obj_load_time),
+            "epoch_time_s": float(obj_metrics["mean_epoch_time_s"]),
+        }
         del train_obj, val_obj, test_obj
 
         # --- Arrow IPC loader ---
         print(f"\n--- Arrow IPC loader (seed={seed}) ---", flush=True)
+        random.seed(seed)
         np.random.seed(seed)
         torch.manual_seed(seed)
         if torch.cuda.is_available():
@@ -732,10 +790,16 @@ def run_benchmark(args: argparse.Namespace) -> dict:
         )
         arrow_metrics["dataset_load_time_s"] = round(arrow_load_time, 2)
         arrow_runs.append(arrow_metrics)
+        per_seed_results[seed]["arrow_ipc"] = {
+            "accuracy": float(arrow_metrics["test_accuracy"]),
+            "macro_f1": float(arrow_metrics["test_f1_macro"]),
+            "load_time_s": float(arrow_load_time),
+            "epoch_time_s": float(arrow_metrics["mean_epoch_time_s"]),
+        }
         del train_arrow, val_arrow, test_arrow
         gc.collect()
 
-    # --- Aggregate across runs ---
+    # --- Aggregate across runs (legacy shape, kept for backward compat) ---
     def _aggregate(runs: list[dict]) -> dict:
         """Compute mean +/- std for each metric across runs."""
         keys = [
@@ -752,12 +816,100 @@ def run_benchmark(args: argparse.Namespace) -> dict:
         agg["training_history"] = runs[0]["training_history"]
         return agg
 
-    hardware = (
+    hardware_str = (
         f"{platform.processor() or platform.machine()} / "
         f"{'CUDA ' + torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'}"
     )
+    hardware = {
+        "description": hardware_str,
+        "platform": platform.platform(),
+        "processor": platform.processor() or platform.machine(),
+        "cpu_cores": os.cpu_count(),
+        "cuda_available": torch.cuda.is_available(),
+        "cuda_device_count": (
+            torch.cuda.device_count() if torch.cuda.is_available() else 0
+        ),
+        "cuda_device_name": (
+            torch.cuda.get_device_name(0) if torch.cuda.is_available() else None
+        ),
+    }
+
+    # --- Multi-seed summary statistics (B1 schema) -----------------------
+    def _seed_stats(loader_key: str) -> dict:
+        """Aggregate per-seed metrics for *loader_key* into mean/SD/per-seed."""
+        per_seed = [per_seed_results[s][loader_key] for s in seeds]
+        accs = [r["accuracy"] for r in per_seed]
+        f1s = [r["macro_f1"] for r in per_seed]
+        loads = [r["load_time_s"] for r in per_seed]
+        epochs = [r["epoch_time_s"] for r in per_seed]
+        return {
+            "accuracy_mean": float(np.mean(accs)),
+            # Sample SD (ddof=1); 0.0 when only one seed.
+            "accuracy_sd": (
+                float(np.std(accs, ddof=1)) if len(accs) > 1 else 0.0
+            ),
+            "macro_f1_mean": float(np.mean(f1s)),
+            "macro_f1_sd": (
+                float(np.std(f1s, ddof=1)) if len(f1s) > 1 else 0.0
+            ),
+            "load_time_mean_s": float(np.mean(loads)),
+            "load_time_sd_s": (
+                float(np.std(loads, ddof=1)) if len(loads) > 1 else 0.0
+            ),
+            "epoch_time_mean_s": float(np.mean(epochs)),
+            "epoch_time_sd_s": (
+                float(np.std(epochs, ddof=1)) if len(epochs) > 1 else 0.0
+            ),
+            "per_seed_accuracy": [float(x) for x in accs],
+            "per_seed_macro_f1": [float(x) for x in f1s],
+            "per_seed_load_time_s": [float(x) for x in loads],
+            "per_seed_epoch_time_s": [float(x) for x in epochs],
+        }
+
+    parquet_stats = _seed_stats("parquet")
+    arrow_stats = _seed_stats("arrow_ipc")
+    raw_obj_stats = _seed_stats("raw_obj")
+
+    # Paired t-test: Parquet vs raw OBJ accuracy (one paired observation
+    # per seed).  Only computable with >= 2 seeds.
+    pq_accs = [per_seed_results[s]["parquet"]["accuracy"] for s in seeds]
+    obj_accs = [per_seed_results[s]["raw_obj"]["accuracy"] for s in seeds]
+    if len(seeds) >= 2:
+        t_stat, p_val = ttest_rel(pq_accs, obj_accs)
+        # ttest_rel returns NaN when both arrays are identical; coerce to 0/1.
+        if np.isnan(t_stat) or np.isnan(p_val):
+            paired_t_test = {
+                "t_statistic": 0.0,
+                "p_value": 1.0,
+                "note": "identical samples; t-statistic undefined, p set to 1.0",
+            }
+        else:
+            paired_t_test = {
+                "t_statistic": float(t_stat),
+                "p_value": float(p_val),
+            }
+    else:
+        paired_t_test = {
+            "t_statistic": None,
+            "p_value": None,
+            "note": "fewer than 2 seeds; t-test not computed",
+        }
 
     results = {
+        "benchmark_id": "B1_hemibrain_5seed",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "hardware": hardware,
+        "config": {
+            "parquet_dir": str(parquet_dir),
+            "obj_dir": str(obj_dir),
+            "metadata": str(metadata_path),
+            "epochs": args.epochs,
+            "n_points": args.n_points,
+            "batch_size": args.batch_size,
+            "max_classes": args.max_classes,
+            "quick": bool(args.quick),
+            "seeds": seeds,
+        },
         "dataset": "hemibrain_v1.2.1",
         "n_points": args.n_points,
         "batch_size": args.batch_size,
@@ -768,11 +920,16 @@ def run_benchmark(args: argparse.Namespace) -> dict:
         "num_train": len(train_ids),
         "num_val": len(val_ids),
         "num_test": len(test_ids),
-        "hardware": hardware,
         "arrow_ipc_convert_time_s": round(arrow_convert_time, 2),
-        "parquet": _aggregate(parquet_runs),
-        "arrow_ipc": _aggregate(arrow_runs),
+        # B1 schema: per-loader mean / SD / per-seed lists.
+        "parquet": parquet_stats,
+        "arrow_ipc": arrow_stats,
+        "raw_obj": raw_obj_stats,
+        # Legacy schema retained for callers that still read these keys.
+        "parquet_legacy": _aggregate(parquet_runs),
+        "arrow_ipc_legacy": _aggregate(arrow_runs),
         "obj": _aggregate(obj_runs),
+        "paired_t_test_parquet_vs_raw": paired_t_test,
     }
 
     return results
@@ -800,39 +957,68 @@ def main() -> None:
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--n-points", type=int, default=1024)
     parser.add_argument("--batch-size", type=int, default=32)
-    parser.add_argument("--seed", type=int, default=42, help="Base seed (used when --seeds not provided)")
-    parser.add_argument("--seeds", type=str, default="", help="Comma-separated seed list (e.g. '42,123,456,789,1024')")
-    parser.add_argument("--num-seeds", type=int, default=5, help="Number of seeds when --seeds not provided")
-    parser.add_argument("--max-classes", type=int, default=0, help="Limit to top N cell types (0=all)")
     parser.add_argument(
-        "--output", type=str,
-        default="results/hemibrain_ml_benchmark.json",
-        help="Path to write JSON results",
+        "--seed", type=int, default=42,
+        help="Base seed (legacy; only used when --seeds is the empty string)",
+    )
+    parser.add_argument(
+        "--seeds", type=_parse_seeds, default=_parse_seeds("42,123,456,789,1024"),
+        help=(
+            "Comma-separated seed list (e.g. '42,123,456,789,1024'). "
+            "Default: 42,123,456,789,1024 -- the canonical B1 5-seed sweep."
+        ),
+    )
+    parser.add_argument(
+        "--num-seeds", type=int, default=5,
+        help="Number of seeds when --seeds not provided (legacy)",
+    )
+    parser.add_argument(
+        "--max-classes", type=int, default=0,
+        help="Limit to top N cell types (0=all)",
+    )
+    parser.add_argument(
+        "--quick", action="store_true",
+        help=(
+            "Smoke-test mode: cap epochs to 2 and limit max_classes to 3. "
+            "Intended only for sanity checks / CI."
+        ),
+    )
+    parser.add_argument(
+        "--output", type=str, default=None,
+        help=(
+            "Path to write JSON results. If omitted, the result dict is "
+            "printed to stdout."
+        ),
     )
     args = parser.parse_args()
 
     results = run_benchmark(args)
 
-    # Write output
-    output_path = Path(args.output)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(json.dumps(results, indent=2))
-    print(f"\nResults written to {output_path}")
+    # Write output (or print to stdout when --output is omitted).
+    if args.output:
+        output_path = Path(args.output)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(json.dumps(results, indent=2))
+        print(f"\nResults written to {output_path}")
+    else:
+        print(json.dumps(results, indent=2))
 
-    # Print summary
+    # Print summary (B1 schema)
     print(f"\n{'='*60}")
-    print(f"SUMMARY (mean +/- std over {results['num_seeds']} run(s))")
+    print(f"SUMMARY (mean +/- SD over {results['num_seeds']} seed(s))")
     print(f"{'='*60}")
-    for loader in ("parquet", "arrow_ipc", "obj"):
+    for loader, label in (("parquet", "PARQUET"), ("arrow_ipc", "ARROW_IPC"),
+                          ("raw_obj", "RAW_OBJ")):
         r = results[loader]
-        print(f"\n  {loader.upper()}:")
-        print(f"    Test accuracy:       {r['test_accuracy']:.4f} +/- {r['test_accuracy_std']:.4f}")
-        print(f"    Test F1 (macro):     {r['test_f1_macro']:.4f} +/- {r['test_f1_macro_std']:.4f}")
-        print(f"    Time to 1st batch:   {r['time_to_first_batch_ms']:.1f} +/- {r['time_to_first_batch_ms_std']:.1f} ms")
-        print(f"    Mean epoch time:     {r['mean_epoch_time_s']:.3f} +/- {r['mean_epoch_time_s_std']:.3f} s")
-        print(f"    Mean data load time: {r['mean_data_load_time_s']:.3f} +/- {r['mean_data_load_time_s_std']:.3f} s")
-        print(f"    Peak memory:         {r['peak_memory_mb']:.1f} +/- {r['peak_memory_mb_std']:.1f} MB")
-        print(f"    Dataset load time:   {r['dataset_load_time_s']:.1f} +/- {r['dataset_load_time_s_std']:.1f} s")
+        print(f"\n  {label}:")
+        print(f"    Test accuracy:    {r['accuracy_mean']:.4f} +/- {r['accuracy_sd']:.4f}")
+        print(f"    Test F1 (macro):  {r['macro_f1_mean']:.4f} +/- {r['macro_f1_sd']:.4f}")
+        print(f"    Load time (s):    {r['load_time_mean_s']:.3f}")
+        print(f"    Epoch time (s):   {r['epoch_time_mean_s']:.3f}")
+
+    tt = results["paired_t_test_parquet_vs_raw"]
+    print("\n  Paired t-test (parquet vs raw_obj accuracy):")
+    print(f"    t = {tt['t_statistic']}, p = {tt['p_value']}")
 
 
 if __name__ == "__main__":

@@ -13,7 +13,7 @@ from mudm.model import (
     TIN,
     PolyhedralSurface,
 )
-from geojson_pydantic import Point, LineString, Polygon, MultiPolygon
+from geojson_pydantic import Point, LineString
 
 
 class TestAffineTransform:
@@ -186,6 +186,7 @@ class TestApplyTransform3D:
         assert result.coordinates[0][0][0][0] == pytest.approx(5.0)
         assert result.coordinates[0][0][0][1] == pytest.approx(10.0)
         assert result.coordinates[0][0][0][2] == pytest.approx(15.0)
+
 
 class TestTranslateGeometry:
     """Tests for translate_geometry() convenience function."""

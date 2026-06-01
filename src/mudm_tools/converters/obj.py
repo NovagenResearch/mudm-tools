@@ -9,7 +9,6 @@ Source files:
 
 from __future__ import annotations
 
-import json
 import time
 from pathlib import Path
 from typing import Any
@@ -65,6 +64,7 @@ class ObjConverter:
         # Scan bounds if not provided
         if bounds is None:
             from mudm_tools._rs import scan_obj_bounds
+
             print("Scanning OBJ bounds...", end=" ", flush=True)
             t0 = time.time()
             bounds = scan_obj_bounds([str(f) for f in obj_files])
@@ -104,13 +104,15 @@ class ObjConverter:
         print(f"done ({t_tiles:.1f}s)", flush=True)
 
         # Generate Parquet
-        t_parquet = 0
+        t_parquet = 0.0
         if do_parquet:
             print("Encoding Parquet...", end=" ", flush=True)
             t0 = time.time()
             pq_dir = out_dir / "features.parquet"
             pq_rows = gen.generate_parquet_native(
-                str(pq_dir), bounds, simplify=True,
+                str(pq_dir),
+                bounds,
+                simplify=True,
             )
             t_parquet = time.time() - t0
             print(f"{pq_rows:,} rows ({t_parquet:.1f}s)", flush=True)

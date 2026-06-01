@@ -121,6 +121,7 @@ dependencies = [
  "arrow-schema",
  "arrow-select",
  "arrow-string",
+ "pyo3",
 ]
 
 [[package]]
@@ -278,6 +279,9 @@ name = "arrow-schema"
 version = "54.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cfaf5e440be44db5413b75b72c2a87c1f8f0627117d110264048f2969b99e9"
+dependencies = [
+ "bitflags 2.11.0",
+]
 
 [[package]]
 name = "arrow-select"
@@ -737,8 +741,6 @@ dependencies = [
 [[package]]
 name = "draco-oxide"
 version = "0.1.0-alpha.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "acbad1ec71b929aa0766554fdea06b3862ca8658ad8482aa0f803182760c2ae5"
 dependencies = [
  "base64 0.21.7",
  "draco-nd-vector",
@@ -1618,6 +1620,8 @@ dependencies = [
  "byteorder",
  "dashmap",
  "draco-oxide",
+ "gltf",
+ "libc",
  "memmap2",
  "meshopt",
  "numpy",

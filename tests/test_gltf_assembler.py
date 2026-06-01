@@ -18,7 +18,6 @@ from mudm_tools.gltf.gltf_assembler import (
 )
 from mudm_tools.gltf.models import GltfConfig
 
-
 FIXTURE_DIR = Path(__file__).parent / "fixtures"
 SAMPLE_SWC = FIXTURE_DIR / "sample_neuron.swc"
 
@@ -41,6 +40,7 @@ def _tin_feature(**props) -> MuDMFeature:
 def _tin_from_swc() -> MuDMFeature:
     """A TIN feature derived from SWC conversion."""
     from mudm_tools.swc import swc_to_tin
+
     return swc_to_tin(str(SAMPLE_SWC))
 
 
@@ -332,8 +332,14 @@ class TestGridLayout:
         return TIN(
             type="TIN",
             coordinates=[
-                [[(x_offset, 0, 0), (x_offset + width, 0, 0),
-                  (x_offset + width / 2, 10, 5), (x_offset, 0, 0)]],
+                [
+                    [
+                        (x_offset, 0, 0),
+                        (x_offset + width, 0, 0),
+                        (x_offset + width / 2, 10, 5),
+                        (x_offset, 0, 0),
+                    ]
+                ],
             ],
         )
 
@@ -448,6 +454,7 @@ class TestColorBy:
 
     def _colored_collection(self):
         """Three TIN features with different 'kind' property values."""
+
         def _make(kind_value):
             return MuDMFeature(
                 type="Feature",
@@ -459,6 +466,7 @@ class TestColorBy:
                 ),
                 properties={"kind": kind_value},
             )
+
         return MuDMFeatureCollection(
             type="FeatureCollection",
             features=[_make("alpha"), _make("beta"), _make("alpha")],

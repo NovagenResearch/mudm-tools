@@ -1,4 +1,5 @@
 """Tests for TiledGeometry base class and tiled mode on TIN/PolyhedralSurface."""
+
 import pytest
 from pydantic import ValidationError
 from mudm.model import TIN, PolyhedralSurface
@@ -93,7 +94,7 @@ class TestPolyhedralSurfaceTiledMode:
         assert len(p.coordinates) == 1
 
 
-from mudm_tools.tiling3d.tilejson3d import TileEncoding, TileModel3D
+from mudm_tools.tiling3d.tilejson3d import TileEncoding, TileModel3D  # noqa: E402
 
 
 class TestTileEncoding:
@@ -179,7 +180,9 @@ class TestTileModel3DEncodings:
             bounds3d=[8.0, 50776.0, 23224.0, 275424.0, 300544.0, 323680.0],
             encodings=[
                 TileEncoding(format="glb", compression="meshopt", path="3dtiles", extension=".glb"),
-                TileEncoding(format="parquet", compression="zstd", path="parquet", extension=".parquet"),
+                TileEncoding(
+                    format="parquet", compression="zstd", path="parquet", extension=".parquet"
+                ),
             ],
             zoom_counts={"0": 1, "1": 8, "2": 60},
             id_fields=["body_id", "instance"],
@@ -194,7 +197,7 @@ class TestTileModel3DEncodings:
         assert loaded.id_fields == ["body_id", "instance"]
 
 
-from mudm.tilemodel import PyramidEntry, PyramidJSON
+from mudm.tilemodel import PyramidEntry, PyramidJSON  # noqa: E402
 
 
 class TestPyramidJSON:
@@ -217,19 +220,24 @@ class TestPyramidJSON:
         assert entry.feature_count == 5099
 
     def test_pyramid_json_with_version(self):
-        manifest = PyramidJSON(pyramids=[
-            PyramidEntry(id="hemibrain"),
-            PyramidEntry(id="mouselight_2018-04-25"),
-        ])
+        manifest = PyramidJSON(
+            pyramids=[
+                PyramidEntry(id="hemibrain"),
+                PyramidEntry(id="mouselight_2018-04-25"),
+            ]
+        )
         assert manifest.version == "1.0"
         assert len(manifest.pyramids) == 2
 
     def test_pyramid_json_roundtrip(self):
         """Serialize to JSON and back."""
-        manifest = PyramidJSON(pyramids=[
-            PyramidEntry(id="test", label="Test Pyramid", tiles=100,
-                         feature_count=50, size_bytes=1000000),
-        ])
+        manifest = PyramidJSON(
+            pyramids=[
+                PyramidEntry(
+                    id="test", label="Test Pyramid", tiles=100, feature_count=50, size_bytes=1000000
+                ),
+            ]
+        )
         json_str = manifest.model_dump_json()
         loaded = PyramidJSON.model_validate_json(json_str)
         assert loaded.pyramids[0].id == "test"

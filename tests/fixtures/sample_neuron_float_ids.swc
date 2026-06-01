@@ -1,0 +1,4 @@
+# Sample SWC with float-formatted integer ids (NeuroMorpho convention)
+1.000000 1.000000 0.0 0.0 0.0 8.0 -1.000000
+2.000000 3.000000 10.0 5.0 2.0 2.0 1.000000
+3.000000 3.000000 20.0 10.0 5.0 1.5 2.000000

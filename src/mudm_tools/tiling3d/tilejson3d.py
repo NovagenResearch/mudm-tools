@@ -8,7 +8,6 @@ from pydantic import BaseModel, conlist
 
 from mudm.tilemodel import TileModel
 
-
 # --- Tile encoding types (semi-open enums) ---
 
 KnownTileFormat = Literal["glb", "parquet", "arrow", "neuroglancer-precomputed"]
@@ -25,6 +24,7 @@ class TileEncoding(BaseModel):
         path: Base path relative to the pyramid root directory.
         extension: File extension including the dot (e.g. ".glb", ".parquet").
     """
+
     format: Union[KnownTileFormat, str]
     compression: Optional[Union[KnownCompression, str]] = None
     path: str

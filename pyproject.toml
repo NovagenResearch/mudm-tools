@@ -33,10 +33,20 @@ dependencies = [
     "jsonschema>=4.23.0",
     "pygltflib>=1.16",
     "numpy>=1.26",
+    "scipy>=1.13",
+    "scikit-learn>=1.3",
 ]
 
 [project.optional-dependencies]
 draco = ["DracoPy>=1.4"]
+# Xenium spatial-transcriptomics converter (scripts/xenium_to_tiles.py +
+# converters/xenium.py). Optional: install with `pip install mudm-tools[xenium]`
+# or run tests with `uv run --extra xenium pytest`.
+xenium = [
+    "polars>=1.41.2",
+    "tifffile>=2026.3.3",
+    "pillow>=12.2.0",
+]
 
 [project.scripts]
 mudm-serve = "mudm_tools.serve:main"
@@ -60,3 +70,48 @@ where = ["src"]
 [tool.pytest.ini_options]
 testpaths = ["tests/"]
 pythonpath = ["src/", "scripts/"]
+
+# --- Lint / format / type-check ------------------------------------------
+# Enforced surface: the library (src/mudm_tools) + tests. Generated protobuf
+# (vt2pbf/mapbox/*_pb2.py — "DO NOT EDIT") and the research scripts/ are
+# excluded. Black owns line length (ruff E501 disabled to avoid conflicts).
+[tool.black]
+line-length = 100
+target-version = ["py311", "py312", "py313"]
+extend-exclude = '.*_pb2\.py$'
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+extend-exclude = ["*_pb2.py", "scripts"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W"]
+ignore = ["E501"]  # line length is managed by black
+
+[tool.mypy]
+python_version = "3.11"
+ignore_missing_imports = true
+exclude = ['_pb2\.py$']
+
+# tifffile (xenium extra) uses 3.12 `type` statements that mypy rejects under
+# python_version 3.11; don't analyze the lib's source (we only need its types).
+[[tool.mypy.overrides]]
+module = "tifffile.*"
+follow_imports = "skip"
+
+[dependency-groups]
+dev = [
+    "maturin>=1.13.1",
+    "pytest>=9.0.3",
+]
+docs = [
+    "mkdocs-material>=9.7.6",
+    "mkdocstrings[python]>=1.0.4",
+    "ruff>=0.15.15",
+]
+lint = [
+    "black>=24.0",
+    "ruff>=0.15.15",
+    "mypy>=1.13",
+]

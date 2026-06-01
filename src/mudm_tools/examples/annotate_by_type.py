@@ -18,7 +18,6 @@ from __future__ import annotations
 import argparse
 import functools
 import json
-import math
 from collections import defaultdict
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
@@ -40,7 +39,6 @@ from mudm_tools.neuroglancer.state import (
     build_viewer_state,
     viewer_state_to_url,
 )
-
 
 # SWC type codes
 SWC_TYPES = {
@@ -93,7 +91,9 @@ def split_by_type(morphology: NeuronMorphology) -> dict[int, NeuronMorphology]:
                 bridge = SWCSample(
                     id=parent.id,
                     type=swc_type,  # Tag with this type for rendering
-                    x=parent.x, y=parent.y, z=parent.z,
+                    x=parent.x,
+                    y=parent.y,
+                    z=parent.z,
                     r=parent.r,
                     parent=-1,  # Make it a root in this sub-tree
                 )
@@ -106,9 +106,13 @@ def split_by_type(morphology: NeuronMorphology) -> dict[int, NeuronMorphology]:
             # Make the first node a root
             first = extended_nodes[0]
             extended_nodes[0] = SWCSample(
-                id=first.id, type=first.type,
-                x=first.x, y=first.y, z=first.z,
-                r=first.r, parent=-1,
+                id=first.id,
+                type=first.type,
+                x=first.x,
+                y=first.y,
+                z=first.z,
+                r=first.r,
+                parent=-1,
             )
 
         # Fix parent references — remove parents not in this sub-tree
@@ -117,16 +121,18 @@ def split_by_type(morphology: NeuronMorphology) -> dict[int, NeuronMorphology]:
         for s in extended_nodes:
             if s.parent != -1 and s.parent not in final_ids:
                 s = SWCSample(
-                    id=s.id, type=s.type,
-                    x=s.x, y=s.y, z=s.z, r=s.r,
+                    id=s.id,
+                    type=s.type,
+                    x=s.x,
+                    y=s.y,
+                    z=s.z,
+                    r=s.r,
                     parent=-1,
                 )
             cleaned.append(s)
 
         if cleaned:
-            result[swc_type] = NeuronMorphology(
-                type="NeuronMorphology", tree=cleaned
-            )
+            result[swc_type] = NeuronMorphology(type="NeuronMorphology", tree=cleaned)
 
     return result
 
@@ -135,7 +141,6 @@ def find_structural_points(
     morphology: NeuronMorphology,
 ) -> list[MuDMFeature]:
     """Find soma, branch points, and terminals as Point annotations."""
-    by_id = {s.id: s for s in morphology.tree}
     children_count: dict[int, int] = defaultdict(int)
     for s in morphology.tree:
         if s.parent != -1:
@@ -147,43 +152,49 @@ def find_structural_points(
     for s in morphology.tree:
         # Soma centers
         if s.type == 1:
-            features.append(MuDMFeature(
-                type="Feature",
-                geometry={"type": "Point", "coordinates": [s.x, s.y, s.z]},
-                properties={
-                    "annotation": "soma",
-                    "node_id": s.id,
-                    "radius": s.r,
-                },
-                featureClass="soma",
-            ))
+            features.append(
+                MuDMFeature(
+                    type="Feature",
+                    geometry={"type": "Point", "coordinates": [s.x, s.y, s.z]},
+                    properties={
+                        "annotation": "soma",
+                        "node_id": s.id,
+                        "radius": s.r,
+                    },
+                    featureClass="soma",
+                )
+            )
 
         # Branch points (2+ children)
         if children_count.get(s.id, 0) >= 2:
-            features.append(MuDMFeature(
-                type="Feature",
-                geometry={"type": "Point", "coordinates": [s.x, s.y, s.z]},
-                properties={
-                    "annotation": "branch_point",
-                    "node_id": s.id,
-                    "branch_count": children_count[s.id],
-                    "compartment": SWC_TYPES.get(s.type, str(s.type)),
-                },
-                featureClass="branch_point",
-            ))
+            features.append(
+                MuDMFeature(
+                    type="Feature",
+                    geometry={"type": "Point", "coordinates": [s.x, s.y, s.z]},
+                    properties={
+                        "annotation": "branch_point",
+                        "node_id": s.id,
+                        "branch_count": children_count[s.id],
+                        "compartment": SWC_TYPES.get(s.type, str(s.type)),
+                    },
+                    featureClass="branch_point",
+                )
+            )
 
         # Terminals (leaf nodes, not soma)
         if s.id not in parent_ids and s.type != 1:
-            features.append(MuDMFeature(
-                type="Feature",
-                geometry={"type": "Point", "coordinates": [s.x, s.y, s.z]},
-                properties={
-                    "annotation": "terminal",
-                    "node_id": s.id,
-                    "compartment": SWC_TYPES.get(s.type, str(s.type)),
-                },
-                featureClass="terminal",
-            ))
+            features.append(
+                MuDMFeature(
+                    type="Feature",
+                    geometry={"type": "Point", "coordinates": [s.x, s.y, s.z]},
+                    properties={
+                        "annotation": "terminal",
+                        "node_id": s.id,
+                        "compartment": SWC_TYPES.get(s.type, str(s.type)),
+                    },
+                    featureClass="terminal",
+                )
+            )
 
     return features
 
@@ -196,8 +207,7 @@ def main() -> None:
     parser.add_argument("--output-dir", "-o", default="neuroglancer_output")
     parser.add_argument("--port", "-p", type=int, default=9000)
     parser.add_argument("--no-serve", action="store_true")
-    parser.add_argument("--save-json", action="store_true",
-                        help="Save the MuDM collection as JSON")
+    parser.add_argument("--save-json", action="store_true", help="Save the MuDM collection as JSON")
     args = parser.parse_args()
 
     swc_path = Path(args.swc_file)
@@ -229,24 +239,32 @@ def main() -> None:
     seg_features: list[MuDMFeature] = []
     seg_ids: list[int] = []
 
-    print(f"\n  Skeleton segments:")
+    print("\n  Skeleton segments:")
     for segment_id, (swc_type, subtree) in enumerate(sorted(subtrees.items()), start=1):
         type_name = SWC_TYPES.get(swc_type, f"type_{swc_type}")
         segment_map[segment_id] = type_name
 
         write_skeleton(skel_dir, segment_id, subtree)
 
-        seg_features.append(MuDMFeature(
-            type="Feature",
-            geometry={"type": "Point", "coordinates": [0, 0, 0]},
-            properties={"name": type_name, "swc_type": swc_type, "node_count": len(subtree.tree)},
-        ))
+        seg_features.append(
+            MuDMFeature(
+                type="Feature",
+                geometry={"type": "Point", "coordinates": [0, 0, 0]},
+                properties={
+                    "name": type_name,
+                    "swc_type": swc_type,
+                    "node_count": len(subtree.tree),
+                },
+            )
+        )
         seg_ids.append(segment_id)
 
         bbox = subtree.bbox3d()
         span = [bbox[3] - bbox[0], bbox[4] - bbox[1], bbox[5] - bbox[2]]
-        print(f"    [{segment_id}] {type_name:20s} — {len(subtree.tree):5d} nodes, "
-              f"span: {span[0]:.0f} x {span[1]:.0f} x {span[2]:.0f}")
+        print(
+            f"    [{segment_id}] {type_name:20s} — {len(subtree.tree):5d} nodes, "
+            f"span: {span[0]:.0f} x {span[1]:.0f} x {span[2]:.0f}"
+        )
 
     # Write segment properties (so Neuroglancer shows type names)
     write_segment_properties(skel_dir / "seg_props", seg_features, seg_ids)
@@ -261,7 +279,7 @@ def main() -> None:
     for f in point_annotations:
         ann_counts[f.featureClass] += 1
 
-    print(f"\n  Point annotations:")
+    print("\n  Point annotations:")
     for cls, count in sorted(ann_counts.items()):
         print(f"    {cls}: {count}")
 
@@ -282,13 +300,19 @@ def main() -> None:
             if s.parent != -1 and s.parent in by_id:
                 p = by_id[s.parent]
                 lines.append([[p.x, p.y, p.z], [s.x, s.y, s.z]])
-        geom = MultiLineString(type="MultiLineString", coordinates=lines) if lines else None
-        all_features.append(MuDMFeature(
-            type="Feature",
-            geometry=geom,
-            properties={"compartment": type_name, "swc_type": swc_type, "node_count": len(subtree.tree)},
-            featureClass=type_name,
-        ))
+        geom = MultiLineString(type="MultiLineString", coordinates=lines) if lines else None  # type: ignore[arg-type]  # geojson-pydantic accepts coord lists
+        all_features.append(
+            MuDMFeature(
+                type="Feature",
+                geometry=geom,
+                properties={
+                    "compartment": type_name,
+                    "swc_type": swc_type,
+                    "node_count": len(subtree.tree),
+                },
+                featureClass=type_name,
+            )
+        )
 
     all_features.extend(point_annotations)
 
@@ -328,7 +352,7 @@ def main() -> None:
     center_nm = [c * 1000 for c in center_um]
     # Zoom: use the largest span (in nm) × 1.2 to frame the neuron tightly
     bbox = morphology.bbox3d()
-    spans_nm = [(bbox[i+3] - bbox[i]) * 1000 for i in range(3)]
+    spans_nm = [(bbox[i + 3] - bbox[i]) * 1000 for i in range(3)]
     zoom_nm = max(spans_nm) * 1.2
     state = build_viewer_state(layers, position=center_nm, projection_scale=zoom_nm)
     url = viewer_state_to_url(state)
@@ -358,7 +382,7 @@ def main() -> None:
     handler = functools.partial(CORSHandler, directory=str(output_dir))
     server = HTTPServer(("", port), handler)
     print(f"  Server running on http://localhost:{port}")
-    print(f"  Copy the Viewer URL into your browser. Press Ctrl+C to stop.\n")
+    print("  Copy the Viewer URL into your browser. Press Ctrl+C to stop.\n")
 
     try:
         server.serve_forever()

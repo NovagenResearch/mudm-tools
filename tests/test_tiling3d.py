@@ -8,16 +8,17 @@ and round-trip generate→read→compare.
 from __future__ import annotations
 
 import json
-import math
 import struct
-import tempfile
-from pathlib import Path
 
 import pytest
 from geojson_pydantic import LineString, Point, Polygon
 
 from mudm.model import (
-    MuDMFeature, MuDMFeatureCollection, OntologyTerm, TIN, Vocabulary,
+    MuDMFeature,
+    MuDMFeatureCollection,
+    OntologyTerm,
+    TIN,
+    Vocabulary,
 )
 
 # --- Proto imports ---
@@ -39,7 +40,6 @@ from mudm_tools.tiling3d.convert3d import (
     TIN_TYPE,
     compute_bounds_3d,
     convert_collection_3d,
-    convert_feature_3d,
 )
 from mudm_tools.tiling3d.tile3d import create_tile_3d, transform_tile_3d
 from mudm_tools.tiling3d.encoder3d import encode_tile_3d, _build_indexed_mesh
@@ -48,10 +48,10 @@ from mudm_tools.tiling3d.octree import Octree, OctreeConfig
 from mudm_tools.tiling3d.generator3d import TileGenerator3D
 from mudm_tools.tiling3d.tilejson3d import TileModel3D
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _point_feature(x: float, y: float, z: float, **props) -> MuDMFeature:
     return MuDMFeature(
@@ -103,6 +103,7 @@ def _collection(*features: MuDMFeature) -> MuDMFeatureCollection:
 # ===========================================================================
 # 1. Proto round-trip tests
 # ===========================================================================
+
 
 class TestProtoRoundTrip:
     """Protobuf serialization/deserialization."""
@@ -157,8 +158,13 @@ class TestProtoRoundTrip:
 
     def test_geom_types(self):
         """All GeomType enum values round-trip."""
-        for gt in [pb.Tile.POINT3D, pb.Tile.LINESTRING3D, pb.Tile.POLYGON3D,
-                   pb.Tile.POLYHEDRALSURFACE, pb.Tile.TIN]:
+        for gt in [
+            pb.Tile.POINT3D,
+            pb.Tile.LINESTRING3D,
+            pb.Tile.POLYGON3D,
+            pb.Tile.POLYHEDRALSURFACE,
+            pb.Tile.TIN,
+        ]:
             tile = pb.Tile()
             f = tile.layers.add().features.add()
             f.type = gt
@@ -185,11 +191,11 @@ class TestProtoRoundTrip:
         data = tile.SerializeToString()
         tile2 = pb.Tile()
         tile2.ParseFromString(data)
-        l = tile2.layers[0]
-        assert list(l.keys) == ["name", "count"]
-        assert l.values[0].string_value == "hello"
-        assert l.values[1].uint_value == 42
-        assert list(l.features[0].tags) == [0, 0, 1, 1]
+        layer = tile2.layers[0]
+        assert list(layer.keys) == ["name", "count"]
+        assert layer.values[0].string_value == "hello"
+        assert layer.values[1].uint_value == 42
+        assert list(layer.features[0].tags) == [0, 0, 1, 1]
 
     def test_radii_field(self):
         tile = pb.Tile()
@@ -204,6 +210,7 @@ class TestProtoRoundTrip:
 # ===========================================================================
 # 2. Morton code tests
 # ===========================================================================
+
 
 class TestMorton:
     def test_encode_decode_origin(self):
@@ -235,6 +242,7 @@ class TestMorton:
 # ===========================================================================
 # 3. TileModel3D tests
 # ===========================================================================
+
 
 class TestTileModel3D:
     def test_basic_validation(self):
@@ -280,6 +288,7 @@ class TestTileModel3D:
 # 4. CartesianProjector3D tests
 # ===========================================================================
 
+
 class TestCartesianProjector3D:
     def test_project_origin(self):
         proj = CartesianProjector3D((0, 0, 0, 10, 10, 10))
@@ -304,6 +313,7 @@ class TestCartesianProjector3D:
 # ===========================================================================
 # 5. RDP-3D simplification tests
 # ===========================================================================
+
 
 class TestSimplify3D:
     def test_no_simplification_short(self):
@@ -347,20 +357,29 @@ class TestSimplify3D:
 # 6. 3D clipping tests
 # ===========================================================================
 
+
 class TestClip3D:
     def _make_point(self, x, y, z):
         return {
-            "geometry": [x, y], "geometry_z": [z],
-            "type": POINT3D, "tags": {},
-            "minX": x, "minY": y, "minZ": z,
-            "maxX": x, "maxY": y, "maxZ": z,
+            "geometry": [x, y],
+            "geometry_z": [z],
+            "type": POINT3D,
+            "tags": {},
+            "minX": x,
+            "minY": y,
+            "minZ": z,
+            "maxX": x,
+            "maxY": y,
+            "maxZ": z,
         }
 
     def _make_line(self, xy, z):
         n = len(z)
         return {
-            "geometry": xy, "geometry_z": z,
-            "type": LINESTRING3D, "tags": {},
+            "geometry": xy,
+            "geometry_z": z,
+            "type": LINESTRING3D,
+            "tags": {},
             "minX": min(xy[i * 2] for i in range(n)),
             "minY": min(xy[i * 2 + 1] for i in range(n)),
             "minZ": min(z),
@@ -411,9 +430,14 @@ class TestClip3D:
         tin_feat = {
             "geometry": [0.0, 0.0, 1.0, 0.0, 0.5, 1.0],
             "geometry_z": [0.0, 0.0, 0.5],
-            "type": TIN_TYPE, "tags": {},
-            "minX": 0.0, "minY": 0.0, "minZ": 0.0,
-            "maxX": 1.0, "maxY": 1.0, "maxZ": 0.5,
+            "type": TIN_TYPE,
+            "tags": {},
+            "minX": 0.0,
+            "minY": 0.0,
+            "minZ": 0.0,
+            "maxX": 1.0,
+            "maxY": 1.0,
+            "maxZ": 0.5,
         }
         result = clip_3d([tin_feat], 0.0, 0.5, 0)
         assert len(result) == 1  # included whole
@@ -423,9 +447,14 @@ class TestClip3D:
         tin_feat = {
             "geometry": [2.0, 2.0, 3.0, 2.0, 2.5, 3.0],
             "geometry_z": [0.0, 0.0, 0.5],
-            "type": TIN_TYPE, "tags": {},
-            "minX": 2.0, "minY": 2.0, "minZ": 0.0,
-            "maxX": 3.0, "maxY": 3.0, "maxZ": 0.5,
+            "type": TIN_TYPE,
+            "tags": {},
+            "minX": 2.0,
+            "minY": 2.0,
+            "minZ": 0.0,
+            "maxX": 3.0,
+            "maxY": 3.0,
+            "maxZ": 0.5,
         }
         result = clip_3d([tin_feat], 0.0, 1.0, 0)
         assert len(result) == 0
@@ -445,14 +474,21 @@ class TestClip3D:
 # 7. Octree tests
 # ===========================================================================
 
+
 class TestOctree:
     def test_single_point_builds(self):
         """Single point should produce tiles at all zoom levels."""
         feat = {
-            "geometry": [0.5, 0.5], "geometry_z": [0.5],
-            "type": POINT3D, "tags": {},
-            "minX": 0.5, "minY": 0.5, "minZ": 0.5,
-            "maxX": 0.5, "maxY": 0.5, "maxZ": 0.5,
+            "geometry": [0.5, 0.5],
+            "geometry_z": [0.5],
+            "type": POINT3D,
+            "tags": {},
+            "minX": 0.5,
+            "minY": 0.5,
+            "minZ": 0.5,
+            "maxX": 0.5,
+            "maxY": 0.5,
+            "maxZ": 0.5,
         }
         config = OctreeConfig(max_zoom=2)
         tree = Octree([feat], config)
@@ -461,10 +497,16 @@ class TestOctree:
     def test_zoom_levels(self):
         """Tiles should exist at each zoom up to max_zoom."""
         feat = {
-            "geometry": [0.5, 0.5], "geometry_z": [0.5],
-            "type": POINT3D, "tags": {},
-            "minX": 0.5, "minY": 0.5, "minZ": 0.5,
-            "maxX": 0.5, "maxY": 0.5, "maxZ": 0.5,
+            "geometry": [0.5, 0.5],
+            "geometry_z": [0.5],
+            "type": POINT3D,
+            "tags": {},
+            "minX": 0.5,
+            "minY": 0.5,
+            "minZ": 0.5,
+            "maxX": 0.5,
+            "maxY": 0.5,
+            "maxZ": 0.5,
         }
         config = OctreeConfig(max_zoom=3)
         tree = Octree([feat], config)
@@ -481,16 +523,28 @@ class TestOctree:
     def test_multiple_points_split(self):
         """Two distant points should end up in different octants at zoom 1."""
         f1 = {
-            "geometry": [0.1, 0.1], "geometry_z": [0.1],
-            "type": POINT3D, "tags": {"id": "a"},
-            "minX": 0.1, "minY": 0.1, "minZ": 0.1,
-            "maxX": 0.1, "maxY": 0.1, "maxZ": 0.1,
+            "geometry": [0.1, 0.1],
+            "geometry_z": [0.1],
+            "type": POINT3D,
+            "tags": {"id": "a"},
+            "minX": 0.1,
+            "minY": 0.1,
+            "minZ": 0.1,
+            "maxX": 0.1,
+            "maxY": 0.1,
+            "maxZ": 0.1,
         }
         f2 = {
-            "geometry": [0.9, 0.9], "geometry_z": [0.9],
-            "type": POINT3D, "tags": {"id": "b"},
-            "minX": 0.9, "minY": 0.9, "minZ": 0.9,
-            "maxX": 0.9, "maxY": 0.9, "maxZ": 0.9,
+            "geometry": [0.9, 0.9],
+            "geometry_z": [0.9],
+            "type": POINT3D,
+            "tags": {"id": "b"},
+            "minX": 0.9,
+            "minY": 0.9,
+            "minZ": 0.9,
+            "maxX": 0.9,
+            "maxY": 0.9,
+            "maxZ": 0.9,
         }
         config = OctreeConfig(max_zoom=1)
         tree = Octree([f1, f2], config)
@@ -501,10 +555,16 @@ class TestOctree:
     def test_min_zoom_respected(self):
         """Tiles below min_zoom should not be stored."""
         feat = {
-            "geometry": [0.5, 0.5], "geometry_z": [0.5],
-            "type": POINT3D, "tags": {},
-            "minX": 0.5, "minY": 0.5, "minZ": 0.5,
-            "maxX": 0.5, "maxY": 0.5, "maxZ": 0.5,
+            "geometry": [0.5, 0.5],
+            "geometry_z": [0.5],
+            "type": POINT3D,
+            "tags": {},
+            "minX": 0.5,
+            "minY": 0.5,
+            "minZ": 0.5,
+            "maxX": 0.5,
+            "maxY": 0.5,
+            "maxZ": 0.5,
         }
         config = OctreeConfig(min_zoom=1, max_zoom=2)
         tree = Octree([feat], config)
@@ -517,12 +577,20 @@ class TestOctree:
         for x in [0.1, 0.9]:
             for y in [0.1, 0.9]:
                 for d in [0.1, 0.9]:
-                    features.append({
-                        "geometry": [x, y], "geometry_z": [d],
-                        "type": POINT3D, "tags": {},
-                        "minX": x, "minY": y, "minZ": d,
-                        "maxX": x, "maxY": y, "maxZ": d,
-                    })
+                    features.append(
+                        {
+                            "geometry": [x, y],
+                            "geometry_z": [d],
+                            "type": POINT3D,
+                            "tags": {},
+                            "minX": x,
+                            "minY": y,
+                            "minZ": d,
+                            "maxX": x,
+                            "maxY": y,
+                            "maxZ": d,
+                        }
+                    )
         config = OctreeConfig(max_zoom=1)
         tree = Octree(features, config)
         assert len(tree.tiles_at_zoom(1)) == 8
@@ -531,6 +599,7 @@ class TestOctree:
 # ===========================================================================
 # 8. Convert + Tile + Transform tests
 # ===========================================================================
+
 
 class TestConvert3D:
     def test_point_conversion(self):
@@ -582,10 +651,16 @@ class TestConvert3D:
 class TestTile3D:
     def test_create_tile(self):
         feat = {
-            "geometry": [0.5, 0.5], "geometry_z": [0.5],
-            "type": POINT3D, "tags": {},
-            "minX": 0.5, "minY": 0.5, "minZ": 0.5,
-            "maxX": 0.5, "maxY": 0.5, "maxZ": 0.5,
+            "geometry": [0.5, 0.5],
+            "geometry_z": [0.5],
+            "type": POINT3D,
+            "tags": {},
+            "minX": 0.5,
+            "minY": 0.5,
+            "minZ": 0.5,
+            "maxX": 0.5,
+            "maxY": 0.5,
+            "maxZ": 0.5,
         }
         tile = create_tile_3d([feat], 0, 0, 0, 0)
         assert tile["num_features"] == 1
@@ -593,10 +668,16 @@ class TestTile3D:
 
     def test_transform_tile(self):
         feat = {
-            "geometry": [0.5, 0.5], "geometry_z": [0.5],
-            "type": POINT3D, "tags": {},
-            "minX": 0.5, "minY": 0.5, "minZ": 0.5,
-            "maxX": 0.5, "maxY": 0.5, "maxZ": 0.5,
+            "geometry": [0.5, 0.5],
+            "geometry_z": [0.5],
+            "type": POINT3D,
+            "tags": {},
+            "minX": 0.5,
+            "minY": 0.5,
+            "minZ": 0.5,
+            "maxX": 0.5,
+            "maxY": 0.5,
+            "maxZ": 0.5,
         }
         tile = create_tile_3d([feat], 0, 0, 0, 0)
         transformed = transform_tile_3d(tile, extent=4096, extent_z=4096)
@@ -609,10 +690,16 @@ class TestTile3D:
     def test_transform_zoom1(self):
         """At zoom 1, tile (1,1,1) covers [0.5,1.0] in all axes."""
         feat = {
-            "geometry": [0.75, 0.75], "geometry_z": [0.75],
-            "type": POINT3D, "tags": {},
-            "minX": 0.75, "minY": 0.75, "minZ": 0.75,
-            "maxX": 0.75, "maxY": 0.75, "maxZ": 0.75,
+            "geometry": [0.75, 0.75],
+            "geometry_z": [0.75],
+            "type": POINT3D,
+            "tags": {},
+            "minX": 0.75,
+            "minY": 0.75,
+            "minZ": 0.75,
+            "maxX": 0.75,
+            "maxY": 0.75,
+            "maxZ": 0.75,
         }
         tile = create_tile_3d([feat], 1, 1, 1, 1)
         transformed = transform_tile_3d(tile, extent=4096, extent_z=4096)
@@ -625,15 +712,18 @@ class TestTile3D:
 # 9. Encoder tests
 # ===========================================================================
 
+
 class TestEncoder3D:
     def test_encode_point(self):
         tile_data = {
-            "features": [{
-                "geometry": [2048, 2048],
-                "geometry_z": [2048],
-                "type": POINT3D,
-                "tags": {"name": "test"},
-            }],
+            "features": [
+                {
+                    "geometry": [2048, 2048],
+                    "geometry_z": [2048],
+                    "type": POINT3D,
+                    "tags": {"name": "test"},
+                }
+            ],
         }
         data = encode_tile_3d(tile_data)
         assert isinstance(data, bytes)
@@ -647,12 +737,14 @@ class TestEncoder3D:
 
     def test_encode_line(self):
         tile_data = {
-            "features": [{
-                "geometry": [0, 0, 1000, 2000, 4096, 4096],
-                "geometry_z": [0, 2048, 4096],
-                "type": LINESTRING3D,
-                "tags": {},
-            }],
+            "features": [
+                {
+                    "geometry": [0, 0, 1000, 2000, 4096, 4096],
+                    "geometry_z": [0, 2048, 4096],
+                    "type": LINESTRING3D,
+                    "tags": {},
+                }
+            ],
         }
         data = encode_tile_3d(tile_data)
         layers = decode_tile(data)
@@ -666,12 +758,14 @@ class TestEncoder3D:
     def test_encode_z_delta(self):
         """Z values are delta-encoded and decoded correctly."""
         tile_data = {
-            "features": [{
-                "geometry": [0, 0, 100, 100, 200, 200],
-                "geometry_z": [100, 300, 200],
-                "type": LINESTRING3D,
-                "tags": {},
-            }],
+            "features": [
+                {
+                    "geometry": [0, 0, 100, 100, 200, 200],
+                    "geometry_z": [100, 300, 200],
+                    "type": LINESTRING3D,
+                    "tags": {},
+                }
+            ],
         }
         data = encode_tile_3d(tile_data)
         layers = decode_tile(data)
@@ -680,12 +774,14 @@ class TestEncoder3D:
 
     def test_encode_tags(self):
         tile_data = {
-            "features": [{
-                "geometry": [100, 200],
-                "geometry_z": [50],
-                "type": POINT3D,
-                "tags": {"category": "neuron", "count": 42},
-            }],
+            "features": [
+                {
+                    "geometry": [100, 200],
+                    "geometry_z": [50],
+                    "type": POINT3D,
+                    "tags": {"category": "neuron", "count": 42},
+                }
+            ],
         }
         data = encode_tile_3d(tile_data)
         layers = decode_tile(data)
@@ -695,13 +791,15 @@ class TestEncoder3D:
 
     def test_encode_polygon(self):
         tile_data = {
-            "features": [{
-                "geometry": [0, 0, 4096, 0, 4096, 4096, 0, 4096, 0, 0],
-                "geometry_z": [0, 0, 4096, 4096, 0],
-                "ring_lengths": [5],
-                "type": POLYGON3D,
-                "tags": {},
-            }],
+            "features": [
+                {
+                    "geometry": [0, 0, 4096, 0, 4096, 4096, 0, 4096, 0, 0],
+                    "geometry_z": [0, 0, 4096, 4096, 0],
+                    "ring_lengths": [5],
+                    "type": POLYGON3D,
+                    "tags": {},
+                }
+            ],
         }
         data = encode_tile_3d(tile_data)
         layers = decode_tile(data)
@@ -718,6 +816,7 @@ class TestEncoder3D:
 # ===========================================================================
 # 10. Generator end-to-end tests
 # ===========================================================================
+
 
 class TestGenerator3D:
     def test_point_pipeline(self, tmp_path):
@@ -818,6 +917,7 @@ class TestGenerator3D:
 # ===========================================================================
 # 11. Round-trip tests (generate → read → compare)
 # ===========================================================================
+
 
 class TestRoundTrip:
     def test_point_roundtrip(self, tmp_path):
@@ -968,10 +1068,12 @@ class TestMetadataPipeline:
             namespace="http://purl.obolibrary.org/obo/",
             terms={
                 "soma": OntologyTerm(
-                    uri="GO_0043025", label="neuronal cell body",
+                    uri="GO_0043025",
+                    label="neuronal cell body",
                 ),
                 "axon": OntologyTerm(
-                    uri="GO_0030424", label="axon",
+                    uri="GO_0030424",
+                    label="axon",
                 ),
             },
         )
@@ -1061,8 +1163,8 @@ class TestIndexedMesh:
         # Triangle 1: (0,0,0), (10,0,0), (5,10,5)  closed ring = 4 verts
         # Triangle 2: (10,0,0), (20,0,0), (15,10,5) closed ring = 4 verts
         # Shared vertex: (10,0,0)
-        xy = [0, 0, 10, 0, 5, 10, 0, 0,   10, 0, 20, 0, 15, 10, 10, 0]
-        z = [0, 0, 5, 0,   0, 0, 5, 0]
+        xy = [0, 0, 10, 0, 5, 10, 0, 0, 10, 0, 20, 0, 15, 10, 10, 0]
+        z = [0, 0, 5, 0, 0, 0, 5, 0]
         ring_lengths = [4, 4]
 
         pos_bytes, idx_bytes = _build_indexed_mesh(xy, z, ring_lengths)
@@ -1094,13 +1196,15 @@ class TestIndexedMesh:
     def test_encode_decode_tin_indexed(self):
         """TIN feature encodes as indexed mesh bytes and decodes correctly."""
         tile_data = {
-            "features": [{
-                "geometry": [0, 0, 4096, 0, 2048, 4096, 0, 0],
-                "geometry_z": [0, 0, 4096, 0],
-                "ring_lengths": [4],
-                "type": TIN_TYPE,
-                "tags": {"label": "mesh1"},
-            }],
+            "features": [
+                {
+                    "geometry": [0, 0, 4096, 0, 2048, 4096, 0, 0],
+                    "geometry_z": [0, 0, 4096, 0],
+                    "ring_lengths": [4],
+                    "type": TIN_TYPE,
+                    "tags": {"label": "mesh1"},
+                }
+            ],
         }
         data = encode_tile_3d(tile_data)
         layers = decode_tile(data)
@@ -1108,7 +1212,7 @@ class TestIndexedMesh:
 
         # Should have indexed mesh data as bytes
         assert len(feat["mesh_positions"]) == 36  # 3 verts × 3 × 4 bytes
-        assert len(feat["mesh_indices"]) == 12    # 3 indices × 4 bytes
+        assert len(feat["mesh_indices"]) == 12  # 3 indices × 4 bytes
         assert isinstance(feat["mesh_positions"], bytes)
         assert isinstance(feat["mesh_indices"], bytes)
         # Backward-compat xy/z should also be populated
@@ -1120,14 +1224,17 @@ class TestIndexedMesh:
     def test_encode_decode_polyhedral_indexed(self):
         """PolyhedralSurface also uses indexed mesh encoding."""
         from mudm_tools.tiling3d.convert3d import POLYHEDRALSURFACE as PS_TYPE
+
         tile_data = {
-            "features": [{
-                "geometry": [0, 0, 100, 0, 50, 100, 0, 0],
-                "geometry_z": [0, 0, 50, 0],
-                "ring_lengths": [4],
-                "type": PS_TYPE,
-                "tags": {},
-            }],
+            "features": [
+                {
+                    "geometry": [0, 0, 100, 0, 50, 100, 0, 0],
+                    "geometry_z": [0, 0, 50, 0],
+                    "ring_lengths": [4],
+                    "type": PS_TYPE,
+                    "tags": {},
+                }
+            ],
         }
         data = encode_tile_3d(tile_data)
         layers = decode_tile(data)
@@ -1138,12 +1245,14 @@ class TestIndexedMesh:
     def test_points_still_ring_based(self):
         """Point features should NOT use indexed mesh encoding."""
         tile_data = {
-            "features": [{
-                "geometry": [2048, 2048],
-                "geometry_z": [1024],
-                "type": POINT3D,
-                "tags": {},
-            }],
+            "features": [
+                {
+                    "geometry": [2048, 2048],
+                    "geometry_z": [1024],
+                    "type": POINT3D,
+                    "tags": {},
+                }
+            ],
         }
         data = encode_tile_3d(tile_data)
         layers = decode_tile(data)
@@ -1155,12 +1264,14 @@ class TestIndexedMesh:
     def test_lines_still_ring_based(self):
         """LineString features should NOT use indexed mesh encoding."""
         tile_data = {
-            "features": [{
-                "geometry": [0, 0, 1000, 2000],
-                "geometry_z": [0, 100],
-                "type": LINESTRING3D,
-                "tags": {},
-            }],
+            "features": [
+                {
+                    "geometry": [0, 0, 1000, 2000],
+                    "geometry_z": [0, 100],
+                    "type": LINESTRING3D,
+                    "tags": {},
+                }
+            ],
         }
         data = encode_tile_3d(tile_data)
         layers = decode_tile(data)
@@ -1171,13 +1282,15 @@ class TestIndexedMesh:
     def test_polygon_still_ring_based(self):
         """Polygon3D should still use ring-based encoding, not indexed mesh."""
         tile_data = {
-            "features": [{
-                "geometry": [0, 0, 4096, 0, 4096, 4096, 0, 4096, 0, 0],
-                "geometry_z": [0, 0, 4096, 4096, 0],
-                "ring_lengths": [5],
-                "type": POLYGON3D,
-                "tags": {},
-            }],
+            "features": [
+                {
+                    "geometry": [0, 0, 4096, 0, 4096, 4096, 0, 4096, 0, 0],
+                    "geometry_z": [0, 0, 4096, 4096, 0],
+                    "ring_lengths": [5],
+                    "type": POLYGON3D,
+                    "tags": {},
+                }
+            ],
         }
         data = encode_tile_3d(tile_data)
         layers = decode_tile(data)
@@ -1197,10 +1310,7 @@ class TestIndexedMesh:
         layers = decode_tile(tile_file.read_bytes())
 
         # Find a TIN feature
-        tin_feats = [
-            f for layer in layers for f in layer["features"]
-            if f["type"] == 5  # TIN
-        ]
+        tin_feats = [f for layer in layers for f in layer["features"] if f["type"] == 5]  # TIN
         assert len(tin_feats) >= 1
         feat = tin_feats[0]
         assert len(feat["mesh_positions"]) > 0
@@ -1210,13 +1320,15 @@ class TestIndexedMesh:
     def test_coordinate_space(self):
         """Indexed mesh positions should be in [0, extent] tile-local range."""
         tile_data = {
-            "features": [{
-                "geometry": [0, 0, 4096, 0, 2048, 4096, 0, 0],
-                "geometry_z": [0, 0, 4096, 0],
-                "ring_lengths": [4],
-                "type": TIN_TYPE,
-                "tags": {},
-            }],
+            "features": [
+                {
+                    "geometry": [0, 0, 4096, 0, 2048, 4096, 0, 0],
+                    "geometry_z": [0, 0, 4096, 0],
+                    "ring_lengths": [4],
+                    "type": TIN_TYPE,
+                    "tags": {},
+                }
+            ],
         }
         data = encode_tile_3d(tile_data, extent=4096, extent_z=4096)
         layers = decode_tile(data)
@@ -1234,14 +1346,32 @@ class TestIndexedMesh:
     def test_zero_copy_struct_unpack(self):
         """Verify mesh bytes can be unpacked with struct for zero-copy path."""
         tile_data = {
-            "features": [{
-                "geometry": [0, 0, 4096, 0, 2048, 4096, 0, 0,
-                             4096, 0, 4096, 4096, 2048, 4096, 4096, 0],
-                "geometry_z": [0, 0, 4096, 0, 0, 4096, 4096, 0],
-                "ring_lengths": [4, 4],
-                "type": TIN_TYPE,
-                "tags": {},
-            }],
+            "features": [
+                {
+                    "geometry": [
+                        0,
+                        0,
+                        4096,
+                        0,
+                        2048,
+                        4096,
+                        0,
+                        0,
+                        4096,
+                        0,
+                        4096,
+                        4096,
+                        2048,
+                        4096,
+                        4096,
+                        0,
+                    ],
+                    "geometry_z": [0, 0, 4096, 0, 0, 4096, 4096, 0],
+                    "ring_lengths": [4, 4],
+                    "type": TIN_TYPE,
+                    "tags": {},
+                }
+            ],
         }
         data = encode_tile_3d(tile_data)
         layers = decode_tile(data)
@@ -1251,7 +1381,7 @@ class TestIndexedMesh:
         pos = feat["mesh_positions"]
         idx = feat["mesh_indices"]
         n_verts = len(pos) // 12  # 3 floats × 4 bytes
-        n_tris = len(idx) // 12   # 3 indices × 4 bytes
+        n_tris = len(idx) // 12  # 3 indices × 4 bytes
         assert n_verts >= 3
         assert n_tris == 2
 
@@ -1262,13 +1392,15 @@ class TestLazyMeshXYZ:
     def _encode_tin(self):
         """Helper: encode a TIN tile and return decoded feature."""
         tile_data = {
-            "features": [{
-                "geometry": [0, 0, 1000, 2000, 4096, 4096, 0, 0],
-                "geometry_z": [100, 300, 200, 100],
-                "ring_lengths": [4],
-                "type": TIN_TYPE,
-                "tags": {},
-            }],
+            "features": [
+                {
+                    "geometry": [0, 0, 1000, 2000, 4096, 4096, 0, 0],
+                    "geometry_z": [100, 300, 200, 100],
+                    "ring_lengths": [4],
+                    "type": TIN_TYPE,
+                    "tags": {},
+                }
+            ],
         }
         data = encode_tile_3d(tile_data, extent=4096, extent_z=4096)
         layers = decode_tile(data)
@@ -1289,7 +1421,6 @@ class TestLazyMeshXYZ:
 
     def test_lazy_materializes_on_index(self):
         """Accessing an element should trigger materialization."""
-        from mudm_tools.tiling3d.reader3d import _LazyMeshXY, _LazyMeshZ
 
         feat = self._encode_tin()
         xy = feat["xy"]
@@ -1302,7 +1433,6 @@ class TestLazyMeshXYZ:
 
     def test_lazy_len_without_materialize(self):
         """len() should work without materializing."""
-        from mudm_tools.tiling3d.reader3d import _LazyMeshXY, _LazyMeshZ
 
         feat = self._encode_tin()
         xy = feat["xy"]
@@ -1315,7 +1445,6 @@ class TestLazyMeshXYZ:
 
     def test_lazy_bool_without_materialize(self):
         """bool() should work without materializing."""
-        from mudm_tools.tiling3d.reader3d import _LazyMeshXY, _LazyMeshZ
 
         feat = self._encode_tin()
         assert bool(feat["xy"]) is True
@@ -1345,13 +1474,15 @@ class TestLazyMeshXYZ:
         from mudm_tools.tiling3d.reader3d import _LazyMeshXY
 
         tile_data = {
-            "features": [{
-                "geometry": [(10 << 3) | 1, 200, 400],
-                "geometry_z": [500],
-                "ring_lengths": None,
-                "type": POINT3D,
-                "tags": {},
-            }],
+            "features": [
+                {
+                    "geometry": [(10 << 3) | 1, 200, 400],
+                    "geometry_z": [500],
+                    "ring_lengths": None,
+                    "type": POINT3D,
+                    "tags": {},
+                }
+            ],
         }
         data = encode_tile_3d(tile_data, extent=4096, extent_z=4096)
         layers = decode_tile(data)

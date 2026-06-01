@@ -3,15 +3,14 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Union
+from typing import Any
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 import shapely
 
-from mudm.model import MuDMFeature, MuDMFeatureCollection, OntologyTerm, Vocabulary
+from mudm.model import MuDMFeature, MuDMFeatureCollection, Vocabulary
 from ._from_geometry import shapely_to_microjson
-
 
 # Columns with special meaning — not copied to feature.properties
 _RESERVED_COLUMNS = {"id", "featureClass", "geometry"}
@@ -61,10 +60,7 @@ def _parse_vocabularies(
     if isinstance(parsed, str):
         return parsed
     if isinstance(parsed, dict):
-        return {
-            k: Vocabulary(**v) if isinstance(v, dict) else v
-            for k, v in parsed.items()
-        }
+        return {k: Vocabulary(**v) if isinstance(v, dict) else v for k, v in parsed.items()}
     return None
 
 

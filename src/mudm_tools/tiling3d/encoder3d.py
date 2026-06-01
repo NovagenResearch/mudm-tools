@@ -11,14 +11,13 @@ from typing import Any, Union
 
 from .proto import mudm_3d_tile_pb2 as pb
 
-
 # GeomType mapping
 _GEOM_TYPE_MAP = {
-    1: pb.Tile.POINT3D,
-    2: pb.Tile.LINESTRING3D,
-    3: pb.Tile.POLYGON3D,
-    4: pb.Tile.POLYHEDRALSURFACE,
-    5: pb.Tile.TIN,
+    1: pb.Tile.POINT3D,  # type: ignore[attr-defined]  # generated protobuf
+    2: pb.Tile.LINESTRING3D,  # type: ignore[attr-defined]  # generated protobuf
+    3: pb.Tile.POLYGON3D,  # type: ignore[attr-defined]  # generated protobuf
+    4: pb.Tile.POLYHEDRALSURFACE,  # type: ignore[attr-defined]  # generated protobuf
+    5: pb.Tile.TIN,  # type: ignore[attr-defined]  # generated protobuf
 }
 
 
@@ -81,7 +80,8 @@ def _encode_line_geometry(xy: list[int]) -> list[int]:
 
 
 def _encode_polygon_geometry(
-    xy: list[int], ring_lengths: list[int] | None,
+    xy: list[int],
+    ring_lengths: list[int] | None,
 ) -> list[int]:
     """Encode polygon geometry with rings."""
     result = []
@@ -229,7 +229,7 @@ def encode_tile_3d(
     -------
     Serialized protobuf bytes.
     """
-    tile_pb = pb.Tile()
+    tile_pb = pb.Tile()  # type: ignore[attr-defined]  # generated protobuf
     layer = tile_pb.layers.add()
     layer.name = layer_name
     layer.version = 3
@@ -244,7 +244,7 @@ def encode_tile_3d(
         pb_feat.id = feat_idx
 
         gt = feat.get("type", 0)
-        pb_feat.type = _GEOM_TYPE_MAP.get(gt, pb.Tile.UNKNOWN)
+        pb_feat.type = _GEOM_TYPE_MAP.get(gt, pb.Tile.UNKNOWN)  # type: ignore[attr-defined]  # generated protobuf
 
         # Encode tags
         tags = feat.get("tags", {})
@@ -303,7 +303,7 @@ _build_indexed_mesh_py = _build_indexed_mesh
 encode_tile_3d_py = encode_tile_3d
 
 try:
-    from mudm_tools._rs import build_indexed_mesh as _build_indexed_mesh  # noqa: F811
+    from mudm_tools._rs import build_indexed_mesh as _build_indexed_mesh  # type: ignore[no-redef]  # noqa: F811
     from mudm_tools._rs import encode_tile_3d as _encode_tile_3d_rs  # noqa: F401
 except ImportError:
     pass

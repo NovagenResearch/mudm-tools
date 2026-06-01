@@ -20,10 +20,10 @@ from obj_to_mudm import (
     parse_obj,
 )
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _write_obj(content: str) -> str:
     """Write OBJ content to a temp file and return the path."""
@@ -90,6 +90,7 @@ _MOCK_ONTOLOGY = {
 # parse_obj tests
 # ---------------------------------------------------------------------------
 
+
 class TestParseObj:
     def test_simple_triangle(self):
         """Single triangle — vertices and face indices parsed correctly."""
@@ -106,9 +107,7 @@ class TestParseObj:
     def test_with_normals(self):
         """f v1//n1 v2//n2 v3//n3 format — normals ignored, vertices correct."""
         obj = _write_obj(
-            "v 0 0 0\nv 1 0 0\nv 0 1 0\n"
-            "vn 0 0 1\nvn 0 0 1\nvn 0 0 1\n"
-            "f 1//1 2//2 3//3\n"
+            "v 0 0 0\nv 1 0 0\nv 0 1 0\n" "vn 0 0 1\nvn 0 0 1\nvn 0 0 1\n" "f 1//1 2//2 3//3\n"
         )
         verts, faces = parse_obj(obj)
 
@@ -131,10 +130,7 @@ class TestParseObj:
 
     def test_quads(self):
         """Quad face → 2 triangles via fan triangulation."""
-        obj = _write_obj(
-            "v 0 0 0\nv 1 0 0\nv 1 1 0\nv 0 1 0\n"
-            "f 1 2 3 4\n"
-        )
+        obj = _write_obj("v 0 0 0\nv 1 0 0\nv 1 1 0\nv 0 1 0\n" "f 1 2 3 4\n")
         verts, faces = parse_obj(obj)
 
         assert verts.shape == (4, 3)
@@ -176,6 +172,7 @@ class TestParseObj:
 # match_region tests
 # ---------------------------------------------------------------------------
 
+
 class TestMatchRegion:
     def test_match_by_name(self):
         """Exact name match (case-insensitive)."""
@@ -205,13 +202,11 @@ class TestMatchRegion:
 # obj_to_feature tests
 # ---------------------------------------------------------------------------
 
+
 class TestObjToFeature:
     def test_basic(self):
         """OBJ → MuDMFeature with TIN geometry and basic properties."""
-        obj = _write_obj(
-            "v 0 0 0\nv 1 0 0\nv 0 1 0\nv 1 1 0\n"
-            "f 1 2 3\nf 2 4 3\n"
-        )
+        obj = _write_obj("v 0 0 0\nv 1 0 0\nv 0 1 0\nv 1 1 0\n" "f 1 2 3\nf 2 4 3\n")
         feat = obj_to_feature(obj)
 
         assert feat.type == "Feature"
@@ -243,6 +238,7 @@ class TestObjToFeature:
 # ---------------------------------------------------------------------------
 # build_collection tests
 # ---------------------------------------------------------------------------
+
 
 class TestBuildCollection:
     def test_collection_with_vocabulary(self):
@@ -300,6 +296,7 @@ class TestBuildCollection:
 # ---------------------------------------------------------------------------
 # Allen CCF ontology (offline test)
 # ---------------------------------------------------------------------------
+
 
 class TestAllenOntology:
     def test_fetch_from_local_file(self, tmp_path):
