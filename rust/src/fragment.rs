@@ -255,9 +255,10 @@ impl ShardReader3D {
 ///
 /// Additive, non-load-bearing readahead to overlap open()+decode. Hints are
 /// best-effort and silently ignored on filesystems that don't support them.
-/// On Linux, uses `posix_fadvise(SEQUENTIAL|WILLNEED)`; elsewhere, an
-/// `mmap` + `madvise(WILLNEED)`. The handle is dropped immediately after the
-/// hint is issued — the kernel hint persists past close.
+/// On Linux, uses `posix_fadvise(SEQUENTIAL|WILLNEED)`; on other Unix
+/// (macOS/BSD), an `mmap` + `madvise(WILLNEED)`; on non-Unix (Windows) it is a
+/// no-op (no portable hint). The handle is dropped immediately after the hint
+/// is issued — the kernel hint persists past close.
 #[cfg(target_os = "linux")]
 pub(crate) fn prefetch_advise(path: &Path) {
     use std::os::unix::io::AsRawFd;
@@ -272,7 +273,10 @@ pub(crate) fn prefetch_advise(path: &Path) {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+// Other Unix (macOS/BSD): mmap + madvise(WILLNEED). `memmap2::Mmap::advise` and
+// `memmap2::Advice` are `#[cfg(unix)]`, so this branch must EXCLUDE non-Unix
+// targets — otherwise Windows fails to compile (E0599/E0433).
+#[cfg(all(unix, not(target_os = "linux")))]
 pub(crate) fn prefetch_advise(path: &Path) {
     if let Ok(f) = File::open(path) {
         // Safety: file is opened read-only and the mapping is not aliased
@@ -282,6 +286,10 @@ pub(crate) fn prefetch_advise(path: &Path) {
         }
     }
 }
+
+// Non-Unix (e.g. Windows): no portable readahead hint — best-effort no-op.
+#[cfg(not(unix))]
+pub(crate) fn prefetch_advise(_path: &Path) {}
 
 /// Parse one shard into a tile-keyed local map.
 ///
