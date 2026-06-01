@@ -2329,7 +2329,11 @@ fn _encode_grouped_fragments(
     // a serial run and a parallel run emit byte-identical .glb files. This
     // changes ONLY node ordering, never geometry/accessors/encode logic.
     for (_k, frags) in tiles.iter_mut() {
-        frags.sort_by_key(|f| f.feature_id);
+        // frag_cmp leads with feature_id (strict refinement of the old key), so
+        // this cannot reorder distinct features (no synthetic re-bake) but also
+        // breaks ties between a feature's own multiple fragments in a tile —
+        // making GLB node order deterministic on real data.
+        frags.sort_by(crate::fragment::frag_cmp);
     }
 
     // Encode the fattest tiles first (load balancing). The outer ordering of
@@ -2986,7 +2990,7 @@ fn read_chunk_sorted(
         .into_iter()
         .collect();
     for (_k, v) in tiles.iter_mut() {
-        v.sort_by_key(|f| f.feature_id);
+        v.sort_by(crate::fragment::frag_cmp);
     }
     Ok(tiles)
 }
@@ -4180,7 +4184,7 @@ impl StreamingTileGenerator {
                     let mut tiles: Vec<((u32, u32, u32, u32), Vec<Fragment3D>)> =
                         groups.into_iter().collect();
                     for (_k, v) in tiles.iter_mut() {
-                        v.sort_by_key(|f| f.feature_id);
+                        v.sort_by(crate::fragment::frag_cmp);
                     }
                     Ok(collect_parquet_rows(&tiles, &wb, max_zoom, base_cells))
                 })
@@ -4250,7 +4254,7 @@ impl StreamingTileGenerator {
                     let mut tiles: Vec<((u32, u32, u32, u32), Vec<Fragment3D>)> =
                         groups.into_iter().collect();
                     for (_k, v) in tiles.iter_mut() {
-                        v.sort_by_key(|f| f.feature_id);
+                        v.sort_by(crate::fragment::frag_cmp);
                     }
                     let rows = collect_parquet_rows(&tiles, &wb, max_zoom, base_cells);
                     if rows.is_empty() {
@@ -5329,7 +5333,7 @@ impl StreamingTileGenerator {
     ///   {output_dir}/segment_properties/info (metadata from tags)
     ///
     /// Returns the number of segments written.
-    #[pyo3(signature = (output_dir, world_bounds, vertex_quantization_bits=10, max_memory_bytes=0))]
+    #[pyo3(signature = (output_dir, world_bounds, vertex_quantization_bits=10, max_memory_bytes=0, sharded=false, minishard_bits=6, shard_bits=0))]
     fn generate_neuroglancer_multilod(
         &mut self,
         py: Python<'_>,
@@ -5337,6 +5341,9 @@ impl StreamingTileGenerator {
         world_bounds: (f64, f64, f64, f64, f64, f64),
         vertex_quantization_bits: u8,
         max_memory_bytes: usize,
+        sharded: bool,
+        minishard_bits: u8,
+        shard_bits: u8,
     ) -> PyResult<u32> {
         // WS-B: resolve the per-path memory ceiling (explicit arg wins, else the
         // generator's resolved ceiling). Now USED to derive the feature-bucket
@@ -5419,6 +5426,23 @@ impl StreamingTileGenerator {
         let chunk_shape = [dx / n_tiles, dy / n_tiles, dz / n_tiles];
         let grid_origin = [xmin as f32, ymin as f32, zmin as f32];
 
+        // T6: opt-in `neuroglancer_uint64_sharded_v1` output. The loose
+        // per-segment files stay the default. In sharded mode each segment's
+        // (manifest, fragment bytes) is accumulated and packed into `.shard`
+        // files AFTER the bucket loop (the shard index can only be built once all
+        // per-feature bytes are known). NOTE: this accumulation holds the NG mesh
+        // corpus in RAM — it does NOT preserve WS-B's per-bucket memory bound, so
+        // it is an opt-in deploy-scale path; a streaming-to-disk writer is a
+        // follow-up. The loose path is unchanged and stays bounded.
+        let sharding_spec = crate::ng_sharded::ShardingSpec {
+            preshift_bits: 0,
+            minishard_bits: minishard_bits as u32,
+            shard_bits: shard_bits as u32,
+        };
+        let sharded_segments: std::sync::Mutex<Vec<(u64, Vec<u8>, Vec<u8>)>> =
+            std::sync::Mutex::new(Vec::new());
+        let sharded_ref = &sharded_segments;
+
         let count = py.allow_threads(|| {
             std::fs::create_dir_all(&out_dir).ok();
 
@@ -5431,13 +5455,24 @@ impl StreamingTileGenerator {
                 0.0, 1.0, 0.0, 0.0,
                 0.0, 0.0, 1.0, 0.0,
             ];
-            let info = serde_json::json!({
+            let mut info = serde_json::json!({
                 "@type": "neuroglancer_multilod_draco",
                 "vertex_quantization_bits": qbits,
                 "transform": transform,
                 "lod_scale_multiplier": 1.0,
                 "segment_properties": "segment_properties"
             });
+            if sharded {
+                info["sharding"] = serde_json::json!({
+                    "@type": "neuroglancer_uint64_sharded_v1",
+                    "preshift_bits": 0,
+                    "hash": "murmurhash3_x86_128",
+                    "minishard_bits": minishard_bits,
+                    "shard_bits": shard_bits,
+                    "minishard_index_encoding": "raw",
+                    "data_encoding": "raw"
+                });
+            }
             let info_str = serde_json::to_string_pretty(&info).unwrap_or_default();
             std::fs::write(out_dir.join("info"), info_str).ok();
 
@@ -5745,12 +5780,22 @@ impl StreamingTileGenerator {
                         for &off in fo { index_buf.extend_from_slice(&off.to_le_bytes()); }
                     }
 
-                    let index_path = out_dir.join(format!("{}.index", feature_id));
-                    std::fs::write(&index_path, &index_buf).ok();
-
-                    // Write concatenated Draco data
-                    let data_path = out_dir.join(feature_id.to_string());
-                    std::fs::write(&data_path, &all_draco_data).ok();
+                    if sharded {
+                        // Accumulate (label, manifest, fragment bytes) for the
+                        // final shard-assembly pass; loose files are NOT written
+                        // in this mode. write_sharded sorts internally, so the
+                        // parallel push order does not affect output.
+                        sharded_ref
+                            .lock()
+                            .unwrap()
+                            .push((*feature_id as u64, index_buf, all_draco_data));
+                    } else {
+                        let index_path = out_dir.join(format!("{}.index", feature_id));
+                        std::fs::write(&index_path, &index_buf).ok();
+                        // Write concatenated Draco data
+                        let data_path = out_dir.join(feature_id.to_string());
+                        std::fs::write(&data_path, &all_draco_data).ok();
+                    }
 
                     1u32
                 })
@@ -5760,6 +5805,22 @@ impl StreamingTileGenerator {
                 // `bucket_features` (the heavy per-feature geometry for THIS
                 // bucket) is dropped here at the end of the loop iteration,
                 // before the next bucket is read — this is what bounds peak RSS.
+            }
+
+            // T6: assemble the sharded output now that every segment's bytes are
+            // known (the shard index references all minishard indexes). In loose
+            // mode the per-segment files were written inside the loop instead.
+            if sharded {
+                let segs = std::mem::take(&mut *sharded_ref.lock().unwrap());
+                if let Err(e) = crate::ng_sharded::write_sharded(&out_dir, segs, sharding_spec) {
+                    collector_ref.record_failure(
+                        "neuroglancer",
+                        Severity::Fatal,
+                        "<sharded write>",
+                        "write",
+                        &e.to_string(),
+                    );
+                }
             }
 
             // WS-B: build segment_properties in a SEPARATE final pass over the

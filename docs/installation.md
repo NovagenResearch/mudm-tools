@@ -70,6 +70,12 @@ After modifying Rust code, rebuild with:
 maturin develop --uv
 ```
 
+> **Performance note.** `maturin develop` builds the *dev* profile. Dependencies
+> (including the Draco encoder) are compiled at `opt-level=3` even in dev (see
+> `[profile.dev.package."*"]` in `rust/Cargo.toml`), so the hot encode path is
+> fast locally. For benchmarking the full pipeline, still build optimized:
+> `maturin develop --release --uv`. Distributed wheels are always release-built.
+
 ## Verify Installation
 
 ```python

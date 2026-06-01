@@ -54,6 +54,59 @@ impl Fragment3D {
     }
 }
 
+/// Deterministic TOTAL order over `Fragment3D`, used to canonicalize the order
+/// of the fragments a feature contributes to a tile.
+///
+/// The parallel grouped read merges per-shard thread-local maps via a `DashMap`,
+/// so the per-feature `Vec<Fragment3D>` order is nondeterministic across runs and
+/// between serial/parallel reads. Consumers that are sensitive to that order —
+/// notably the Neuroglancer multilod path, which merges a tile's fragments into
+/// ONE shared `vertex_map` with first-occurrence index assignment — then produce
+/// nondeterministic output bytes. Sorting each feature's fragments with this
+/// comparator before consumption removes that nondeterminism at the source.
+///
+/// It is a STRICT REFINEMENT of `feature_id` (the leading field), so substituting
+/// it for the existing `sort_by_key(|f| f.feature_id)` sites can only further-order
+/// fragments that previously tied — it never reorders distinct feature_ids — and
+/// therefore cannot change output that was already deterministic.
+///
+/// Distinct fragments never compare `Equal`: the geometry content (`ring_lengths`,
+/// then `xy`/`z` via the IEEE-754 `total_cmp` total order) is the tiebreak, so the
+/// sort is reproducible even for multiple distinct fragments sharing a tile.
+pub fn frag_cmp(a: &Fragment3D, b: &Fragment3D) -> std::cmp::Ordering {
+    a.feature_id
+        .cmp(&b.feature_id)
+        .then_with(|| a.tile_z.cmp(&b.tile_z))
+        .then_with(|| a.tile_x.cmp(&b.tile_x))
+        .then_with(|| a.tile_y.cmp(&b.tile_y))
+        .then_with(|| a.tile_d.cmp(&b.tile_d))
+        .then_with(|| a.geom_type.cmp(&b.geom_type))
+        // ring_lengths: Vec<u32> has a native lexicographic Ord (no floats).
+        .then_with(|| a.ring_lengths.cmp(&b.ring_lengths))
+        // Compare lengths BEFORE elements so a prefix sorts before its extension
+        // and the elementwise zip never under-reads.
+        .then_with(|| a.xy.len().cmp(&b.xy.len()))
+        .then_with(|| lex_f32(&a.xy, &b.xy))
+        .then_with(|| a.z.len().cmp(&b.z.len()))
+        .then_with(|| lex_f32(&a.z, &b.z))
+}
+
+/// Lexicographic compare of two f32 slices via the IEEE-754 totalOrder
+/// (`f32::total_cmp`): deterministic and platform-independent, distinguishes
+/// -0.0 < +0.0, and orders NaN without panicking — unlike `PartialOrd`. (Raw
+/// `to_bits()` integer compare would mis-order negatives; `total_cmp` applies the
+/// sign transform.) Lengths are compared by the caller before this is reached.
+#[inline]
+fn lex_f32(a: &[f32], b: &[f32]) -> std::cmp::Ordering {
+    for (x, y) in a.iter().zip(b.iter()) {
+        match x.total_cmp(y) {
+            std::cmp::Ordering::Equal => continue,
+            non_eq => return non_eq,
+        }
+    }
+    std::cmp::Ordering::Equal
+}
+
 /// Append-only fragment writer with f32 + ZSTD compression.
 ///
 /// Each writer owns one ZSTD-compressed file. For parallel ingestion,
@@ -505,7 +558,13 @@ impl Fragment3DReader {
                 format!("{} shard(s) failed to parse: {}", errs.len(), errs.join("; ")),
             ));
         }
-        Ok(groups.into_iter().collect())
+        // Canonicalize each feature's fragment order — the DashMap merge above is
+        // nondeterministic, and the NG multilod consumer is order-sensitive.
+        let mut grouped: AHashMap<u32, Vec<Fragment3D>> = groups.into_iter().collect();
+        for v in grouped.values_mut() {
+            v.sort_by(frag_cmp);
+        }
+        Ok(grouped)
     }
 
     /// Non-fatal sibling of `read_all_grouped_by_feature_parallel`.
@@ -609,7 +668,13 @@ impl Fragment3DReader {
             run(); // global pool
         }
         let errs = errors.into_inner().unwrap();
-        Ok((groups.into_iter().collect(), errs))
+        // Canonicalize each feature's fragment order (see frag_cmp) so the
+        // order-sensitive NG multilod consumer is run-to-run deterministic.
+        let mut grouped: AHashMap<u32, Vec<Fragment3D>> = groups.into_iter().collect();
+        for v in grouped.values_mut() {
+            v.sort_by(frag_cmp);
+        }
+        Ok((grouped, errs))
     }
 }
 
@@ -1092,5 +1157,57 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn frag_cmp_is_deterministic_total_order() {
+        use std::cmp::Ordering;
+        let mk = |fid: u32, gt: u8, xy: Vec<f32>, z: Vec<f32>, rl: Vec<u32>| Fragment3D {
+            feature_id: fid,
+            tile_z: 1,
+            tile_x: 1,
+            tile_y: 1,
+            tile_d: 1,
+            geom_type: gt,
+            xy,
+            z,
+            ring_lengths: rl,
+        };
+
+        // (1) leads with feature_id — strict refinement of the old sort_by_key key.
+        let a = mk(1, 5, vec![9.0], vec![9.0], vec![9]);
+        let b = mk(2, 4, vec![0.0], vec![0.0], vec![1]);
+        assert_eq!(frag_cmp(&a, &b), Ordering::Less);
+
+        // (2) tie on the 6-tuple -> ring_lengths breaks it.
+        let c = mk(1, 5, vec![0.0], vec![0.0], vec![3]);
+        let d = mk(1, 5, vec![0.0], vec![0.0], vec![4]);
+        assert_eq!(frag_cmp(&c, &d), Ordering::Less);
+
+        // (3) tie through ring_lengths -> xy content breaks it.
+        let e = mk(1, 5, vec![0.0, 0.0], vec![0.0], vec![3]);
+        let f = mk(1, 5, vec![0.0, 1.0], vec![0.0], vec![3]);
+        assert_eq!(frag_cmp(&e, &f), Ordering::Less);
+
+        // (4) prefix sorts before extension (length compared before elements).
+        let g = mk(1, 5, vec![0.0], vec![0.0], vec![3]);
+        let h = mk(1, 5, vec![0.0, 0.0], vec![0.0], vec![3]);
+        assert_eq!(frag_cmp(&g, &h), Ordering::Less);
+
+        // (5) -0.0 vs +0.0 resolves deterministically (total_cmp: -0.0 < +0.0),
+        //     and is NOT Equal (harmless: such a pair encodes to identical bytes).
+        let i = mk(1, 5, vec![-0.0], vec![0.0], vec![3]);
+        let j = mk(1, 5, vec![0.0], vec![0.0], vec![3]);
+        assert_eq!(frag_cmp(&i, &j), Ordering::Less);
+
+        // (6) byte-identical fragments compare Equal; distinct ones never do.
+        let k1 = mk(7, 5, vec![1.0, 2.0], vec![3.0], vec![3]);
+        let k2 = mk(7, 5, vec![1.0, 2.0], vec![3.0], vec![3]);
+        assert_eq!(frag_cmp(&k1, &k2), Ordering::Equal);
+
+        // antisymmetry: cmp(a,b) == cmp(b,a).reverse() for every pair.
+        for (x, y) in [(&a, &b), (&c, &d), (&e, &f), (&g, &h), (&i, &j)] {
+            assert_eq!(frag_cmp(x, y), frag_cmp(y, x).reverse());
+        }
     }
 }
