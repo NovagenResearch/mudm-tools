@@ -1,0 +1,139 @@
+site_name: mudm-tools
+site_description: >-
+  Processing pipelines, tiling engines, and format converters for muDM spatial data.
+site_url: https://novagenresearch.github.io/mudm-tools/
+site_author: Bengt Ljungquist
+
+repo_url: https://github.com/NovagenResearch/mudm-tools
+repo_name: NovagenResearch/mudm-tools
+edit_uri: edit/main/docs/
+
+copyright: Copyright &copy; muDM contributors — MIT License
+
+theme:
+  name: material
+  features:
+    - navigation.tabs
+    - navigation.tabs.sticky
+    - navigation.sections
+    - navigation.top
+    - navigation.indexes
+    - navigation.tracking
+    - navigation.footer
+    - toc.follow
+    - search.suggest
+    - search.highlight
+    - search.share
+    - content.code.copy
+    - content.code.annotate
+    - content.tabs.link
+    - content.tooltips
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+  icon:
+    repo: fontawesome/brands/github
+    edit: material/pencil
+    view: material/eye
+
+plugins:
+  - search
+  - mkdocstrings:
+      default_handler: python
+      handlers:
+        python:
+          options:
+            docstring_style: google
+            docstring_section_style: table
+            # Our source + the third-party `mudm` core package use prose / pydantic
+            # field docstrings that are not strict Google style. Silence griffe's
+            # docstring-style warnings so `--strict` only fails on real doc defects
+            # (broken links, missing objects, bad nav) — not docstring formatting.
+            docstring_options:
+              warnings: false
+              warn_unknown_params: false
+              warn_missing_types: false
+            show_root_heading: true
+            show_root_full_path: false
+            show_symbol_type_heading: true
+            show_symbol_type_toc: true
+            show_source: true
+            members_order: source
+            separate_signature: true
+            show_signature_annotations: true
+            signature_crossrefs: true
+            merge_init_into_class: true
+            filters:
+              - "!^_"
+
+markdown_extensions:
+  - abbr
+  - admonition
+  - attr_list
+  - def_list
+  - footnotes
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+      title: On this page
+  - pymdownx.highlight:
+      anchor_linenums: true
+      line_spans: __span
+      pygments_lang_class: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.details
+  - pymdownx.keys
+  - pymdownx.caret
+  - pymdownx.mark
+  - pymdownx.tilde
+  - pymdownx.tasklist:
+      custom_checkbox: true
+  - pymdownx.emoji:
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
+
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/NovagenResearch/mudm-tools
+
+nav:
+  - Home: index.md
+  - Installation: installation.md
+  - Getting Started: getting-started.md
+  - Guides:
+      - guides/index.md
+      - guides/2d-tiling.md
+      - guides/3d-tiling.md
+      - guides/converters.md
+      - guides/neuroglancer.md
+      - guides/geoparquet-gltf.md
+      - guides/ome-ngff.md
+      - guides/legacy-pipeline.md
+  - Reference:
+      - reference/index.md
+      - reference/tilejson.md
+      - reference/cli.md
+      - reference/python-api.md
+  - Roadmap: roadmap.md
