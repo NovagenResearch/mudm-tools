@@ -75,11 +75,6 @@ pythonpath = ["src/", "scripts/"]
 dev = [
     "maturin>=1.13.1",
     "pytest>=9.0.3",
-    # torch is a runtime dep of active_learning/classifiers/xenium_mlp.py and of
-    # the benchmark/probe scripts + their tests. It was previously undeclared
-    # (present only ad-hoc in the venv); declared here so the test suite is
-    # reproducible. Runtime users of the ML classifier should install torch too.
-    "torch>=2.6",
 ]
 docs = [
     "mkdocs-material>=9.7.6",
