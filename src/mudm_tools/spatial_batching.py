@@ -22,6 +22,7 @@ Tiles whose row count is at least ``batch_size`` are emitted as one or more
 single-tile batches; only the leftover from such a tile (the modulo remainder)
 spills into the carry buffer.
 """
+
 from __future__ import annotations
 
 from pathlib import Path

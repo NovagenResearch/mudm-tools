@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import random
 import math
-from typing import List, Tuple, Dict, Any, Optional
+from typing import List, Tuple, Optional
 
 from geojson_pydantic import Point, LineString
 
@@ -56,12 +56,14 @@ def _make_triangle_cluster(
         p1 = ring[i]
         p2 = ring[(i + 1) % n_triangles]
         # TIN face: one ring, 4 positions (3 verts + close)
-        face = [[
-            [cx, cy, cz],
-            [p1[0], p1[1], p1[2]],
-            [p2[0], p2[1], p2[2]],
-            [cx, cy, cz],  # close
-        ]]
+        face = [
+            [
+                [cx, cy, cz],
+                [p1[0], p1[1], p1[2]],
+                [p2[0], p2[1], p2[2]],
+                [cx, cy, cz],  # close
+            ]
+        ]
         faces.append(face)
     return faces
 
@@ -84,12 +86,14 @@ def generate_random_tins(
         cx, cy, cz = _random_point_in_bounds(bounds)
         faces = _make_triangle_cluster(cx, cy, cz, radius, triangles_per_tin)
         geom = TIN(type="TIN", coordinates=faces)
-        features.append(MuDMFeature(
-            type="Feature",
-            id=i,
-            geometry=geom,
-            properties={"kind": "tin", "triangles": triangles_per_tin},
-        ))
+        features.append(
+            MuDMFeature(
+                type="Feature",
+                id=i,
+                geometry=geom,
+                properties={"kind": "tin", "triangles": triangles_per_tin},
+            )
+        )
     return features
 
 
@@ -101,13 +105,15 @@ def generate_random_points_3d(
     features: List[MuDMFeature] = []
     for i in range(n):
         x, y, z = _random_point_in_bounds(bounds)
-        geom = Point(type="Point", coordinates=[x, y, z])
-        features.append(MuDMFeature(
-            type="Feature",
-            id=1000 + i,
-            geometry=geom,
-            properties={"kind": "point"},
-        ))
+        geom = Point(type="Point", coordinates=[x, y, z])  # type: ignore[arg-type]  # geojson-pydantic accepts coord lists
+        features.append(
+            MuDMFeature(
+                type="Feature",
+                id=1000 + i,
+                geometry=geom,
+                properties={"kind": "point"},
+            )
+        )
     return features
 
 
@@ -122,13 +128,15 @@ def generate_random_lines_3d(
     for i in range(n):
         nv = random.randint(min_verts, max_verts)
         coords = [list(_random_point_in_bounds(bounds)) for _ in range(nv)]
-        geom = LineString(type="LineString", coordinates=coords)
-        features.append(MuDMFeature(
-            type="Feature",
-            id=2000 + i,
-            geometry=geom,
-            properties={"kind": "line", "vertices": nv},
-        ))
+        geom = LineString(type="LineString", coordinates=coords)  # type: ignore[arg-type]  # geojson-pydantic accepts coord lists
+        features.append(
+            MuDMFeature(
+                type="Feature",
+                id=2000 + i,
+                geometry=geom,
+                properties={"kind": "line", "vertices": nv},
+            )
+        )
     return features
 
 
@@ -179,7 +187,8 @@ def generate_3d_collection(
     # Attach random metadata via polygen helpers
     if n_meta_keys > 0:
         _, meta_values_options = assign_meta_types_and_values(
-            n_meta_keys, n_meta_variants,
+            n_meta_keys,
+            n_meta_variants,
         )
         for feat in all_features:
             extra = generate_meta_values(meta_values_options)

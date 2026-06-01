@@ -6,7 +6,6 @@ import json
 from typing import Any
 
 import pyarrow as pa
-import shapely
 
 from mudm.model import (
     MuDMFeature,
@@ -19,10 +18,10 @@ from ._geometry import (
 )
 from .models import ArrowConfig
 
-
 # ---------------------------------------------------------------------------
 # Property type inference
 # ---------------------------------------------------------------------------
+
 
 def _infer_pa_type(values: list[Any]) -> pa.DataType:
     """Infer a pyarrow type from a list of non-None values."""
@@ -38,9 +37,7 @@ def _infer_pa_type(values: list[Any]) -> pa.DataType:
     if all_int:
         return pa.int64()
 
-    all_numeric = all(
-        isinstance(v, (int, float)) and not isinstance(v, bool) for v in values
-    )
+    all_numeric = all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in values)
     if all_numeric:
         return pa.float64()
 
@@ -71,6 +68,7 @@ def _coerce_value(value: Any, pa_type: pa.DataType) -> Any:
 # ---------------------------------------------------------------------------
 # Row extraction
 # ---------------------------------------------------------------------------
+
 
 def _extract_rows(
     features: list[MuDMFeature],
@@ -143,6 +141,7 @@ def _build_schema(
 # GeoParquet metadata
 # ---------------------------------------------------------------------------
 
+
 def _geoparquet_metadata(
     rows: list[dict[str, Any]],
     config: ArrowConfig,
@@ -183,6 +182,7 @@ def _geoparquet_metadata(
 # ---------------------------------------------------------------------------
 # Public: build table
 # ---------------------------------------------------------------------------
+
 
 def build_table(
     data: MuDMFeature | MuDMFeatureCollection,

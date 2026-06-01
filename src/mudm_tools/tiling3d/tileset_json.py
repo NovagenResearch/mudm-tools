@@ -14,8 +14,12 @@ from .projector3d import CartesianProjector3D
 
 
 def _box_volume(
-    xmin: float, ymin: float, zmin: float,
-    xmax: float, ymax: float, zmax: float,
+    xmin: float,
+    ymin: float,
+    zmin: float,
+    xmax: float,
+    ymax: float,
+    zmax: float,
 ) -> list[float]:
     """Build an OGC 3D Tiles oriented bounding box (12 floats).
 
@@ -53,7 +57,10 @@ def _geometric_error(
 
 
 def _tile_bounds_world(
-    z: int, x: int, y: int, d: int,
+    z: int,
+    x: int,
+    y: int,
+    d: int,
     proj: CartesianProjector3D,
 ) -> tuple[float, float, float, float, float, float]:
     """Compute world-space bounding box for a tile address."""
@@ -105,7 +112,10 @@ def generate_tileset_json(
     root_box = _box_volume(*world_bounds)
 
     def _build_node(
-        z: int, x: int, y: int, d: int,
+        z: int,
+        x: int,
+        y: int,
+        d: int,
     ) -> dict[str, Any] | None:
         """Recursively build a tileset node."""
         if (z, x, y, d) not in all_tiles:

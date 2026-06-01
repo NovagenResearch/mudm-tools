@@ -5,7 +5,7 @@ from mudm.tilemodel import TileModel
 
 def main():
     # Load a TileJSON metadata file from the 'tiles' folder
-    with open('tiles/metadata.json', 'r') as f:
+    with open("tiles/metadata.json", "r") as f:
         tilejson_data = json.load(f)
 
     # Construct a TileModel from the parsed data
@@ -21,7 +21,7 @@ def main():
     print(microjson_data)
 
     # save the mudm data to a file
-    with open('tiles/microjson_data_read.json', 'w') as f:
+    with open("tiles/microjson_data_read.json", "w") as f:
         json.dump(microjson_data, f)
 
 

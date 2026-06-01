@@ -1,5 +1,6 @@
 """Rust gltf decoder Python binding: must decode a GLB file and return
 vertex positions + triangle indices matching pygltflib output bit-for-bit."""
+
 from pathlib import Path
 
 import numpy as np
@@ -7,7 +8,6 @@ import pygltflib
 import pytest
 
 from mudm_tools._rs import decode_glb_buffer
-
 
 FIXTURE_GLB = Path(__file__).parent / "fixtures" / "sample_tile.glb"
 
@@ -45,16 +45,12 @@ def test_rust_gltf_decoder_handles_multi_primitive(two_primitive_glb):
     # Cross-validate: positions concatenate prim0 then prim1
     np.testing.assert_array_almost_equal(
         rust_positions[:4],
-        np.array(
-            [[0, 0, 0], [1, 0, 0], [1, 1, 0], [0, 1, 0]], dtype=np.float32
-        ),
+        np.array([[0, 0, 0], [1, 0, 0], [1, 1, 0], [0, 1, 0]], dtype=np.float32),
         decimal=5,
     )
     np.testing.assert_array_almost_equal(
         rust_positions[4:],
-        np.array(
-            [[2, 2, 2], [3, 2, 2], [3, 3, 2], [2, 3, 2]], dtype=np.float32
-        ),
+        np.array([[2, 2, 2], [3, 2, 2], [3, 3, 2], [2, 3, 2]], dtype=np.float32),
         decimal=5,
     )
 

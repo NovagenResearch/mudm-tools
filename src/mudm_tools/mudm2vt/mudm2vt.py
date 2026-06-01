@@ -142,9 +142,7 @@ class MuDMVt:
             options (dict): The options to be used for generating vector tiles
             log_level (int): The logging level to be used
         """
-        logging.basicConfig(
-            level=log_level, format="%(asctime)s %(levelname)s %(message)s"
-        )
+        logging.basicConfig(level=log_level, format="%(asctime)s %(levelname)s %(message)s")
         defaults = get_default_options()
         defaults.update(options)
         options = self.options = defaults
@@ -153,9 +151,7 @@ class MuDMVt:
         tolerance_setting = options.get("tolerance_function")
         if isinstance(tolerance_setting, str):
             if tolerance_setting in AVAILABLE_TOLERANCE_FUNCTIONS:
-                options["tolerance_function"] = AVAILABLE_TOLERANCE_FUNCTIONS[
-                    tolerance_setting
-                ]
+                options["tolerance_function"] = AVAILABLE_TOLERANCE_FUNCTIONS[tolerance_setting]
             else:
                 raise ValueError(
                     f"Invalid tolerance function key: '{tolerance_setting}'. "
@@ -171,9 +167,7 @@ class MuDMVt:
 
         if options.get("maxZoom") < 0 or options.get("maxZoom") > 24:
             raise Exception("maxZoom should be in the 0-24 range")
-        if options.get("promoteId", None) is not None and options.get(
-            "generateId", False
-        ):
+        if options.get("promoteId", None) is not None and options.get("generateId", False):
             raise Exception("promoteId and generateId cannot be used together.")
 
         # projects and adds simplification info
@@ -199,9 +193,7 @@ class MuDMVt:
                     for iring in range(len(feature[geometry_key])):
                         ring = feature[geometry_key][iring]
                         # Convert geom to list of [x, y] pairs
-                        coords = [
-                            [ring[i], ring[i + 1]] for i in range(0, len(ring), 3)
-                        ]
+                        coords = [[ring[i], ring[i + 1]] for i in range(0, len(ring), 3)]
                         scoords = simplify(coords, tolerance)
                         # Check that it has at least 4 pairs of coordinates
                         if len(scoords) < 4:
@@ -266,8 +258,7 @@ class MuDMVt:
             if tile is None:
                 # Use simplified geometries for this zoom level
                 simplified_features = [
-                    {**feature, "geometry": feature[f"geometry_z{z}"]}
-                    for feature in features
+                    {**feature, "geometry": feature[f"geometry_z{z}"]} for feature in features
                 ]
 
                 self.tiles[id_] = create_tile(simplified_features, z, x, y, options)
@@ -285,9 +276,9 @@ class MuDMVt:
             if cz is None:
                 # stop tiling if we reached max zoom, or if the tile is too
                 # simple
-                if z == options.get("indexMaxZoom") or tile.get(
-                    "numPoints"
-                ) <= options.get("indexMaxPoints"):
+                if z == options.get("indexMaxZoom") or tile.get("numPoints") <= options.get(
+                    "indexMaxPoints"
+                ):
                     continue  # if a drilldown to a specific tile
             elif z == options.get("maxZoom") or z == cz:
                 # stop tiling if we reached base zoom or our target tile zoom

@@ -21,26 +21,23 @@ asserting equality.
 
 import hashlib
 import json
-import resource
-import sys
 from pathlib import Path
 
 import pytest
 
 try:
     from mudm_tools._rs import StreamingTileGenerator
+
     RUST_AVAILABLE = True
 except ImportError:
     RUST_AVAILABLE = False
 
-pytestmark = pytest.mark.skipif(
-    not RUST_AVAILABLE, reason="Rust extensions not compiled"
-)
+pytestmark = pytest.mark.skipif(not RUST_AVAILABLE, reason="Rust extensions not compiled")
 
 WORLD_BOUNDS = (0.0, 0.0, 0.0, 100.0, 200.0, 300.0)
 
-HUGE = 1 << 40   # 1 TiB — forces k == 1 (whole-corpus equivalent)
-TINY = 1         # 1 byte — forces k > 1 (max buckets, one feature class per bucket)
+HUGE = 1 << 40  # 1 TiB — forces k == 1 (whole-corpus equivalent)
+TINY = 1  # 1 byte — forces k > 1 (max buckets, one feature class per bucket)
 
 
 def _make_tin_feature(xy, z, ring_lengths, tags=None):
@@ -62,6 +59,7 @@ def _make_tin_feature(xy, z, ring_lengths, tags=None):
 
 def _make_dense_tin_feature(n_triangles=20, seed=42, tags=None):
     import random
+
     rng = random.Random(seed)
     xy = []
     z = []
@@ -115,6 +113,7 @@ def _multi_feature_corpus(n=8):
 # (a) byte-identity: bucketed (k>1) == whole-corpus (k==1)
 # ---------------------------------------------------------------------------
 
+
 class TestByteIdentityBucketed:
 
     def test_k1_vs_k_gt_1_byte_identical(self, tmp_path):
@@ -136,9 +135,9 @@ class TestByteIdentityBucketed:
         bucketed = _canon_geometry(out2)
 
         assert n1 == n2
-        assert bucketed == baseline, (
-            "bucketed (k>1) NG geometry must be byte-identical to whole-corpus (k==1)"
-        )
+        assert (
+            bucketed == baseline
+        ), "bucketed (k>1) NG geometry must be byte-identical to whole-corpus (k==1)"
 
     def test_serial_equals_parallel_byte_identical(self, tmp_path):
         """PRIMARY gate: serial (io_threads=1) == parallel read, byte-identical,
@@ -146,14 +145,14 @@ class TestByteIdentityBucketed:
         feats = _multi_feature_corpus(8)
 
         gen_s, _ = _build(feats)
-        gen_s._set_io_threads(1)     # serial
+        gen_s._set_io_threads(1)  # serial
         gen_s._set_max_memory(TINY)  # k>1
         out_s = tmp_path / "ng_serial"
         gen_s.generate_neuroglancer_multilod(str(out_s), WORLD_BOUNDS)
         assert gen_s._get_ng_bucket_count() > 1
 
         gen_p, _ = _build(feats)
-        gen_p._set_io_threads(4)     # parallel
+        gen_p._set_io_threads(4)  # parallel
         gen_p._set_max_memory(TINY)  # k>1
         out_p = tmp_path / "ng_parallel"
         gen_p.generate_neuroglancer_multilod(str(out_p), WORLD_BOUNDS)
@@ -187,6 +186,7 @@ class TestByteIdentityBucketed:
 # ---------------------------------------------------------------------------
 # (b) memory bounded
 # ---------------------------------------------------------------------------
+
 
 class TestMemoryBounded:
 
@@ -272,6 +272,7 @@ class TestMemoryBounded:
 # (c) numeric props (separate JSON test) — geometry UNCHANGED
 # ---------------------------------------------------------------------------
 
+
 class TestNumericProps:
 
     def test_all_numeric_column_emits_number_and_data_type(self, tmp_path):
@@ -318,14 +319,15 @@ class TestNumericProps:
         out_l = tmp_path / "lbl"
         gen_l.generate_neuroglancer_multilod(str(out_l), WORLD_BOUNDS)
 
-        assert _canon_geometry(out_n) == _canon_geometry(out_l), (
-            "numeric vs label tags must not change Draco geometry bytes"
-        )
+        assert _canon_geometry(out_n) == _canon_geometry(
+            out_l
+        ), "numeric vs label tags must not change Draco geometry bytes"
 
 
 # ---------------------------------------------------------------------------
 # (d) errors fold into the WS-D ErrorCollector exactly once
 # ---------------------------------------------------------------------------
+
 
 class TestErrorFolding:
 
@@ -354,8 +356,10 @@ class TestErrorFolding:
 
         errlog = run_dir / "errors.jsonl"
         assert errlog.exists(), "errors.jsonl must be written when run_dir is set"
-        lines = [json.loads(l) for l in errlog.read_text().splitlines() if l.strip()]
-        corrupt_lines = [r for r in lines if "zz_corrupt.mjf" in r["item"] or "zz_corrupt.mjf" in r["message"]]
-        assert len(corrupt_lines) == 1, (
-            f"corrupt shard must surface exactly once, got {len(corrupt_lines)}: {corrupt_lines}"
-        )
+        lines = [json.loads(line) for line in errlog.read_text().splitlines() if line.strip()]
+        corrupt_lines = [
+            r for r in lines if "zz_corrupt.mjf" in r["item"] or "zz_corrupt.mjf" in r["message"]
+        ]
+        assert (
+            len(corrupt_lines) == 1
+        ), f"corrupt shard must surface exactly once, got {len(corrupt_lines)}: {corrupt_lines}"

@@ -54,9 +54,7 @@ def linestring_to_shapely(geom: LineString) -> ShapelyLineString:
 
 
 def multilinestring_to_shapely(geom: MultiLineString) -> ShapelyMultiLineString:
-    return ShapelyMultiLineString(
-        [[_coords(p) for p in line] for line in geom.coordinates]
-    )
+    return ShapelyMultiLineString([[_coords(p) for p in line] for line in geom.coordinates])
 
 
 def polygon_to_shapely(geom: Polygon) -> ShapelyPolygon:

@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import sys
 
 
 def main():
@@ -26,27 +25,38 @@ def main():
         "convert", help="Convert source data to muDM tiled format"
     )
     convert_parser.add_argument(
-        "--format", "-f", required=True,
+        "--format",
+        "-f",
+        required=True,
         help="Source format (xenium, obj, geojson)",
     )
     convert_parser.add_argument(
-        "--input", "-i", required=True,
+        "--input",
+        "-i",
+        required=True,
         help="Path to source data directory or file",
     )
     convert_parser.add_argument(
-        "--output", "-o", required=True,
+        "--output",
+        "-o",
+        required=True,
         help="Path for tiled output",
     )
     convert_parser.add_argument(
-        "--config", "-c", default=None,
+        "--config",
+        "-c",
+        default=None,
         help="Path to JSON config file with converter-specific settings",
     )
     convert_parser.add_argument(
-        "--temp-dir", default=None,
+        "--temp-dir",
+        default=None,
         help="Temp directory for intermediate files",
     )
     convert_parser.add_argument(
-        "--max-zoom", type=int, default=None,
+        "--max-zoom",
+        type=int,
+        default=None,
         help="Override max zoom level",
     )
 
@@ -57,6 +67,7 @@ def main():
 
     if args.command == "list-formats":
         from mudm_tools.converters import list_formats
+
         for fmt in list_formats():
             print(f"  {fmt}")
         return

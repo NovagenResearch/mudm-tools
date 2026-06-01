@@ -35,8 +35,7 @@ def _require_dracopy():
         import DracoPy
     except ImportError:
         raise ImportError(
-            "DracoPy is required for Draco compression. "
-            "Install it with: pip install DracoPy"
+            "DracoPy is required for Draco compression. " "Install it with: pip install DracoPy"
         ) from None
     return DracoPy
 

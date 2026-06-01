@@ -1,8 +1,4 @@
-from mudm_tools.tilewriter import (
-    TileWriter,
-    getbounds,
-    extract_fields_ranges_enums
-)
+from mudm_tools.tilewriter import TileWriter, getbounds, extract_fields_ranges_enums
 from pathlib import Path
 from mudm.tilemodel import TileJSON, TileModel, TileLayer
 import os
@@ -12,9 +8,9 @@ import argparse
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("microjson_data_path", nargs='?',
-                        default="",
-                        help="Path to the MuDM data file")
+    parser.add_argument(
+        "microjson_data_path", nargs="?", default="", help="Path to the MuDM data file"
+    )
     args = parser.parse_args()
 
     if args.microjson_data_path:
@@ -22,8 +18,7 @@ def main():
         do_generate = False
 
         # Extract fields, ranges, enums from the provided MuDM
-        field_names, field_ranges, field_enums = extract_fields_ranges_enums(
-            microjson_data_path)
+        field_names, field_ranges, field_enums = extract_fields_ranges_enums(microjson_data_path)
 
         # Create a TileLayer including the extracted fields
         vector_layers = [
@@ -56,9 +51,7 @@ def main():
         meta_types = {
             "num_vertices": "int",
         }
-        meta_values_options = {
-            "polytype": ["Type1", "Type2", "Type3", "Type4"]
-        }
+        meta_values_options = {"polytype": ["Type1", "Type2", "Type3", "Type4"]}
 
         vector_layers = [
             TileLayer(
@@ -67,12 +60,8 @@ def main():
                 minzoom=0,
                 maxzoom=10,
                 description="Layer containing polygon data",
-                fieldranges={
-                    "num_vertices": [10, 100]
-                },
-                fieldenums={
-                    "polytype": ["Type1", "Type2", "Type3", "Type4"]
-                },
+                fieldranges={"num_vertices": [10, 100]},
+                fieldenums={"polytype": ["Type1", "Type2", "Type3", "Type4"]},
             )
         ]
 
@@ -83,15 +72,13 @@ def main():
             MAX_VERTICES,
             meta_types,
             meta_values_options,
-            microjson_data_path
+            microjson_data_path,
         )
 
     # get bounds
     maxbounds = getbounds(microjson_data_path, square=True)
 
-    center = [0,
-              (maxbounds[0] + maxbounds[2]) / 2,
-              (maxbounds[1] + maxbounds[3]) / 2]
+    center = [0, (maxbounds[0] + maxbounds[2]) / 2, (maxbounds[1] + maxbounds[3]) / 2]
 
     # Instantiate TileModel with your settings
     tile_model = TileModel(
@@ -105,7 +92,7 @@ def main():
         maxzoom=7,
         bounds=maxbounds,
         center=center,
-        vector_layers=vector_layers
+        vector_layers=vector_layers,
     )
 
     # Create the root model with your TileModel instance

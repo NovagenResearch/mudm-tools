@@ -15,7 +15,7 @@ import os
 import sys
 import warnings
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from mudm.model import MuDMFeatureCollection, Vocabulary
 from .convert3d import compute_bounds_3d, convert_collection_3d
@@ -52,6 +52,7 @@ def _get_mp_context() -> multiprocessing.context.BaseContext:
 
 # --- Module-level worker functions (fork: read from _SHARED_TILES) --------
 
+
 def _worker_pbf3(args: tuple) -> int:
     """Process a single pbf3 tile: transform → encode → write."""
     key, extent, extent_z, layer_name, output_dir = args
@@ -59,11 +60,15 @@ def _worker_pbf3(args: tuple) -> int:
     z, x, y, d = key
 
     transformed = transform_tile_3d(
-        tile, extent=extent, extent_z=extent_z,
+        tile,
+        extent=extent,
+        extent_z=extent_z,
     )
     data = encode_tile_3d(
-        transformed, layer_name=layer_name,
-        extent=extent, extent_z=extent_z,
+        transformed,
+        layer_name=layer_name,
+        extent=extent,
+        extent_z=extent_z,
     )
 
     tile_path = Path(output_dir) / str(z) / str(x) / str(y) / f"{d}.pbf3"
@@ -81,22 +86,27 @@ def _simplify_ratio(zoom: int, max_zoom: int) -> float:
     if zoom >= max_zoom:
         return 1.0
     levels_above = max_zoom - zoom
-    return 1.0 / (4 ** levels_above)
+    return 1.0 / (4**levels_above)
 
 
 def _worker_3dtiles(args: tuple) -> int:
     """Process a single 3dtiles tile: encode to GLB → write."""
     key, output_dir, max_zoom = args
     tile = _SHARED_TILES[key]
-    bounds6 = _SHARED_BOUNDS
+    assert _SHARED_BOUNDS is not None
+    bounds6 = cast("tuple[float, float, float, float, float, float]", _SHARED_BOUNDS)
     z, x, y, d = key
 
     from .gltf_encoder3d import tile_to_glb
+
     proj = CartesianProjector3D(bounds6)
     ratio = _simplify_ratio(z, max_zoom)
     data = tile_to_glb(
-        tile, proj, simplify_ratio=ratio,
-        world_bounds=bounds6, zoom=z,
+        tile,
+        proj,
+        simplify_ratio=ratio,
+        world_bounds=bounds6,
+        zoom=z,
     )
 
     tile_path = Path(output_dir) / str(z) / str(x) / str(y) / f"{d}.glb"
@@ -272,10 +282,7 @@ class TileGenerator3D:
         """Write protobuf-encoded .pbf3 tiles."""
         assert self._octree is not None
 
-        tiles = [
-            (k, t) for k, t in self._octree.all_tiles.items()
-            if k[0] >= self.config.min_zoom
-        ]
+        tiles = [(k, t) for k, t in self._octree.all_tiles.items() if k[0] >= self.config.min_zoom]
 
         n_workers = self._effective_workers()
         if n_workers <= 1 or len(tiles) < _MIN_TILES_FOR_MP:
@@ -283,7 +290,9 @@ class TileGenerator3D:
         return self._generate_pbf3_parallel(tiles, output_dir, n_workers)
 
     def _generate_pbf3_serial(
-        self, tiles: list, output_dir: Path,
+        self,
+        tiles: list,
+        output_dir: Path,
     ) -> int:
         """Single-threaded pbf3 tile generation."""
         count = 0
@@ -306,7 +315,10 @@ class TileGenerator3D:
         return count
 
     def _generate_pbf3_parallel(
-        self, tiles: list, output_dir: Path, n_workers: int,
+        self,
+        tiles: list,
+        output_dir: Path,
+        n_workers: int,
     ) -> int:
         """Multiprocessing pbf3 tile generation.
 
@@ -316,8 +328,7 @@ class TileGenerator3D:
         global _SHARED_TILES
         _SHARED_TILES = {key: tile for key, tile in tiles}
         args = [
-            (key, self.config.extent, self.config.extent_z,
-             self._layer_name, str(output_dir))
+            (key, self.config.extent, self.config.extent_z, self._layer_name, str(output_dir))
             for key, _ in tiles
         ]
         chunksize = max(1, len(args) // (n_workers * 4))
@@ -333,10 +344,7 @@ class TileGenerator3D:
         assert self._proj is not None
         assert self._bounds is not None
 
-        tiles = [
-            (k, t) for k, t in self._octree.all_tiles.items()
-            if k[0] >= self.config.min_zoom
-        ]
+        tiles = [(k, t) for k, t in self._octree.all_tiles.items() if k[0] >= self.config.min_zoom]
 
         n_workers = self._effective_workers()
         if n_workers <= 1 or len(tiles) < _MIN_TILES_FOR_MP:
@@ -344,18 +352,24 @@ class TileGenerator3D:
         return self._generate_3dtiles_parallel(tiles, output_dir, n_workers)
 
     def _generate_3dtiles_serial(
-        self, tiles: list, output_dir: Path,
+        self,
+        tiles: list,
+        output_dir: Path,
     ) -> int:
         """Single-threaded 3dtiles generation."""
         from .gltf_encoder3d import tile_to_glb
 
+        assert self._proj is not None
         max_z = self.config.max_zoom
         count = 0
         for (z, x, y, d), tile in tiles:
             ratio = _simplify_ratio(z, max_z)
             data = tile_to_glb(
-                tile, self._proj, simplify_ratio=ratio,
-                world_bounds=self._bounds, zoom=z,
+                tile,
+                self._proj,
+                simplify_ratio=ratio,
+                world_bounds=self._bounds,
+                zoom=z,
             )
             tile_path = output_dir / str(z) / str(x) / str(y) / f"{d}.glb"
             tile_path.parent.mkdir(parents=True, exist_ok=True)
@@ -364,7 +378,10 @@ class TileGenerator3D:
         return count
 
     def _generate_3dtiles_parallel(
-        self, tiles: list, output_dir: Path, n_workers: int,
+        self,
+        tiles: list,
+        output_dir: Path,
+        n_workers: int,
     ) -> int:
         """Multiprocessing 3dtiles generation.
 
@@ -374,10 +391,7 @@ class TileGenerator3D:
         _SHARED_TILES = {key: tile for key, tile in tiles}
         _SHARED_BOUNDS = self._bounds
         max_z = self.config.max_zoom
-        args = [
-            (key, str(output_dir), max_z)
-            for key, _ in tiles
-        ]
+        args = [(key, str(output_dir), max_z) for key, _ in tiles]
         chunksize = max(1, len(args) // (n_workers * 4))
         ctx = _get_mp_context()
         with ctx.Pool(n_workers) as pool:
@@ -420,20 +434,26 @@ class TileGenerator3D:
                 self.config.min_zoom,
             ],
             depthsize=self.config.extent_z,
-            vector_layers=[{
-                "id": self._layer_name,
-                "fields": self._field_types or {},
-                "minzoom": self.config.min_zoom,
-                "maxzoom": self.config.max_zoom,
-                **({"fieldranges": self._field_ranges}
-                   if self._field_ranges else {}),
-                **({"fieldenums": self._field_enums}
-                   if self._field_enums else {}),
-                **({"vocabularies": {
-                        k: v.model_dump(exclude_none=True)
-                        for k, v in self._vocabularies.items()
-                    }} if self._vocabularies else {}),
-            }],
+            vector_layers=[
+                {
+                    "id": self._layer_name,
+                    "fields": self._field_types or {},
+                    "minzoom": self.config.min_zoom,
+                    "maxzoom": self.config.max_zoom,
+                    **({"fieldranges": self._field_ranges} if self._field_ranges else {}),
+                    **({"fieldenums": self._field_enums} if self._field_enums else {}),
+                    **(
+                        {
+                            "vocabularies": {
+                                k: v.model_dump(exclude_none=True)
+                                for k, v in self._vocabularies.items()
+                            }
+                        }
+                        if self._vocabularies
+                        else {}
+                    ),
+                }
+            ],
         )
 
         path.write_text(model.model_dump_json(indent=2, exclude_none=True))

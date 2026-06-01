@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Literal, Sequence, cast
 
 from mudm.model import MuDMFeature
 from .models import (
@@ -67,13 +67,23 @@ def features_to_segment_properties(
                 data_type = "float32"
             fields.append(
                 SegmentPropertyField(
-                    id=key, type=field_type, data_type=data_type, values=values
+                    id=key,
+                    type=cast(Literal["label", "number", "string", "tags"], field_type),
+                    data_type=cast(
+                        Literal["float32", "int8", "uint8", "int16", "uint16", "int32", "uint32"],
+                        data_type,
+                    ),
+                    values=values,
                 )
             )
         else:
             field_type = "label"
             fields.append(
-                SegmentPropertyField(id=key, type=field_type, values=values)
+                SegmentPropertyField(
+                    id=key,
+                    type=cast(Literal["label", "number", "string", "tags"], field_type),
+                    values=values,
+                )
             )
 
     inline = SegmentPropertiesInline(ids=ids, properties=fields)

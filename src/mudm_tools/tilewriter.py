@@ -5,7 +5,7 @@ from mudm.model import MuDM
 import json
 from pydantic import ValidationError
 
-from typing import List, Union
+from typing import Any, List, Union
 from pathlib import Path
 import logging
 from shapely.geometry import Polygon
@@ -266,6 +266,7 @@ class TileWriter(TileHandler):
             # add name to the tile_data
             tile_data["name"] = "tile"
 
+            encoded_data: bytes | str | Any
             if self.pbf:
                 # Using vt2pbf to encode tile data to PBF
                 encoded_data = vt2pbf(tile_data)
@@ -283,8 +284,6 @@ class TileWriter(TileHandler):
             else:
                 encoded_data = json.dumps(tile_data)
 
-            generated_tiles.append(
-                save_tile(encoded_data, z, x, y, self.tile_json.tiles[0])
-            )
+            generated_tiles.append(save_tile(encoded_data, z, x, y, self.tile_json.tiles[0]))
 
         return generated_tiles

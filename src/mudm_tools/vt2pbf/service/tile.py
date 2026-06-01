@@ -18,8 +18,7 @@ class Tile:
 
     def add_layer(self, name: str, features: List[dict]):
         if name in self._layers:
-            raise LayerExistError(
-                'Layer with this name already exist in the tile')
+            raise LayerExistError("Layer with this name already exist in the tile")
 
         layer = Layer(self.tile_pbf, name, extend=self.extend)
         for feature in features:

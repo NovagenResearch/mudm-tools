@@ -30,7 +30,6 @@ from mudm_tools.arrow._geometry import (
     to_wkb,
 )
 from mudm_tools.arrow._table_builder import _infer_pa_type, build_table
-from mudm_tools.arrow.models import ArrowConfig
 from mudm.model import (
     MuDMFeature,
     MuDMFeatureCollection,
@@ -47,8 +46,8 @@ from geojson_pydantic import (
     Polygon,
 )
 
-
 # ---- Fixtures ----
+
 
 def _point_feature(x=1.0, y=2.0, z=3.0, fid="f1", props=None):
     return MuDMFeature(
@@ -129,17 +128,13 @@ class TestGeometryConversion:
         assert s.z == 3
 
     def test_multipoint(self):
-        geom = MultiPoint(
-            type="MultiPoint", coordinates=[(0, 0, 1), (1, 1, 2)]
-        )
+        geom = MultiPoint(type="MultiPoint", coordinates=[(0, 0, 1), (1, 1, 2)])
         s = multipoint_to_shapely(geom)
         assert isinstance(s, ShapelyMultiPoint)
         assert len(s.geoms) == 2
 
     def test_linestring(self):
-        geom = LineString(
-            type="LineString", coordinates=[(0, 0), (1, 1), (2, 0)]
-        )
+        geom = LineString(type="LineString", coordinates=[(0, 0), (1, 1), (2, 0)])
         s = linestring_to_shapely(geom)
         assert isinstance(s, ShapelyLineString)
         assert len(s.coords) == 3

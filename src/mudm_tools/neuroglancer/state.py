@@ -8,8 +8,7 @@ from __future__ import annotations
 
 import json
 import urllib.parse
-from typing import Any, Dict, List, Optional
-
+from typing import Any, List, Optional
 
 _RADIUS_SHADER = """\
 #uicontrol float radiusScale slider(min=0.1, max=100.0, default=10.0, step=0.1)

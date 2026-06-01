@@ -1,7 +1,6 @@
 """Tests for Xenium -> muDM tile conversion pipeline."""
 
 import json
-from pathlib import Path
 
 import numpy as np
 import pytest
@@ -16,20 +15,36 @@ pytest.importorskip("PIL")
 import polars as pl
 from PIL import Image
 
-from xenium_to_tiles import boundaries_to_geojson, transcripts_to_geojson, read_um_per_px, generate_raster_tiles, generate_vector_tiles, write_metadata, convert_xenium
+from xenium_to_tiles import (
+    boundaries_to_geojson,
+    transcripts_to_geojson,
+    read_um_per_px,
+    generate_raster_tiles,
+    generate_vector_tiles,
+    write_metadata,
+    convert_xenium,
+)
 
 
 @pytest.fixture
 def tmp_boundary_parquet(tmp_path):
     """Create a minimal cell_boundaries.parquet with 2 cells."""
-    df = pl.DataFrame({
-        "cell_id": ["cell_1", "cell_1", "cell_1", "cell_1",
-                     "cell_2", "cell_2", "cell_2", "cell_2"],
-        "vertex_x": [10.0, 30.0, 20.0, 10.0,
-                     50.0, 70.0, 60.0, 50.0],
-        "vertex_y": [20.0, 20.0, 40.0, 20.0,
-                     60.0, 60.0, 80.0, 60.0],
-    })
+    df = pl.DataFrame(
+        {
+            "cell_id": [
+                "cell_1",
+                "cell_1",
+                "cell_1",
+                "cell_1",
+                "cell_2",
+                "cell_2",
+                "cell_2",
+                "cell_2",
+            ],
+            "vertex_x": [10.0, 30.0, 20.0, 10.0, 50.0, 70.0, 60.0, 50.0],
+            "vertex_y": [20.0, 20.0, 40.0, 20.0, 60.0, 60.0, 80.0, 60.0],
+        }
+    )
     path = tmp_path / "cell_boundaries.parquet"
     df.write_parquet(path)
     return path
@@ -55,11 +70,13 @@ def test_boundaries_to_geojson(tmp_boundary_parquet):
 @pytest.fixture
 def tmp_transcript_parquet(tmp_path):
     """Create a minimal transcripts.parquet with 3 transcripts."""
-    df = pl.DataFrame({
-        "feature_name": ["TNC", "GAPDH", "TNC"],
-        "x_location": [15.0, 55.0, 25.0],
-        "y_location": [25.0, 65.0, 35.0],
-    })
+    df = pl.DataFrame(
+        {
+            "feature_name": ["TNC", "GAPDH", "TNC"],
+            "x_location": [15.0, 55.0, 25.0],
+            "y_location": [25.0, 65.0, 35.0],
+        }
+    )
     path = tmp_path / "transcripts.parquet"
     df.write_parquet(path)
     return path
@@ -98,6 +115,7 @@ def tmp_dapi_image(tmp_path):
     rng = np.random.default_rng(42)
     img = rng.integers(0, 65535, size=(512, 512), dtype=np.uint16)
     import tifffile
+
     tifffile.imwrite(tmp_path / "dapi.tif", img)
     return tmp_path / "dapi.tif"
 
@@ -192,13 +210,16 @@ def test_write_metadata(tmp_path):
 
 
 @pytest.fixture
-def tmp_xenium_dataset(tmp_path, tmp_boundary_parquet, tmp_transcript_parquet, tmp_experiment_xenium):
+def tmp_xenium_dataset(
+    tmp_path, tmp_boundary_parquet, tmp_transcript_parquet, tmp_experiment_xenium
+):
     """Create a minimal Xenium-like dataset directory."""
     data_dir = tmp_path / "xenium_dataset"
     data_dir.mkdir()
 
     # Copy parquet files
     import shutil
+
     shutil.copy(tmp_boundary_parquet, data_dir / "cell_boundaries.parquet")
     shutil.copy(tmp_boundary_parquet, data_dir / "nucleus_boundaries.parquet")
     shutil.copy(tmp_transcript_parquet, data_dir / "transcripts.parquet")
@@ -206,6 +227,7 @@ def tmp_xenium_dataset(tmp_path, tmp_boundary_parquet, tmp_transcript_parquet, t
 
     # Create a small DAPI image
     import tifffile
+
     rng = np.random.default_rng(42)
     img = rng.integers(0, 65535, size=(256, 256), dtype=np.uint16)
     morph_dir = data_dir / "morphology_focus"

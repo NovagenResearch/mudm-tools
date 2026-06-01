@@ -72,9 +72,7 @@ def _compute_bounds(geojson_str: str) -> tuple[float, float, float, float]:
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="2D tiling example using the Rust-based pipeline"
-    )
+    parser = argparse.ArgumentParser(description="2D tiling example using the Rust-based pipeline")
     parser.add_argument(
         "geojson_path",
         nargs="?",
@@ -83,9 +81,7 @@ def main():
     )
     parser.add_argument("--min-zoom", type=int, default=0)
     parser.add_argument("--max-zoom", type=int, default=7)
-    parser.add_argument(
-        "--output", default="tiles_2d.parquet", help="Output Parquet path"
-    )
+    parser.add_argument("--output", default="tiles_2d.parquet", help="Output Parquet path")
     parser.add_argument(
         "--partitioned",
         action="store_true",
@@ -101,8 +97,9 @@ def main():
         action="store_true",
         help="Disable Douglas-Peucker simplification at coarse zoom levels",
     )
-    parser.add_argument("--buffer", type=int, default=64,
-                        help="Tile buffer in pixels (at extent 4096)")
+    parser.add_argument(
+        "--buffer", type=int, default=64, help="Tile buffer in pixels (at extent 4096)"
+    )
     parser.add_argument("--grid-size", type=int, default=10000)
     parser.add_argument("--cell-size", type=int, default=100)
     args = parser.parse_args()
@@ -113,10 +110,7 @@ def main():
         print(f"Loading GeoJSON from {geojson_path}")
     else:
         geojson_path = Path("example_polygen.json")
-        print(
-            f"Generating random polygons "
-            f"(grid={args.grid_size}, cell={args.cell_size}) ..."
-        )
+        print(f"Generating random polygons " f"(grid={args.grid_size}, cell={args.cell_size}) ...")
         _generate_sample_geojson(geojson_path, args.grid_size, args.cell_size)
         print(f"  Wrote {geojson_path}")
 
@@ -127,9 +121,7 @@ def main():
     # --- 2. Ingest through the Rust quadtree pipeline ---
     # Buffer in normalized tile-fraction space: pixels / extent
     buffer = args.buffer / 4096.0
-    gen = StreamingTileGenerator2D(
-        min_zoom=args.min_zoom, max_zoom=args.max_zoom, buffer=buffer
-    )
+    gen = StreamingTileGenerator2D(min_zoom=args.min_zoom, max_zoom=args.max_zoom, buffer=buffer)
 
     t0 = time.perf_counter()
     fids = gen.add_geojson(geojson_str, bounds)

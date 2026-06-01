@@ -14,7 +14,6 @@ from pathlib import Path
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-
 _DEFAULT_MAX_FILE_BYTES = 500_000_000  # 500 MB uncompressed binary threshold
 _DEFAULT_MAX_BATCH_BYTES = 2_000_000_000  # 2 GB per-batch memory budget
 
@@ -69,8 +68,11 @@ def generate_parquet(
 
     if not has_streaming:
         return _generate_parquet_inmemory(
-            generator, output_path, world_bounds,
-            compression=compression, compression_level=compression_level,
+            generator,
+            output_path,
+            world_bounds,
+            compression=compression,
+            compression_level=compression_level,
         )
 
     # Resolve the per-batch byte budget. An explicit value always wins; the
@@ -108,21 +110,33 @@ def generate_parquet(
         )
         if _use_native:
             return generator.generate_parquet_native_partitioned(
-                str(output_path), world_bounds, compression, compression_level,
-                max_batch_bytes, max_file_bytes,
+                str(output_path),
+                world_bounds,
+                compression,
+                compression_level,
+                max_batch_bytes,
+                max_file_bytes,
             )
         return _generate_parquet_partitioned_streaming(
-            generator, output_path, world_bounds,
-            compression=compression, compression_level=compression_level,
-            batch_size=batch_size, max_file_bytes=max_file_bytes,
+            generator,
+            output_path,
+            world_bounds,
+            compression=compression,
+            compression_level=compression_level,
+            batch_size=batch_size,
+            max_file_bytes=max_file_bytes,
             max_batch_bytes=max_batch_bytes,
             parallel=effective_parallel,
         )
 
     return _generate_parquet_single_streaming(
-        generator, output_path, world_bounds,
-        compression=compression, compression_level=compression_level,
-        batch_size=batch_size, max_batch_bytes=max_batch_bytes,
+        generator,
+        output_path,
+        world_bounds,
+        compression=compression,
+        compression_level=compression_level,
+        batch_size=batch_size,
+        max_batch_bytes=max_batch_bytes,
         parallel=effective_parallel,
     )
 
@@ -130,6 +144,7 @@ def generate_parquet(
 # ---------------------------------------------------------------------------
 # In-memory path (legacy / fallback for old Rust builds)
 # ---------------------------------------------------------------------------
+
 
 def _generate_parquet_inmemory(
     generator,
@@ -162,7 +177,8 @@ def _generate_parquet_inmemory(
     zoom_levels = sorted(set(zoom_col))
 
     writer = pq.ParquetWriter(
-        str(output_path), table.schema,
+        str(output_path),
+        table.schema,
         **_writer_kwargs(compression, compression_level),
     )
     try:
@@ -178,6 +194,7 @@ def _generate_parquet_inmemory(
 # ---------------------------------------------------------------------------
 # Single-file streaming path
 # ---------------------------------------------------------------------------
+
 
 def _generate_parquet_single_streaming(
     generator,
@@ -231,7 +248,8 @@ def _generate_parquet_single_streaming(
         # Write one row group per zoom
         schema = _parquet_schema()
         writer = pq.ParquetWriter(
-            str(output_path), schema,
+            str(output_path),
+            schema,
             **_writer_kwargs(compression, compression_level),
         )
         try:
@@ -250,6 +268,7 @@ def _generate_parquet_single_streaming(
 # ---------------------------------------------------------------------------
 # Partitioned streaming path (TB-scale)
 # ---------------------------------------------------------------------------
+
 
 def _estimate_binary_bytes(batch: pa.RecordBatch) -> int:
     """Estimate uncompressed binary column size via Arrow buffer API — O(1)."""
@@ -292,7 +311,11 @@ class _RotatingWriter:
         batch_bytes = _estimate_binary_bytes(batch)
 
         # Rotate if current file would exceed threshold (never rotate on first write)
-        if self._writer is not None and self._cum_bytes > 0 and self._cum_bytes + batch_bytes > self._max:
+        if (
+            self._writer is not None
+            and self._cum_bytes > 0
+            and self._cum_bytes + batch_bytes > self._max
+        ):
             self._writer.close()
             self._idx += 1
             self._cum_bytes = 0
@@ -364,7 +387,10 @@ def _generate_parquet_partitioned_streaming(
             z_batch_no_zoom = batch.filter(mask).drop_columns(["zoom"])
             if z not in writers:
                 writers[z] = _RotatingWriter(
-                    output_dir / f"zoom={z}", schema, kwargs, max_file_bytes,
+                    output_dir / f"zoom={z}",
+                    schema,
+                    kwargs,
+                    max_file_bytes,
                 )
             writers[z].write(z_batch_no_zoom)
 
@@ -423,6 +449,7 @@ def _generate_parquet_partitioned_streaming(
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _dict_to_record_batch(data: dict) -> pa.RecordBatch:
     """Convert the Python dict from _next_parquet_batch/_collect_parquet_data to a RecordBatch."""

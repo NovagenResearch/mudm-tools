@@ -1,4 +1,5 @@
 """Shared pytest fixtures for the mudm-tools test suite."""
+
 from pathlib import Path
 
 import numpy as np
@@ -14,14 +15,10 @@ def _build_two_primitive_glb(out_path: Path) -> None:
 
     Indices in each primitive are local (0..3); a correct decoder must offset
     primitive-1 indices by primitive-0's vertex count when concatenating."""
-    prim0_pos = np.array(
-        [[0, 0, 0], [1, 0, 0], [1, 1, 0], [0, 1, 0]], dtype=np.float32
-    )
+    prim0_pos = np.array([[0, 0, 0], [1, 0, 0], [1, 1, 0], [0, 1, 0]], dtype=np.float32)
     prim0_idx = np.array([0, 1, 2, 0, 2, 3], dtype=np.uint32)
 
-    prim1_pos = np.array(
-        [[2, 2, 2], [3, 2, 2], [3, 3, 2], [2, 3, 2]], dtype=np.float32
-    )
+    prim1_pos = np.array([[2, 2, 2], [3, 2, 2], [3, 3, 2], [2, 3, 2]], dtype=np.float32)
     prim1_idx = np.array([0, 1, 2, 0, 2, 3], dtype=np.uint32)
 
     p0p_bytes = prim0_pos.tobytes()

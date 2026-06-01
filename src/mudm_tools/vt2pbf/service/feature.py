@@ -14,22 +14,22 @@ def zigzag(delta: Union[int, float]) -> int:
 
 
 class Feature:
-    REQUIRED_FIELDS = {'geometry', 'type', 'tags'}
+    REQUIRED_FIELDS = {"geometry", "type", "tags"}
 
-    def __init__(self, layer, feature_type: int, feature_id: int = None):
+    def __init__(self, layer, feature_type: int, feature_id: int | None = None):
         """
-            Leading the mapbox proto spec, feature type must follow next schema:
-                 UNKNOWN = 0;
-                 POINT = 1;
-                 LINESTRING = 2;
-                 POLYGON = 3;
+        Leading the mapbox proto spec, feature type must follow next schema:
+             UNKNOWN = 0;
+             POINT = 1;
+             LINESTRING = 2;
+             POLYGON = 3;
         """
         self._layer = layer
         self._layer_pbf = layer.layer_pbf
         self.feature_type = feature_type
         self.feature = self._create_feature(feature_id)
 
-    def _create_feature(self, feature_id: int = None):
+    def _create_feature(self, feature_id: int | None = None):
         feature = self._layer_pbf.features.add()
         if feature_id is not None:
             feature.id = feature_id
@@ -68,11 +68,15 @@ class Feature:
             else:
                 instance.uint_value = value
         else:
-            raise WrongFeatureTypeError(f'{value} type is not support, must be one of [bool, str, int, float]')
+            raise WrongFeatureTypeError(
+                f"{value} type is not support, must be one of [bool, str, int, float]"
+            )
 
     def add_geometry(self, geometry: Union[List[List[int]], List[List[List[int]]]]):
-        geometry = [geometry] if self.feature_type == 1 else geometry
-        encoded_geometry = self._encode_feature_geometry(geometry)
+        rings: List[List[List[int]]] = (
+            [geometry] if self.feature_type == 1 else geometry  # type: ignore[assignment, list-item]  # legacy union: type 1 wraps List[List[int]], else already nested rings
+        )
+        encoded_geometry = self._encode_feature_geometry(rings)
         self.feature.geometry.extend(encoded_geometry)
 
     def _encode_feature_geometry(self, raw_geometry: List[List[List[int]]]) -> List[int]:

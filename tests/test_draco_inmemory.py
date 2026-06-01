@@ -36,10 +36,18 @@ draco_encode_mesh = _rs.draco_encode_mesh
 def _tetra():
     """A non-degenerate tetrahedron (4 verts, 4 tris)."""
     positions = [
-        0.0, 0.0, 0.0,
-        100.0, 0.0, 0.0,
-        50.0, 100.0, 0.0,
-        50.0, 50.0, 100.0,
+        0.0,
+        0.0,
+        0.0,
+        100.0,
+        0.0,
+        0.0,
+        50.0,
+        100.0,
+        0.0,
+        50.0,
+        50.0,
+        100.0,
     ]
     indices = [0, 1, 2, 0, 1, 3, 1, 2, 3, 0, 2, 3]
     return positions, indices
@@ -141,9 +149,7 @@ class TestDecodeEquivalence:
         # FACE-count parity (mandatory): this clean tetra has no coincident
         # vertices and no degenerate faces, so build()'s dedup/degenerate-filter
         # must NOT drop any triangle.
-        assert df.shape[0] == n_in_tris, (
-            f"triangle count changed: in={n_in_tris} out={df.shape[0]}"
-        )
+        assert df.shape[0] == n_in_tris, f"triangle count changed: in={n_in_tris} out={df.shape[0]}"
         # UNIQUE-decoded-vertex-count parity (NOT raw point count): libdraco's
         # decode-side attribute-corner-table split inflates the reported point
         # count (the benign 4->8 artifact, present on ANY QuantizationCoordinateWise
@@ -165,9 +171,9 @@ class TestDecodeEquivalence:
         in_q = self._quantize(positions, qbits)
         in_set = np.array(sorted(set(map(tuple, in_q.tolist()))))
         out_set = np.array(sorted(set(map(tuple, np.round(dv).tolist()))))
-        assert np.allclose(dv, np.round(dv), atol=0.0), (
-            "decoded positions are not exact integers (lossless transform broken)"
-        )
+        assert np.allclose(
+            dv, np.round(dv), atol=0.0
+        ), "decoded positions are not exact integers (lossless transform broken)"
         np.testing.assert_array_equal(out_set, in_set)
 
     def test_count_parity_large_mesh(self):
@@ -177,6 +183,6 @@ class TestDecodeEquivalence:
         _dv, df = self._decode(data)
         n_in_tris = len(indices) // 3
         # The grid has all-unique vertices and no degenerate faces.
-        assert df.shape[0] == n_in_tris, (
-            f"triangle count changed on grid: in={n_in_tris} out={df.shape[0]}"
-        )
+        assert (
+            df.shape[0] == n_in_tris
+        ), f"triangle count changed on grid: in={n_in_tris} out={df.shape[0]}"

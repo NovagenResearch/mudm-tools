@@ -25,7 +25,6 @@ from pydantic import BaseModel, field_validator
 
 from mudm.model import MuDMFeature, MuDMFeatureCollection, TIN
 
-
 # ---------------------------------------------------------------------------
 # SWC constants
 # ---------------------------------------------------------------------------
@@ -55,6 +54,7 @@ SWC_TYPE_NAMES: dict[int, str] = {
 # SWCSample / NeuronMorphology models (canonical definitions)
 # ---------------------------------------------------------------------------
 
+
 class SWCSample(BaseModel):
     """A single sample point in an SWC neuron morphology tree."""
 
@@ -83,20 +83,16 @@ class NeuronMorphology(BaseModel):
     @classmethod
     def _validate_tree(cls, v: List[SWCSample]) -> List[SWCSample]:
         if len(v) == 0:
-            raise ValueError(
-                "NeuronMorphology tree must have at least one node"
-            )
+            raise ValueError("NeuronMorphology tree must have at least one node")
         ids = {s.id for s in v}
         if not any(s.parent == -1 for s in v):
             raise ValueError(
-                "NeuronMorphology tree must have at least one root node "
-                "(parent == -1)"
+                "NeuronMorphology tree must have at least one root node " "(parent == -1)"
             )
         for s in v:
             if s.parent != -1 and s.parent not in ids:
                 raise ValueError(
-                    f"Node {s.id} has parent {s.parent} which does not exist "
-                    f"in the tree"
+                    f"Node {s.id} has parent {s.parent} which does not exist " f"in the tree"
                 )
         return v
 
@@ -118,6 +114,7 @@ class NeuronMorphology(BaseModel):
 # ---------------------------------------------------------------------------
 # Internal SWC parser (returns NeuronMorphology — not for MuDMFeature)
 # ---------------------------------------------------------------------------
+
 
 def _parse_swc(swc_path: str) -> NeuronMorphology:
     """Parse an SWC file into a NeuronMorphology (internal use only)."""
@@ -147,6 +144,7 @@ def _parse_swc(swc_path: str) -> NeuronMorphology:
 # ---------------------------------------------------------------------------
 # Neuron-specific mesh generation
 # ---------------------------------------------------------------------------
+
 
 def _extract_paths(
     tree: list,
@@ -334,7 +332,10 @@ def neuron_to_typed_meshes(
     typed_offsets: dict[int, int] = defaultdict(int)
 
     def _append(
-        swc_type: int, v: np.ndarray, n: np.ndarray, idx: np.ndarray,
+        swc_type: int,
+        v: np.ndarray,
+        n: np.ndarray,
+        idx: np.ndarray,
     ) -> None:
         if v.shape[0] == 0:
             return
@@ -364,17 +365,16 @@ def neuron_to_typed_meshes(
         typed_subs = _split_path_by_type(path_ids, id_to_sample)
         for swc_type, sub_ids in typed_subs:
             points = [
-                np.array([
-                    id_to_sample[s].x,
-                    id_to_sample[s].y,
-                    id_to_sample[s].z,
-                ])
+                np.array(
+                    [
+                        id_to_sample[s].x,
+                        id_to_sample[s].y,
+                        id_to_sample[s].z,
+                    ]
+                )
                 for s in sub_ids
             ]
-            radii = [
-                max(id_to_sample[s].r, min_radius)
-                for s in sub_ids
-            ]
+            radii = [max(id_to_sample[s].r, min_radius) for s in sub_ids]
             if smooth_subdivisions > 0:
                 points, radii = smooth_path(points, radii, smooth_subdivisions)
             if mesh_quality < 1.0:
@@ -396,6 +396,7 @@ def neuron_to_typed_meshes(
 # TIN conversion helpers
 # ---------------------------------------------------------------------------
 
+
 def _mesh_to_tin(vertices: np.ndarray, indices: np.ndarray) -> TIN:
     """Convert a triangle mesh (Nx3 vertices, Mx3 face indices) to a TIN."""
     faces: list[list[list[list[float]]]] = []
@@ -416,6 +417,7 @@ def _mesh_to_tin(vertices: np.ndarray, indices: np.ndarray) -> TIN:
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
+
 
 def swc_to_microjson(
     swc_path: str,
@@ -512,12 +514,14 @@ def swc_to_linestring3d(swc_path: str) -> MultiLineString:
         if s.parent == -1:
             continue
         parent = by_id[s.parent]
-        lines.append([
-            [parent.x, parent.y, parent.z],
-            [s.x, s.y, s.z],
-        ])
+        lines.append(
+            [
+                [parent.x, parent.y, parent.z],
+                [s.x, s.y, s.z],
+            ]
+        )
 
-    return MultiLineString(type="MultiLineString", coordinates=lines)
+    return MultiLineString(type="MultiLineString", coordinates=lines)  # type: ignore[arg-type]  # shapely accepts coord lists
 
 
 def _neuron_name_from_path(swc_path: str) -> str:

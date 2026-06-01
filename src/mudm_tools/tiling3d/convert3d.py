@@ -17,8 +17,6 @@ from mudm.layout import geometry_bounds
 from mudm.model import (
     MuDMFeature,
     MuDMFeatureCollection,
-    PolyhedralSurface,
-    TIN,
 )
 from .projector3d import CartesianProjector3D
 
@@ -56,7 +54,9 @@ def _flatten_positions(
 
 
 def _project_flat(
-    xy: list[float], z: list[float], proj: CartesianProjector3D,
+    xy: list[float],
+    z: list[float],
+    proj: CartesianProjector3D,
 ) -> tuple[list[float], list[float]]:
     """Project flat arrays through the 3D projector."""
     n = len(z)
@@ -87,7 +87,8 @@ def _geom_type_for(geom: Any) -> int:
 
 
 def _convert_point(
-    geom: Any, proj: CartesianProjector3D,
+    geom: Any,
+    proj: CartesianProjector3D,
 ) -> list[dict]:
     """Convert Point or MultiPoint."""
     results = []
@@ -101,18 +102,25 @@ def _convert_point(
         y = float(coord[1]) if len(coord) > 1 else 0.0
         z_val = float(coord[2]) if len(coord) > 2 else 0.0
         px, py, pz = proj.project(x, y, z_val)
-        results.append({
-            "geometry": [px, py],
-            "geometry_z": [pz],
-            "type": POINT3D,
-            "minX": px, "minY": py, "minZ": pz,
-            "maxX": px, "maxY": py, "maxZ": pz,
-        })
+        results.append(
+            {
+                "geometry": [px, py],
+                "geometry_z": [pz],
+                "type": POINT3D,
+                "minX": px,
+                "minY": py,
+                "minZ": pz,
+                "maxX": px,
+                "maxY": py,
+                "maxZ": pz,
+            }
+        )
     return results
 
 
 def _convert_line(
-    geom: Any, proj: CartesianProjector3D,
+    geom: Any,
+    proj: CartesianProjector3D,
 ) -> list[dict]:
     """Convert LineString or MultiLineString to flat arrays."""
     if geom.type == "LineString":
@@ -133,18 +141,25 @@ def _convert_line(
         max_y = max(xy[i * 2 + 1] for i in range(n))
         min_z = min(z)
         max_z = max(z)
-        results.append({
-            "geometry": xy,
-            "geometry_z": z,
-            "type": LINESTRING3D,
-            "minX": min_x, "minY": min_y, "minZ": min_z,
-            "maxX": max_x, "maxY": max_y, "maxZ": max_z,
-        })
+        results.append(
+            {
+                "geometry": xy,
+                "geometry_z": z,
+                "type": LINESTRING3D,
+                "minX": min_x,
+                "minY": min_y,
+                "minZ": min_z,
+                "maxX": max_x,
+                "maxY": max_y,
+                "maxZ": max_z,
+            }
+        )
     return results
 
 
 def _convert_polygon(
-    geom: Any, proj: CartesianProjector3D,
+    geom: Any,
+    proj: CartesianProjector3D,
 ) -> list[dict]:
     """Convert Polygon or MultiPolygon to flat arrays.
 
@@ -176,19 +191,27 @@ def _convert_polygon(
         max_y = max(all_xy[i * 2 + 1] for i in range(n))
         min_z = min(all_z)
         max_z = max(all_z)
-        results.append({
-            "geometry": all_xy,
-            "geometry_z": all_z,
-            "ring_lengths": ring_lengths,
-            "type": POLYGON3D,
-            "minX": min_x, "minY": min_y, "minZ": min_z,
-            "maxX": max_x, "maxY": max_y, "maxZ": max_z,
-        })
+        results.append(
+            {
+                "geometry": all_xy,
+                "geometry_z": all_z,
+                "ring_lengths": ring_lengths,
+                "type": POLYGON3D,
+                "minX": min_x,
+                "minY": min_y,
+                "minZ": min_z,
+                "maxX": max_x,
+                "maxY": max_y,
+                "maxZ": max_z,
+            }
+        )
     return results
 
 
 def _convert_surface(
-    geom: Any, proj: CartesianProjector3D, geom_type: int,
+    geom: Any,
+    proj: CartesianProjector3D,
+    geom_type: int,
 ) -> list[dict]:
     """Convert TIN or PolyhedralSurface — each face is a polygon ring."""
     all_xy: list[float] = []
@@ -215,14 +238,20 @@ def _convert_surface(
     min_z = min(all_z)
     max_z = max(all_z)
 
-    return [{
-        "geometry": all_xy,
-        "geometry_z": all_z,
-        "ring_lengths": ring_lengths,
-        "type": geom_type,
-        "minX": min_x, "minY": min_y, "minZ": min_z,
-        "maxX": max_x, "maxY": max_y, "maxZ": max_z,
-    }]
+    return [
+        {
+            "geometry": all_xy,
+            "geometry_z": all_z,
+            "ring_lengths": ring_lengths,
+            "type": geom_type,
+            "minX": min_x,
+            "minY": min_y,
+            "minZ": min_z,
+            "maxX": max_x,
+            "maxY": max_y,
+            "maxZ": max_z,
+        }
+    ]
 
 
 def convert_feature_3d(
@@ -300,6 +329,10 @@ def compute_bounds_3d(
         return (0.0, 0.0, 0.0, 1.0, 1.0, 1.0)
 
     return (
-        min(xs_min), min(ys_min), min(zs_min),
-        max(xs_max), max(ys_max), max(zs_max),
+        min(xs_min),
+        min(ys_min),
+        min(zs_min),
+        max(xs_max),
+        max(ys_max),
+        max(zs_max),
     )

@@ -7,7 +7,6 @@
 import math
 from .feature import create_feature, Slice
 
-
 r"""
 clip features between two vertical or horizontal axis-parallel lines:
  *     |        |
@@ -33,16 +32,16 @@ def clip(features, scale, k1, k2, axis, minAll, maxAll, options, z=None):
     clipped = []
 
     for feature in features:
-        geometry_key = f'geometry_z{z}' if z is not None else 'geometry'
-        if isinstance(feature.get('geometry'), Slice):
+        geometry_key = f"geometry_z{z}" if z is not None else "geometry"
+        if isinstance(feature.get("geometry"), Slice):
             geometry = feature.get(geometry_key)
         else:
             geometry = Slice(feature.get(geometry_key))
 
-        type_ = feature.get('type')
+        type_ = feature.get("type")
 
-        min_ = feature.get('minX') if axis == 0 else feature.get('minY')
-        max_ = feature.get('maxX') if axis == 0 else feature.get('maxY')
+        min_ = feature.get("minX") if axis == 0 else feature.get("minY")
+        max_ = feature.get("maxX") if axis == 0 else feature.get("maxY")
 
         if min_ >= k1 and max_ < k2:  # trivial accept
             clipped.append(feature)
@@ -52,19 +51,18 @@ def clip(features, scale, k1, k2, axis, minAll, maxAll, options, z=None):
 
         newGeometry = Slice([])  # []
 
-        if type_ == 'Point' or type_ == 'MultiPoint':
+        if type_ == "Point" or type_ == "MultiPoint":
             clip_points(geometry, newGeometry, k1, k2, axis)
-        elif type_ == 'LineString':
-            clip_line(geometry, newGeometry, k1, k2,
-                      axis, False, options.get('lineMetrics', False))
-        elif type_ == 'MultiLineString':
+        elif type_ == "LineString":
+            clip_line(geometry, newGeometry, k1, k2, axis, False, options.get("lineMetrics", False))
+        elif type_ == "MultiLineString":
             clip_lines(geometry, newGeometry, k1, k2, axis, False)
-        elif type_ == 'Polygon':
+        elif type_ == "Polygon":
             if any(isinstance(li, list) for li in geometry):
                 clip_lines(geometry, newGeometry, k1, k2, axis, True)
             else:
                 clip_line(geometry, newGeometry, k1, k2, axis, True, False)
-        elif type_ == 'MultiPolygon':
+        elif type_ == "MultiPolygon":
             for polygon in geometry:
                 newPolygon = Slice([])
                 clip_lines(polygon, newPolygon, k1, k2, axis, True)
@@ -72,14 +70,12 @@ def clip(features, scale, k1, k2, axis, minAll, maxAll, options, z=None):
                     newGeometry.append(newPolygon)
 
         if len(newGeometry) > 0:
-            new_feature = create_feature(
-                feature.get('id'), type_, newGeometry, feature.get('tags'))
+            new_feature = create_feature(feature.get("id"), type_, newGeometry, feature.get("tags"))
             if z is not None:
-                new_feature[f'geometry_z{z}'] = newGeometry
+                new_feature[f"geometry_z{z}"] = newGeometry
                 # set the geometries with higher zoom levels to the original
-                for i in range(z + 1, options.get('maxZoom') + 1):
-                    new_feature[f'geometry_z{i}'] = feature.get(
-                        f'geometry_z{i}')
+                for i in range(z + 1, options.get("maxZoom") + 1):
+                    new_feature[f"geometry_z{i}"] = feature.get(f"geometry_z{i}")
             clipped.append(new_feature)
 
     return clipped if len(clipped) > 0 else None
@@ -95,7 +91,7 @@ def clip_points(geom, newGeom, k1, k2, axis):
 def clip_line(geom, newGeom, k1, k2, axis, isPolygon, trackMetrics):
     slice_ = new_slice(geom)
     intersect = intersectX if axis == 0 else intersectY
-    l_l = geom.start if isinstance(geom, Slice) else 0.
+    l_l = geom.start if isinstance(geom, Slice) else 0.0
     segLen, t = None, None
 
     # length = len(geom) if isinstance(geom, list) else 0
@@ -155,9 +151,7 @@ def clip_line(geom, newGeom, k1, k2, axis, isPolygon, trackMetrics):
 
     # close the polygon if its endpoints are not the same after clipping
     last = len(slice_) - 3
-    if isPolygon and last >= 3 and (
-        slice_[last] != slice_[0] or slice_[last + 1] != slice_[1]
-    ):
+    if isPolygon and last >= 3 and (slice_[last] != slice_[0] or slice_[last + 1] != slice_[1]):
         add_point(slice_, slice_[0], slice_[1], slice_[2])
 
     # add the final slice
@@ -167,9 +161,9 @@ def clip_line(geom, newGeom, k1, k2, axis, isPolygon, trackMetrics):
 
 def new_slice(line):
     slice_ = Slice([])
-    slice_.size = line.size if isinstance(line, Slice) else 0.
-    slice_.start = line.start if isinstance(line, Slice) else 0.
-    slice_.end = line.end if isinstance(line, Slice) else 0.
+    slice_.size = line.size if isinstance(line, Slice) else 0.0
+    slice_.start = line.start if isinstance(line, Slice) else 0.0
+    slice_.end = line.end if isinstance(line, Slice) else 0.0
     return slice_
 
 

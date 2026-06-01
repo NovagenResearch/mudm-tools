@@ -7,30 +7,29 @@ import pytest
 
 DracoPy = pytest.importorskip("DracoPy")
 
-from pygltflib import LINES, POINTS, TRIANGLES, BufferFormat
+from pygltflib import LINES, POINTS, TRIANGLES  # noqa: E402
 
-from mudm.model import (
+from mudm.model import (  # noqa: E402
     MuDMFeature,
     MuDMFeatureCollection,
     TIN,
 )
-from mudm_tools.gltf.gltf_assembler import (
+from mudm_tools.gltf.gltf_assembler import (  # noqa: E402
     collection_to_gltf,
     feature_to_gltf,
 )
-from mudm_tools.gltf.models import GltfConfig
-from mudm_tools.gltf.writer import to_glb
-from mudm_tools.gltf._draco import (
+from mudm_tools.gltf.models import GltfConfig  # noqa: E402
+from mudm_tools.gltf.writer import to_glb  # noqa: E402
+from mudm_tools.gltf._draco import (  # noqa: E402
     DRACO_EXTENSION,
     encode_draco,
-    add_draco_triangle_mesh,
     ensure_draco_extensions,
 )
-
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _tin_feature(**props) -> MuDMFeature:
     """A TIN feature with several triangles for meaningful compression tests."""
@@ -89,6 +88,7 @@ def _polygon_feature() -> MuDMFeature:
 # TestDracoCompression
 # ---------------------------------------------------------------------------
 
+
 class TestDracoCompression:
     """Compressed GLB is smaller, valid GLB header, vertex count preserved."""
 
@@ -101,8 +101,7 @@ class TestDracoCompression:
         glb_draco = to_glb(feat, config=config_draco)
 
         assert len(glb_draco) < len(glb_std), (
-            f"Draco GLB ({len(glb_draco)}) should be smaller than "
-            f"standard GLB ({len(glb_std)})"
+            f"Draco GLB ({len(glb_draco)}) should be smaller than " f"standard GLB ({len(glb_std)})"
         )
 
     def test_valid_glb_header(self):
@@ -166,6 +165,7 @@ class TestDracoCompression:
 # ---------------------------------------------------------------------------
 # TestDracoExtensionStructure
 # ---------------------------------------------------------------------------
+
 
 class TestDracoExtensionStructure:
     """Extension on root + primitives, stub accessors, Draco BufferView."""
@@ -244,6 +244,7 @@ class TestDracoExtensionStructure:
 
     def test_ensure_draco_extensions_idempotent(self):
         from pygltflib import GLTF2
+
         gltf = GLTF2()
         ensure_draco_extensions(gltf)
         ensure_draco_extensions(gltf)  # call again
@@ -255,6 +256,7 @@ class TestDracoExtensionStructure:
 # ---------------------------------------------------------------------------
 # TestDracoNonTriangle
 # ---------------------------------------------------------------------------
+
 
 class TestDracoNonTriangle:
     """Lines and points are NOT compressed even with draco=True."""
@@ -288,6 +290,7 @@ class TestDracoNonTriangle:
 # ---------------------------------------------------------------------------
 # TestDracoMixedGeometry
 # ---------------------------------------------------------------------------
+
 
 class TestDracoMixedGeometry:
     """Collection with TINs + lines -- only triangles compressed."""
@@ -359,6 +362,7 @@ class TestDracoMixedGeometry:
 # ---------------------------------------------------------------------------
 # TestDracoConfig
 # ---------------------------------------------------------------------------
+
 
 class TestDracoConfig:
     """Custom quantization works, draco=False by default, draco=False -> standard GLB."""

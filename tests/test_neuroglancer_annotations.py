@@ -2,9 +2,7 @@
 
 import json
 import struct
-from pathlib import Path
 
-import pytest
 
 from mudm.model import MuDMFeature
 from mudm_tools.neuroglancer.annotation_writer import (
@@ -13,10 +11,10 @@ from mudm_tools.neuroglancer.annotation_writer import (
     write_annotations,
 )
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _point_feature(x, y, z) -> MuDMFeature:
     return MuDMFeature(
@@ -37,6 +35,7 @@ def _line_feature(coords) -> MuDMFeature:
 # ---------------------------------------------------------------------------
 # Tests: point binary
 # ---------------------------------------------------------------------------
+
 
 class TestPointsToAnnotationBinary:
     def test_single_point(self):
@@ -66,6 +65,7 @@ class TestPointsToAnnotationBinary:
 # Tests: line binary
 # ---------------------------------------------------------------------------
 
+
 class TestLinesToAnnotationBinary:
     def test_single_line(self):
         line = (0.0, 0.0, 0.0, 10.0, 10.0, 10.0)
@@ -86,6 +86,7 @@ class TestLinesToAnnotationBinary:
 # ---------------------------------------------------------------------------
 # Tests: write_annotations (disk I/O)
 # ---------------------------------------------------------------------------
+
 
 class TestWriteAnnotations:
     def test_point_creates_directory(self, tmp_path):

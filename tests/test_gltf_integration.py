@@ -3,7 +3,6 @@
 import struct
 from pathlib import Path
 
-import pytest
 from pygltflib import GLTF2
 
 from mudm.model import (
@@ -12,8 +11,7 @@ from mudm.model import (
     TIN,
 )
 from mudm_tools.swc import swc_to_tin
-from mudm_tools.gltf import GltfConfig, to_glb, to_gltf
-
+from mudm_tools.gltf import to_glb, to_gltf
 
 FIXTURE_DIR = Path(__file__).parent / "fixtures"
 SWC_FILE = FIXTURE_DIR / "sample_neuron.swc"
@@ -94,7 +92,7 @@ class TestMixedGeometryCollection:
         )
 
         out = tmp_path / "mixed.glb"
-        glb = to_glb(collection, output_path=out)
+        to_glb(collection, output_path=out)
 
         loaded = GLTF2.load(str(out))
         # point(1) + line(1) + polygon(1) + tin(1) = 4 meshes
@@ -113,7 +111,7 @@ class TestPublicAPIImports:
         assert GltfConfig is not None
 
     def test_import_from_gltf_subpackage(self):
-        from mudm_tools.gltf import to_gltf, to_glb, GltfConfig
+        from mudm_tools.gltf import to_gltf, to_glb
 
         assert callable(to_gltf)
         assert callable(to_glb)

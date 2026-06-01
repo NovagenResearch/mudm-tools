@@ -145,12 +145,7 @@ class OmeMicrojsonModel:
 
         self._tile_read()
         out_combined = Path(self.out_dir, "tmp")
-        out_file = (
-            Path(self.file_path).name.split(".")[0]
-            + "_"
-            + str(self.polygon_type)
-            + ".json"
-        )
+        out_file = Path(self.file_path).name.split(".")[0] + "_" + str(self.polygon_type) + ".json"
         if not out_combined.exists():
             out_combined.mkdir(exist_ok=True)
 
@@ -205,10 +200,7 @@ class OmeMicrojsonModel:
             ):
                 contour = np.flip(contour, axis=1)
                 seg_encodings = contour.ravel().tolist()
-                poly = [
-                    [xi + x, yi + y]
-                    for xi, yi in zip(seg_encodings[1::2], seg_encodings[::2])
-                ]
+                poly = [[xi + x, yi + y] for xi, yi in zip(seg_encodings[1::2], seg_encodings[::2])]
                 label.append(i)
                 coordinates.append(poly)
 

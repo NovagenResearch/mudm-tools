@@ -2,7 +2,6 @@
 
 import struct
 
-import pytest
 
 from mudm_tools.neuroglancer._binary import (
     pack_float32,

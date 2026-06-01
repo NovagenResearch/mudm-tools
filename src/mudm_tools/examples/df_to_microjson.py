@@ -26,26 +26,20 @@ def df_to_microjson(df: pd.DataFrame) -> mj.FeatureCollection:
         # Dynamically generate a Geometry object based on the row's
         # geometry type
         GeometryClass = getattr(mj, row["geometryType"])
-        geometry = GeometryClass(
-            type=row["geometryType"], coordinates=row["coordinates"]
-        )
+        geometry = GeometryClass(type=row["geometryType"], coordinates=row["coordinates"])
         properties = {}
         for key in ["name", "value", "values"]:
             properties[key] = row[key]
 
         # Generate a Feature object that combines geometry and properties
-        feature = mj.MuDMFeature(
-            type=row["type"], geometry=geometry, properties=properties
-        )
+        feature = mj.MuDMFeature(type=row["type"], geometry=geometry, properties=properties)
 
         # Append this feature to the list of features
         features.append(feature)
 
     # Generate a FeatureCollection object to aggregate all features
     feature_collection = mj.MuDMFeatureCollection(
-        type="FeatureCollection",
-        features=features,
-        properties={"plate": "Example Plate"}
+        type="FeatureCollection", features=features, properties={"plate": "Example Plate"}
     )
 
     return feature_collection
@@ -79,5 +73,4 @@ if __name__ == "__main__":
     feature_collection_model = df_to_microjson(df)
 
     # Serialize the FeatureCollection model to a JSON string
-    print(feature_collection_model.model_dump_json(
-        indent=2, exclude_unset=True))
+    print(feature_collection_model.model_dump_json(indent=2, exclude_unset=True))

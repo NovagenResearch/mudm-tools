@@ -1,10 +1,5 @@
 """Tests for glTF/GLB writer and public API."""
 
-import tempfile
-from pathlib import Path
-
-import numpy as np
-import pytest
 from pygltflib import GLTF2
 
 from mudm.model import (
@@ -40,12 +35,13 @@ class TestToGltf:
     def test_saves_to_file(self, tmp_path):
         feat = _tin_feature()
         out = tmp_path / "test.gltf"
-        result = to_gltf(feat, output_path=out)
+        to_gltf(feat, output_path=out)
 
         assert out.exists()
         assert out.stat().st_size > 0
         # Should be valid JSON
         import json
+
         data = json.loads(out.read_text())
         assert data["asset"]["version"] == "2.0"
 
@@ -73,6 +69,7 @@ class TestToGlb:
         feat = _tin_feature()
         result = to_glb(feat)
         import struct
+
         version = struct.unpack_from("<I", result, 4)[0]
         assert version == 2
 

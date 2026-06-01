@@ -1,7 +1,5 @@
 """Tests for mudm.polygen3d — random 3D geometry generator."""
 
-import pytest
-
 from mudm_tools.polygen3d import (
     generate_random_tins,
     generate_random_points_3d,
@@ -88,14 +86,22 @@ class TestGenerateRandomLines3D:
 class TestGenerate3DCollection:
     def test_feature_count(self):
         coll = generate_3d_collection(
-            n_tins=4, n_points=3, n_lines=2, bounds=BOUNDS, seed=42,
+            n_tins=4,
+            n_points=3,
+            n_lines=2,
+            bounds=BOUNDS,
+            seed=42,
         )
         assert len(coll.features) == 9  # 4 + 3 + 2
 
     def test_metadata_attached(self):
         coll = generate_3d_collection(
-            n_tins=2, n_points=1, n_lines=1,
-            bounds=BOUNDS, n_meta_keys=3, seed=42,
+            n_tins=2,
+            n_points=1,
+            n_lines=1,
+            bounds=BOUNDS,
+            n_meta_keys=3,
+            seed=42,
         )
         for feat in coll.features:
             assert "meta1" in feat.properties

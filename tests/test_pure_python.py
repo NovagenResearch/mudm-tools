@@ -6,11 +6,10 @@ They must pass even when _rs is not compiled.
 """
 
 import json
-import pytest
 
 
 def test_model_validation():
-    from mudm.model import MuDM, GeoJSON
+    from mudm.model import MuDM
 
     data = {
         "type": "FeatureCollection",

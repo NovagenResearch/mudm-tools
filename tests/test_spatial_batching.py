@@ -1,5 +1,6 @@
 """SpatiallyCoherentLoader: yields batches drawn from a single octree tile, with
 adjacent-tile padding when a tile has fewer features than the requested batch size."""
+
 from __future__ import annotations
 
 import sys
@@ -8,7 +9,6 @@ from pathlib import Path
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
-import pytest
 
 # The curriculum-benchmark helpers we exercise live under ``scripts/`` rather
 # than the installed package, so make that path importable.
@@ -40,7 +40,8 @@ def _build_synthetic_partitioned_parquet(tmp_path, *, zoom: int, n_features_per_
     table = pa.Table.from_pylist(rows)
     out_dir = tmp_path / "parquet_partitioned"
     pq.write_to_dataset(
-        table, root_path=str(out_dir),
+        table,
+        root_path=str(out_dir),
         partition_cols=["zoom", "tile_x", "tile_y", "tile_d"],
     )
     return out_dir
@@ -50,12 +51,16 @@ def test_spatial_loader_yields_single_tile_batch(tmp_path):
     from mudm_tools.spatial_batching import SpatiallyCoherentLoader
 
     parquet_dir = _build_synthetic_partitioned_parquet(
-        tmp_path, zoom=3,
+        tmp_path,
+        zoom=3,
         n_features_per_tile={(0, 0, 0): 8, (1, 0, 0): 8, (0, 1, 0): 8},
     )
 
     loader = SpatiallyCoherentLoader(
-        parquet_dir=parquet_dir, zoom=3, batch_size=8, shuffle=False,
+        parquet_dir=parquet_dir,
+        zoom=3,
+        batch_size=8,
+        shuffle=False,
     )
     batches = list(loader)
     assert len(batches) == 3
@@ -71,11 +76,15 @@ def test_spatial_loader_pads_undersized_tile(tmp_path):
     from mudm_tools.spatial_batching import SpatiallyCoherentLoader
 
     parquet_dir = _build_synthetic_partitioned_parquet(
-        tmp_path, zoom=3,
+        tmp_path,
+        zoom=3,
         n_features_per_tile={(0, 0, 0): 4, (1, 0, 0): 4, (2, 0, 0): 8},
     )
     loader = SpatiallyCoherentLoader(
-        parquet_dir=parquet_dir, zoom=3, batch_size=8, shuffle=False,
+        parquet_dir=parquet_dir,
+        zoom=3,
+        batch_size=8,
+        shuffle=False,
     )
     batches = list(loader)
     # Each batch is exactly batch_size; total features = 4+4+8 = 16, so 2 batches
@@ -90,18 +99,24 @@ def test_spatial_loader_total_features_preserved(tmp_path):
     from mudm_tools.spatial_batching import SpatiallyCoherentLoader
 
     parquet_dir = _build_synthetic_partitioned_parquet(
-        tmp_path, zoom=3,
+        tmp_path,
+        zoom=3,
         n_features_per_tile={(0, 0, 0): 8, (1, 0, 0): 8},
     )
     loader = SpatiallyCoherentLoader(
-        parquet_dir=parquet_dir, zoom=3, batch_size=8, shuffle=False,
+        parquet_dir=parquet_dir,
+        zoom=3,
+        batch_size=8,
+        shuffle=False,
     )
     seen = set()
     for batch in loader:
         for b in batch:
             seen.add(b["feature_id"])
     # Every original feature should be visited at least once
-    expected = {f"f_{x}_{y}_{d}_{i}" for (x, y, d), n in [((0,0,0),8),((1,0,0),8)] for i in range(n)}
+    expected = {
+        f"f_{x}_{y}_{d}_{i}" for (x, y, d), n in [((0, 0, 0), 8), ((1, 0, 0), 8)] for i in range(n)
+    }
     assert expected.issubset(seen)
 
 
@@ -111,11 +126,16 @@ def test_spatial_loader_shuffles_tile_order(tmp_path):
     from mudm_tools.spatial_batching import SpatiallyCoherentLoader
 
     parquet_dir = _build_synthetic_partitioned_parquet(
-        tmp_path, zoom=3,
+        tmp_path,
+        zoom=3,
         n_features_per_tile={(0, 0, 0): 4, (1, 0, 0): 4, (2, 0, 0): 4, (3, 0, 0): 4},
     )
     loader = SpatiallyCoherentLoader(
-        parquet_dir=parquet_dir, zoom=3, batch_size=4, shuffle=True, seed=42,
+        parquet_dir=parquet_dir,
+        zoom=3,
+        batch_size=4,
+        shuffle=True,
+        seed=42,
     )
     epoch_a = [b[0]["tile_x"] for b in loader]
     epoch_b = [b[0]["tile_x"] for b in loader]
@@ -159,7 +179,8 @@ def _build_mixed_split_partitioned_parquet(tmp_path, *, zoom: int, body_ids_per_
     table = pa.Table.from_pylist(rows)
     out_dir = tmp_path / "parquet_partitioned"
     pq.write_to_dataset(
-        table, root_path=str(out_dir),
+        table,
+        root_path=str(out_dir),
         partition_cols=["zoom", "tile_x", "tile_y", "tile_d"],
     )
     return out_dir
@@ -175,10 +196,10 @@ def test_train_only_parquet_view_contains_only_train_rows(tmp_path):
         tmp_path,
         zoom=3,
         body_ids_per_tile={
-            (0, 0, 0): ["t1", "t2", "v1"],   # mixed train/val
-            (1, 0, 0): ["t3", "t4"],         # all train
-            (0, 1, 0): ["v2", "x1"],         # zero train -> tile dropped
-            (1, 1, 0): ["t5", "x2", "v3"],   # mixed all three splits
+            (0, 0, 0): ["t1", "t2", "v1"],  # mixed train/val
+            (1, 0, 0): ["t3", "t4"],  # all train
+            (0, 1, 0): ["v2", "x1"],  # zero train -> tile dropped
+            (1, 1, 0): ["t5", "x2", "v3"],  # mixed all three splits
         },
     )
 
@@ -212,6 +233,7 @@ def test_train_only_parquet_view_contains_only_train_rows(tmp_path):
         assert seen_bids == train_id_set
     finally:
         import shutil
+
         shutil.rmtree(out_dir, ignore_errors=True)
 
 
@@ -228,7 +250,7 @@ def test_train_only_parquet_view_is_consumable_by_spatial_loader(tmp_path):
         body_ids_per_tile={
             (0, 0, 0): [f"t{i}" for i in range(8)] + ["v0", "v1"],
             (1, 0, 0): [f"t{i}" for i in range(8, 16)],
-            (0, 1, 0): ["v2", "v3", "v4"],   # zero train rows
+            (0, 1, 0): ["v2", "v3", "v4"],  # zero train rows
         },
     )
     train_id_set = {f"t{i}" for i in range(16)}
@@ -240,7 +262,10 @@ def test_train_only_parquet_view_is_consumable_by_spatial_loader(tmp_path):
     )
     try:
         loader = SpatiallyCoherentLoader(
-            parquet_dir=Path(out_dir), zoom=3, batch_size=8, shuffle=False,
+            parquet_dir=Path(out_dir),
+            zoom=3,
+            batch_size=8,
+            shuffle=False,
         )
         batches = list(loader)
         # 16 train rows, batch_size=8 -> exactly 2 full batches, no carry drop.
@@ -253,4 +278,5 @@ def test_train_only_parquet_view_is_consumable_by_spatial_loader(tmp_path):
                 assert tags_dict["body_id"] in train_id_set
     finally:
         import shutil
+
         shutil.rmtree(out_dir, ignore_errors=True)

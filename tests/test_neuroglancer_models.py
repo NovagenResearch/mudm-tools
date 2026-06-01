@@ -1,7 +1,5 @@
 """Tests for Neuroglancer Pydantic config models."""
 
-import pytest
-
 from mudm_tools.neuroglancer.models import (
     AnnotationDimension,
     AnnotationInfo,

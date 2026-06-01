@@ -2,6 +2,7 @@
 verify round-trip of polygons + expression vectors + cell-type / ontology metadata.
 
 Skipped when the dataset isn't on disk."""
+
 from __future__ import annotations
 
 import json
@@ -10,14 +11,7 @@ from pathlib import Path
 import pyarrow.parquet as pq
 import pytest
 
-
-REP1 = (
-    Path(__file__).resolve().parent.parent
-    / "data"
-    / "xenium_breast"
-    / "Rep1"
-    / "outs"
-)
+REP1 = Path(__file__).resolve().parent.parent / "data" / "xenium_breast" / "Rep1" / "outs"
 
 
 @pytest.mark.skipif(not REP1.exists(), reason="Xenium Rep1 not downloaded")
@@ -81,6 +75,7 @@ def test_xenium_tile_to_parquet_roundtrip(tmp_path):
 
     # Tags should preserve expression and cell_id (encoded as utf8 strings).
     tags_col = table.column("tags").to_pylist()
+
     # Each row is a list[(key, value)] tuple list when reading map<utf8,utf8>
     def _has_key(row, key):
         if row is None:
@@ -89,8 +84,9 @@ def test_xenium_tile_to_parquet_roundtrip(tmp_path):
             return key in row
         return any(k == key for k, _ in row)
 
-    assert any(_has_key(row, "expression") for row in tags_col), \
-        f"no expression in tags; sample: {tags_col[:1]}"
+    assert any(
+        _has_key(row, "expression") for row in tags_col
+    ), f"no expression in tags; sample: {tags_col[:1]}"
     assert any(_has_key(row, "cell_id") for row in tags_col)
 
     # Expression value must be a JSON-decodable list of ints with non-trivial length.
@@ -102,9 +98,7 @@ def test_xenium_tile_to_parquet_roundtrip(tmp_path):
                 return v
         return None
 
-    sample_expr = next(
-        _get(row, "expression") for row in tags_col if _has_key(row, "expression")
-    )
+    sample_expr = next(_get(row, "expression") for row in tags_col if _has_key(row, "expression"))
     decoded = json.loads(sample_expr)
     assert isinstance(decoded, list)
     assert len(decoded) > 0

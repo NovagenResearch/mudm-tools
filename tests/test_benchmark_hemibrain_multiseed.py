@@ -1,28 +1,30 @@
 """Smoke test that benchmark_hemibrain_ml.py runs in 5-seed mode and emits
 mean +/- SD with a paired t-test."""
+
 import json
 import subprocess
 from pathlib import Path
 
 import pytest
 
-
 ROOT = Path(__file__).resolve().parent.parent
 HEMIBRAIN_DATA = ROOT / "data" / "hemibrain"
 
 
-@pytest.mark.skipif(
-    not HEMIBRAIN_DATA.exists(), reason="Hemibrain dataset not available locally"
-)
+@pytest.mark.skipif(not HEMIBRAIN_DATA.exists(), reason="Hemibrain dataset not available locally")
 def test_benchmark_emits_multiseed_stats(tmp_path):
     out = tmp_path / "result.json"
     subprocess.run(
         [
-            "uv", "run", "python",
+            "uv",
+            "run",
+            "python",
             str(ROOT / "scripts" / "benchmark_hemibrain_ml.py"),
-            "--seeds", "42,123",
+            "--seeds",
+            "42,123",
             "--quick",
-            "--output", str(out),
+            "--output",
+            str(out),
         ],
         check=True,
         cwd=ROOT,
@@ -36,8 +38,12 @@ def test_benchmark_emits_multiseed_stats(tmp_path):
         assert loader_key in data, f"missing loader: {loader_key}"
         ld = data[loader_key]
         for stat_key in (
-            "accuracy_mean", "accuracy_sd", "macro_f1_mean", "macro_f1_sd",
-            "load_time_mean_s", "epoch_time_mean_s",
+            "accuracy_mean",
+            "accuracy_sd",
+            "macro_f1_mean",
+            "macro_f1_sd",
+            "load_time_mean_s",
+            "epoch_time_mean_s",
         ):
             assert stat_key in ld, f"missing {loader_key}.{stat_key}"
         assert "per_seed_accuracy" in ld

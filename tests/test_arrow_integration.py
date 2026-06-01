@@ -3,27 +3,28 @@
 from __future__ import annotations
 
 import json
-import tempfile
-from pathlib import Path
 
 import geopandas as gpd
 import pyarrow as pa
 import pyarrow.parquet as pq
-import pytest
 import shapely
 
-from mudm_tools.arrow import ArrowConfig, to_arrow_table, to_geoparquet, from_arrow_table, from_geoparquet
+from mudm_tools.arrow import (
+    ArrowConfig,
+    to_arrow_table,
+    to_geoparquet,
+    from_arrow_table,
+    from_geoparquet,
+)
 from mudm.model import (
     MuDMFeature,
     MuDMFeatureCollection,
     OntologyTerm,
-    PolyhedralSurface,
     TIN,
     Vocabulary,
 )
 
 from geojson_pydantic import (
-    LineString,
     MultiLineString,
     MultiPoint,
     MultiPolygon,
@@ -31,8 +32,8 @@ from geojson_pydantic import (
     Polygon,
 )
 
-
 # ---- Helpers ----
+
 
 def _point_feat(fid="p1", x=1.0, y=2.0, z=3.0, props=None):
     return MuDMFeature(
@@ -111,7 +112,7 @@ class TestGeoParquetRoundTrip:
                 _point_feat("b", props={"val": 2}),
             ],
         )
-        table = to_geoparquet(fc, path)
+        to_geoparquet(fc, path)
 
         # Verify file exists
         assert path.exists()
@@ -339,7 +340,10 @@ class TestVocabularyArrowRoundTrip:
         assert raw is not None
         vocab = json.loads(raw)
         assert "cell_type" in vocab
-        assert vocab["cell_type"]["terms"]["pyramidal"]["uri"] == "http://purl.obolibrary.org/obo/CL_0000598"
+        assert (
+            vocab["cell_type"]["terms"]["pyramidal"]["uri"]
+            == "http://purl.obolibrary.org/obo/CL_0000598"
+        )
 
     def test_vocabulary_arrow_roundtrip(self):
         fc = self._make_collection_with_vocab()
@@ -347,7 +351,10 @@ class TestVocabularyArrowRoundTrip:
         fc2 = from_arrow_table(table)
         assert fc2.vocabularies is not None
         assert "cell_type" in fc2.vocabularies
-        assert fc2.vocabularies["cell_type"].terms["pyramidal"].uri == "http://purl.obolibrary.org/obo/CL_0000598"
+        assert (
+            fc2.vocabularies["cell_type"].terms["pyramidal"].uri
+            == "http://purl.obolibrary.org/obo/CL_0000598"
+        )
         assert fc2.vocabularies["cell_type"].terms["pyramidal"].label == "pyramidal neuron"
 
     def test_vocabulary_geoparquet_roundtrip(self, tmp_path):

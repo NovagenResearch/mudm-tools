@@ -6,20 +6,18 @@ from geojson_pydantic import Point, Polygon
 from mudm.model import (
     MuDMFeature,
     MuDMFeatureCollection,
-    PolyhedralSurface,
     TIN,
 )
 from mudm.layout import (
-    Bounds,
     apply_layout,
     compute_collection_offsets,
     geometry_bounds,
 )
 
-
 # ---------------------------------------------------------------------------
 # geometry_bounds
 # ---------------------------------------------------------------------------
+
 
 class TestGeometryBounds:
     def test_point(self):
@@ -34,12 +32,12 @@ class TestGeometryBounds:
         )
         b = geometry_bounds(p)
         assert b is not None
-        assert b[0] == 0.0   # xmin
-        assert b[1] == 0.0   # ymin
-        assert b[2] == 0.0   # zmin (default)
+        assert b[0] == 0.0  # xmin
+        assert b[1] == 0.0  # ymin
+        assert b[2] == 0.0  # zmin (default)
         assert b[3] == 10.0  # xmax
-        assert b[4] == 5.0   # ymax
-        assert b[5] == 0.0   # zmax (default)
+        assert b[4] == 5.0  # ymax
+        assert b[5] == 0.0  # zmax (default)
 
     def test_tin(self):
         tin = TIN(
@@ -62,6 +60,7 @@ class TestGeometryBounds:
 # Helper: TIN feature factory (replaces NeuronMorphology-based helper)
 # ---------------------------------------------------------------------------
 
+
 def _tin_at(x_start=0.0, x_end=100.0):
     """Create a TIN geometry spanning from x_start to x_end."""
     return TIN(
@@ -76,12 +75,10 @@ def _tin_at(x_start=0.0, x_end=100.0):
 # Row layout
 # ---------------------------------------------------------------------------
 
+
 class TestRowLayout:
     def _features(self, *tins):
-        return [
-            MuDMFeature(type="Feature", geometry=t, properties=None)
-            for t in tins
-        ]
+        return [MuDMFeature(type="Feature", geometry=t, properties=None) for t in tins]
 
     def test_single_feature_no_offset(self):
         feats = self._features(_tin_at())
@@ -118,6 +115,7 @@ class TestRowLayout:
 # Grid layout
 # ---------------------------------------------------------------------------
 
+
 class TestGridLayout:
     def _tin(self, width=100.0):
         return _tin_at(0.0, width)
@@ -136,7 +134,9 @@ class TestGridLayout:
         """4 features in 2 columns -> 2 rows."""
         feats = self._features(4)
         offsets = compute_collection_offsets(
-            feats, spacing=10.0, grid_max_x=2,
+            feats,
+            spacing=10.0,
+            grid_max_x=2,
         )
         # Feature 0: no offset
         assert offsets[0] == (0.0, 0.0, 0.0)
@@ -150,7 +150,10 @@ class TestGridLayout:
         """5 features in 2x2 -> 5th goes to layer 1."""
         feats = self._features(5)
         offsets = compute_collection_offsets(
-            feats, spacing=10.0, grid_max_x=2, grid_max_y=2,
+            feats,
+            spacing=10.0,
+            grid_max_x=2,
+            grid_max_y=2,
         )
         # Feature 4: layer 1, col 0, row 0 -> dz > 0
         assert abs(offsets[4][0]) < 1e-6  # col 0
@@ -161,22 +164,30 @@ class TestGridLayout:
         feats = self._features(10)
         with pytest.raises(ValueError, match="Cannot fit 10 features"):
             compute_collection_offsets(
-                feats, spacing=10.0,
-                grid_max_x=2, grid_max_y=2, grid_max_z=2,
+                feats,
+                spacing=10.0,
+                grid_max_x=2,
+                grid_max_y=2,
+                grid_max_z=2,
             )
 
     def test_exact_capacity_fits(self):
         feats = self._features(8)
         offsets = compute_collection_offsets(
-            feats, spacing=10.0,
-            grid_max_x=2, grid_max_y=2, grid_max_z=2,
+            feats,
+            spacing=10.0,
+            grid_max_x=2,
+            grid_max_y=2,
+            grid_max_z=2,
         )
         assert len(offsets) == 8
 
     def test_unconstrained_z_always_fits(self):
         feats = self._features(20)
         offsets = compute_collection_offsets(
-            feats, spacing=10.0, grid_max_x=3,
+            feats,
+            spacing=10.0,
+            grid_max_x=3,
         )
         assert len(offsets) == 20
 
@@ -185,13 +196,17 @@ class TestGridLayout:
 # apply_layout end-to-end
 # ---------------------------------------------------------------------------
 
+
 class TestApplyLayout:
     def test_single_feature_unchanged(self):
         feat = MuDMFeature(
-            type="Feature", geometry=_tin_at(), properties=None,
+            type="Feature",
+            geometry=_tin_at(),
+            properties=None,
         )
         coll = MuDMFeatureCollection(
-            type="FeatureCollection", features=[feat],
+            type="FeatureCollection",
+            features=[feat],
         )
         result = apply_layout(coll)
         # Single feature -- no translation
@@ -213,13 +228,20 @@ class TestApplyLayout:
 
     def test_original_not_modified(self):
         feat = MuDMFeature(
-            type="Feature", geometry=_tin_at(0, 100), properties=None,
+            type="Feature",
+            geometry=_tin_at(0, 100),
+            properties=None,
         )
         coll = MuDMFeatureCollection(
             type="FeatureCollection",
-            features=[feat, MuDMFeature(
-                type="Feature", geometry=_tin_at(0, 80), properties=None,
-            )],
+            features=[
+                feat,
+                MuDMFeature(
+                    type="Feature",
+                    geometry=_tin_at(0, 80),
+                    properties=None,
+                ),
+            ],
         )
         result = apply_layout(coll, spacing=50.0)
         # Original should be unchanged

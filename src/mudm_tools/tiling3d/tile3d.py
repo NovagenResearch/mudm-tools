@@ -145,6 +145,6 @@ def transform_tile_3d(
 transform_tile_3d_py = transform_tile_3d
 
 try:
-    from mudm_tools._rs import transform_tile_3d  # noqa: F811
+    from mudm_tools._rs import transform_tile_3d  # type: ignore[no-redef]  # noqa: F811
 except ImportError:
     pass

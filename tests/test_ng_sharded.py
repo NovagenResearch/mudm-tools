@@ -22,6 +22,7 @@ import pytest
 
 try:
     from mudm_tools._rs import StreamingTileGenerator
+
     RUST_AVAILABLE = True
 except ImportError:
     RUST_AVAILABLE = False
@@ -33,6 +34,7 @@ WORLD_BOUNDS = (0.0, 0.0, 0.0, 100.0, 200.0, 300.0)
 
 def _make_dense_tin_feature(n_triangles=20, seed=42, tags=None):
     import random
+
     rng = random.Random(seed)
     xy, z, ring_lengths = [], [], []
     for _ in range(n_triangles):
@@ -45,18 +47,25 @@ def _make_dense_tin_feature(n_triangles=20, seed=42, tags=None):
         ring_lengths.append(3)
     n = len(z)
     return {
-        "geometry": xy, "geometry_z": z, "ring_lengths": ring_lengths, "type": 5,
+        "geometry": xy,
+        "geometry_z": z,
+        "ring_lengths": ring_lengths,
+        "type": 5,
         "tags": tags or {"name": "dense"},
-        "minX": min(xy[i * 2] for i in range(n)), "minY": min(xy[i * 2 + 1] for i in range(n)),
-        "minZ": min(z), "maxX": max(xy[i * 2] for i in range(n)),
-        "maxY": max(xy[i * 2 + 1] for i in range(n)), "maxZ": max(z),
+        "minX": min(xy[i * 2] for i in range(n)),
+        "minY": min(xy[i * 2 + 1] for i in range(n)),
+        "minZ": min(z),
+        "maxX": max(xy[i * 2] for i in range(n)),
+        "maxY": max(xy[i * 2 + 1] for i in range(n)),
+        "maxZ": max(z),
     }
 
 
 def _corpus(n=8):
     return [
-        _make_dense_tin_feature(12 + i, seed=100 + i,
-                                tags={"name": f"neuron_{i}", "volume": float(10 * i + 5)})
+        _make_dense_tin_feature(
+            12 + i, seed=100 + i, tags={"name": f"neuron_{i}", "volume": float(10 * i + 5)}
+        )
         for i in range(n)
     ]
 
@@ -84,16 +93,16 @@ def _manifest_total_fragment_size(man: bytes) -> int:
     off = 3 * 4 + 3 * 4  # chunk_shape + grid_origin (f32 x3 each)
     (num_lods,) = struct.unpack_from("<I", man, off)
     off += 4
-    off += num_lods * 4          # lod_scales
-    off += num_lods * 3 * 4      # vertex_offsets
+    off += num_lods * 4  # lod_scales
+    off += num_lods * 3 * 4  # vertex_offsets
     num_frags = struct.unpack_from("<%dI" % num_lods, man, off)
     off += num_lods * 4
     total = 0
     for lod in range(num_lods):
         nf = num_frags[lod]
-        off += nf * 3 * 4        # fragment_positions [3, nf]
+        off += nf * 3 * 4  # fragment_positions [3, nf]
         offs = struct.unpack_from("<%dI" % nf, man, off)
-        off += nf * 4            # fragment_offsets [nf]
+        off += nf * 4  # fragment_offsets [nf]
         total += sum(offs)
     return total
 
@@ -114,10 +123,10 @@ def _decode_sharded(out_dir: Path) -> dict:
             start, end = struct.unpack_from("<QQ", b, m * 16)
             if start == end:
                 continue
-            mi = b[shard_index_end + start: shard_index_end + end]
+            mi = b[shard_index_end + start : shard_index_end + end]
             n = len(mi) // 24
             u = struct.unpack_from("<%dQ" % (3 * n), mi, 0)
-            row0, row1, row2 = u[0:n], u[n:2 * n], u[2 * n:3 * n]
+            row0, row1, row2 = u[0:n], u[n : 2 * n], u[2 * n : 3 * n]
             labels, acc = [], 0
             for i in range(n):
                 acc = row0[i] if i == 0 else acc + row0[i]
@@ -125,12 +134,13 @@ def _decode_sharded(out_dir: Path) -> dict:
             sizes = list(row2)
             starts = []
             for i in range(n):
-                starts.append(shard_index_end + row1[0] if i == 0
-                              else starts[-1] + sizes[i - 1] + row1[i])
+                starts.append(
+                    shard_index_end + row1[0] if i == 0 else starts[-1] + sizes[i - 1] + row1[i]
+                )
             for i in range(n):
-                man = b[starts[i]: starts[i] + sizes[i]]
+                man = b[starts[i] : starts[i] + sizes[i]]
                 total_frag = _manifest_total_fragment_size(man)
-                frag = b[starts[i] - total_frag: starts[i]]
+                frag = b[starts[i] - total_frag : starts[i]]
                 decoded[str(labels[i])] = (man, frag)
     return decoded
 
@@ -146,8 +156,11 @@ def test_sharded_equivalent_to_loose(tmp_path, minishard_bits, shard_bits):
 
     out_sharded = tmp_path / "sharded"
     n_sharded = _build(feats).generate_neuroglancer_multilod(
-        str(out_sharded), WORLD_BOUNDS,
-        sharded=True, minishard_bits=minishard_bits, shard_bits=shard_bits,
+        str(out_sharded),
+        WORLD_BOUNDS,
+        sharded=True,
+        minishard_bits=minishard_bits,
+        shard_bits=shard_bits,
     )
 
     assert n_loose == n_sharded
@@ -176,8 +189,12 @@ def test_sharded_is_deterministic(tmp_path):
     feats = _corpus(6)
     out1 = tmp_path / "s1"
     out2 = tmp_path / "s2"
-    _build(feats).generate_neuroglancer_multilod(str(out1), WORLD_BOUNDS, sharded=True, minishard_bits=4)
-    _build(feats).generate_neuroglancer_multilod(str(out2), WORLD_BOUNDS, sharded=True, minishard_bits=4)
+    _build(feats).generate_neuroglancer_multilod(
+        str(out1), WORLD_BOUNDS, sharded=True, minishard_bits=4
+    )
+    _build(feats).generate_neuroglancer_multilod(
+        str(out2), WORLD_BOUNDS, sharded=True, minishard_bits=4
+    )
     shards1 = sorted(out1.glob("*.shard"))
     shards2 = sorted(out2.glob("*.shard"))
     assert shards1 and [p.name for p in shards1] == [p.name for p in shards2]

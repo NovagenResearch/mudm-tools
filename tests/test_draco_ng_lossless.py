@@ -36,10 +36,18 @@ draco_encode_ng_u32 = getattr(_rs, "draco_encode_ng_u32", None)
 
 def _tetra_u32():
     positions = [
-        0, 0, 0,
-        1000, 0, 0,
-        500, 1000, 0,
-        500, 500, 1000,
+        0,
+        0,
+        0,
+        1000,
+        0,
+        0,
+        500,
+        1000,
+        0,
+        500,
+        500,
+        1000,
     ]
     indices = [0, 1, 2, 0, 1, 3, 1, 2, 3, 0, 2, 3]
     return positions, indices
@@ -59,10 +67,18 @@ def _tetra_u32_near_max():
     """
     qmax = (1 << _NG_DEFAULT_QBITS) - 1  # 1023
     positions = [
-        0, 0, 0,
-        qmax, 0, 0,
-        qmax // 2, qmax, 0,
-        qmax // 2, qmax // 2, qmax,
+        0,
+        0,
+        0,
+        qmax,
+        0,
+        0,
+        qmax // 2,
+        qmax,
+        0,
+        qmax // 2,
+        qmax // 2,
+        qmax,
     ]
     indices = [0, 1, 2, 0, 1, 3, 1, 2, 3, 0, 2, 3]
     return positions, indices

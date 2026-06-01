@@ -71,6 +71,35 @@ where = ["src"]
 testpaths = ["tests/"]
 pythonpath = ["src/", "scripts/"]
 
+# --- Lint / format / type-check ------------------------------------------
+# Enforced surface: the library (src/mudm_tools) + tests. Generated protobuf
+# (vt2pbf/mapbox/*_pb2.py — "DO NOT EDIT") and the research scripts/ are
+# excluded. Black owns line length (ruff E501 disabled to avoid conflicts).
+[tool.black]
+line-length = 100
+target-version = ["py311", "py312", "py313"]
+extend-exclude = '.*_pb2\.py$'
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+extend-exclude = ["*_pb2.py", "scripts"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W"]
+ignore = ["E501"]  # line length is managed by black
+
+[tool.mypy]
+python_version = "3.11"
+ignore_missing_imports = true
+exclude = ['_pb2\.py$']
+
+# tifffile (xenium extra) uses 3.12 `type` statements that mypy rejects under
+# python_version 3.11; don't analyze the lib's source (we only need its types).
+[[tool.mypy.overrides]]
+module = "tifffile.*"
+follow_imports = "skip"
+
 [dependency-groups]
 dev = [
     "maturin>=1.13.1",
@@ -80,4 +109,9 @@ docs = [
     "mkdocs-material>=9.7.6",
     "mkdocstrings[python]>=1.0.4",
     "ruff>=0.15.15",
+]
+lint = [
+    "black>=24.0",
+    "ruff>=0.15.15",
+    "mypy>=1.13",
 ]

@@ -4,9 +4,6 @@ Note: to_neuroglancer() no longer dispatches skeletons. For skeleton export,
 call write_skeleton() directly with a NeuronMorphology from mudm_tools.swc.
 """
 
-import json
-from pathlib import Path
-
 import pytest
 
 from mudm.model import (
@@ -15,10 +12,10 @@ from mudm.model import (
 )
 from mudm_tools.neuroglancer.writer import to_neuroglancer
 
-
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
+
 
 @pytest.fixture
 def point_feature():
@@ -41,6 +38,7 @@ def line_feature():
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
+
 
 class TestToNeuroglancerPointsOnly:
     def test_point_only(self, point_feature, tmp_path):
@@ -78,9 +76,7 @@ class TestToNeuroglancerViewerState:
         assert "viewer_url" not in result
 
     def test_viewer_url_with_base(self, point_feature, tmp_path):
-        result = to_neuroglancer(
-            point_feature, tmp_path, base_url="http://localhost:8080"
-        )
+        result = to_neuroglancer(point_feature, tmp_path, base_url="http://localhost:8080")
         assert "viewer_url" in result
         assert "viewer_state" in result
         assert result["viewer_url"].startswith("http://localhost:8080/#!")

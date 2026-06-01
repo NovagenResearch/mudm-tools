@@ -32,10 +32,8 @@ def test_valid_geojsons(filename):
     except jsonschema.exceptions.ValidationError as err:
         pytest.fail(f"JSON Schema validation failed. Error: {err}")
     except Exception as e:
-        pytest.fail(
-            f"""Unexpected error occurred
-                    during validation of {filename}: {str(e)}"""
-        )
+        pytest.fail(f"""Unexpected error occurred
+                    during validation of {filename}: {str(e)}""")
 
 
 @pytest.mark.parametrize("filename", invalid_examples)
@@ -46,16 +44,12 @@ def test_invalid_geojsons(filename):
     # Try to parse the data as a GeoJSON object
     try:
         validate(instance=data, schema=schema)
-        pytest.fail(
-            f"""Parsing succeeded on {filename},
-                    but it should not have."""
-        )
+        pytest.fail(f"""Parsing succeeded on {filename},
+                    but it should not have.""")
     except jsonschema.exceptions.ValidationError:
         # The validation error is expected, so we just pass
         pass
     except Exception as e:
         # An unexpected error occurred, so we fail the test
-        pytest.fail(
-            f"""Unexpected error occurred
-                    during validation of {filename}: {str(e)}"""
-        )
+        pytest.fail(f"""Unexpected error occurred
+                    during validation of {filename}: {str(e)}""")

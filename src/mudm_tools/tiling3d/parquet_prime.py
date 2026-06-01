@@ -48,9 +48,7 @@ def prime_parquet(
     """
     allowed = {"uncompressed", "lz4", "zstd"}
     if compression not in allowed:
-        raise ValueError(
-            f"compression must be one of {sorted(allowed)}, got {compression!r}"
-        )
+        raise ValueError(f"compression must be one of {sorted(allowed)}, got {compression!r}")
 
     root = Path(path)
     if not root.exists():

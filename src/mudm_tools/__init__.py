@@ -22,6 +22,7 @@ from .tiling3d.tilejson3d import (  # noqa: F401
 
 try:
     from ._rs import StreamingTileGenerator, StreamingTileGenerator2D  # noqa: F401
+
     RUST_AVAILABLE = True
 except ImportError:
     RUST_AVAILABLE = False

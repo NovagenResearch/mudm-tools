@@ -7,12 +7,11 @@ Covers: glTF tile encoding, tileset.json structure, geometric error,
 from __future__ import annotations
 
 import json
-import math
 import sys
 from pathlib import Path
 
 import pytest
-from geojson_pydantic import LineString, Point, Polygon
+from geojson_pydantic import LineString, Point
 
 from mudm.model import MuDMFeature, MuDMFeatureCollection, TIN
 from mudm_tools.tiling3d.generator3d import TileGenerator3D
@@ -26,10 +25,10 @@ from mudm_tools.tiling3d.tileset_json import (
     _geometric_error,
 )
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _point_feature(x: float, y: float, z: float, **props) -> MuDMFeature:
     return MuDMFeature(
@@ -81,15 +80,24 @@ class TestGltfEncoder3D:
         """A tile with point features produces valid GLB bytes."""
         # Create a minimal tile dict in normalized space
         tile = {
-            "features": [{
-                "geometry": [0.5, 0.5],
-                "geometry_z": [0.5],
-                "type": 1,  # POINT3D
-                "tags": {"name": "test"},
-                "minX": 0.5, "minY": 0.5, "minZ": 0.5,
-                "maxX": 0.5, "maxY": 0.5, "maxZ": 0.5,
-            }],
-            "z": 0, "x": 0, "y": 0, "d": 0,
+            "features": [
+                {
+                    "geometry": [0.5, 0.5],
+                    "geometry_z": [0.5],
+                    "type": 1,  # POINT3D
+                    "tags": {"name": "test"},
+                    "minX": 0.5,
+                    "minY": 0.5,
+                    "minZ": 0.5,
+                    "maxX": 0.5,
+                    "maxY": 0.5,
+                    "maxZ": 0.5,
+                }
+            ],
+            "z": 0,
+            "x": 0,
+            "y": 0,
+            "d": 0,
         }
         proj = CartesianProjector3D((0, 0, 0, 10, 10, 10))
         data = tile_to_glb(tile, proj)
@@ -101,15 +109,24 @@ class TestGltfEncoder3D:
     def test_line_tile_produces_glb(self):
         """A tile with line features produces valid GLB."""
         tile = {
-            "features": [{
-                "geometry": [0.0, 0.0, 1.0, 1.0],
-                "geometry_z": [0.0, 1.0],
-                "type": 2,  # LINESTRING3D
-                "tags": {},
-                "minX": 0.0, "minY": 0.0, "minZ": 0.0,
-                "maxX": 1.0, "maxY": 1.0, "maxZ": 1.0,
-            }],
-            "z": 0, "x": 0, "y": 0, "d": 0,
+            "features": [
+                {
+                    "geometry": [0.0, 0.0, 1.0, 1.0],
+                    "geometry_z": [0.0, 1.0],
+                    "type": 2,  # LINESTRING3D
+                    "tags": {},
+                    "minX": 0.0,
+                    "minY": 0.0,
+                    "minZ": 0.0,
+                    "maxX": 1.0,
+                    "maxY": 1.0,
+                    "maxZ": 1.0,
+                }
+            ],
+            "z": 0,
+            "x": 0,
+            "y": 0,
+            "d": 0,
         }
         proj = CartesianProjector3D((0, 0, 0, 100, 100, 100))
         data = tile_to_glb(tile, proj)
@@ -118,16 +135,25 @@ class TestGltfEncoder3D:
     def test_tin_tile_produces_glb(self):
         """A tile with TIN features produces valid GLB."""
         tile = {
-            "features": [{
-                "geometry": [0.0, 0.0, 0.5, 0.0, 0.25, 0.5, 0.0, 0.0],
-                "geometry_z": [0.0, 0.1, 0.2, 0.0],
-                "type": 5,  # TIN_TYPE
-                "ring_lengths": [4],
-                "tags": {"type": "mesh"},
-                "minX": 0.0, "minY": 0.0, "minZ": 0.0,
-                "maxX": 0.5, "maxY": 0.5, "maxZ": 0.2,
-            }],
-            "z": 0, "x": 0, "y": 0, "d": 0,
+            "features": [
+                {
+                    "geometry": [0.0, 0.0, 0.5, 0.0, 0.25, 0.5, 0.0, 0.0],
+                    "geometry_z": [0.0, 0.1, 0.2, 0.0],
+                    "type": 5,  # TIN_TYPE
+                    "ring_lengths": [4],
+                    "tags": {"type": "mesh"},
+                    "minX": 0.0,
+                    "minY": 0.0,
+                    "minZ": 0.0,
+                    "maxX": 0.5,
+                    "maxY": 0.5,
+                    "maxZ": 0.2,
+                }
+            ],
+            "z": 0,
+            "x": 0,
+            "y": 0,
+            "d": 0,
         }
         proj = CartesianProjector3D((0, 0, 0, 10, 10, 10))
         data = tile_to_glb(tile, proj)
@@ -165,18 +191,18 @@ class TestTilesetJson:
     def test_box_volume_axis_aligned(self):
         """Box volume produces correct axis-aligned format."""
         box = _box_volume(0, 0, 0, 10, 20, 30)
-        assert box[0] == 5      # cx
-        assert box[1] == 10     # cy
-        assert box[2] == 15     # cz
-        assert box[3] == 5      # halfX
+        assert box[0] == 5  # cx
+        assert box[1] == 10  # cy
+        assert box[2] == 15  # cz
+        assert box[3] == 5  # halfX
         assert box[4] == 0
         assert box[5] == 0
         assert box[6] == 0
-        assert box[7] == 10     # halfY
+        assert box[7] == 10  # halfY
         assert box[8] == 0
         assert box[9] == 0
         assert box[10] == 0
-        assert box[11] == 15    # halfZ
+        assert box[11] == 15  # halfZ
 
     def test_geometric_error_at_max_zoom(self):
         """Geometric error at max zoom is 0."""
@@ -197,8 +223,12 @@ class TestTilesetJson:
         # Create a minimal octree-like tile dict
         tiles = {
             (0, 0, 0, 0): {"features": [{"geometry": [0.5, 0.5], "geometry_z": [0.5], "type": 1}]},
-            (1, 0, 0, 0): {"features": [{"geometry": [0.25, 0.25], "geometry_z": [0.25], "type": 1}]},
-            (1, 1, 1, 1): {"features": [{"geometry": [0.75, 0.75], "geometry_z": [0.75], "type": 1}]},
+            (1, 0, 0, 0): {
+                "features": [{"geometry": [0.25, 0.25], "geometry_z": [0.25], "type": 1}]
+            },
+            (1, 1, 1, 1): {
+                "features": [{"geometry": [0.75, 0.75], "geometry_z": [0.75], "type": 1}]
+            },
         }
         bounds = (0, 0, 0, 10, 10, 10)
         proj = CartesianProjector3D(bounds)
@@ -229,8 +259,12 @@ class TestTilesetJson:
         """Children at zoom 1 are nested under zoom 0 root."""
         tiles = {
             (0, 0, 0, 0): {"features": [{"geometry": [0.5, 0.5], "geometry_z": [0.5], "type": 1}]},
-            (1, 0, 0, 0): {"features": [{"geometry": [0.25, 0.25], "geometry_z": [0.25], "type": 1}]},
-            (1, 1, 1, 1): {"features": [{"geometry": [0.75, 0.75], "geometry_z": [0.75], "type": 1}]},
+            (1, 0, 0, 0): {
+                "features": [{"geometry": [0.25, 0.25], "geometry_z": [0.25], "type": 1}]
+            },
+            (1, 1, 1, 1): {
+                "features": [{"geometry": [0.75, 0.75], "geometry_z": [0.75], "type": 1}]
+            },
         }
         bounds = (0, 0, 0, 10, 10, 10)
         proj = CartesianProjector3D(bounds)
@@ -502,6 +536,7 @@ def test_parentid_extras_in_glb(tmp_path):
     land on each GLB node's `extras` object unchanged.
     """
     import struct
+
     pytest.importorskip("mudm_tools._rs")
     from mudm_tools._rs import StreamingTileGenerator
 
@@ -514,8 +549,12 @@ def test_parentid_extras_in_glb(tmp_path):
         "type": 5,  # TIN
         "tags": {"compartment": "axon"},
         "parentId": "neuron_17",
-        "minX": 0.2, "minY": 0.3, "minZ": 0.1,
-        "maxX": 0.4, "maxY": 0.7, "maxZ": 0.6,
+        "minX": 0.2,
+        "minY": 0.3,
+        "minZ": 0.1,
+        "maxX": 0.4,
+        "maxY": 0.7,
+        "maxZ": 0.6,
     }
     gen.add_feature(feat)
 
@@ -530,7 +569,7 @@ def test_parentid_extras_in_glb(tmp_path):
 
     # Parse GLB: 12-byte header, then JSON chunk (length u32, type u32, payload).
     json_len = struct.unpack("<I", glb[12:16])[0]
-    json_bytes = glb[20:20 + json_len]
+    json_bytes = glb[20 : 20 + json_len]
     gltf = json.loads(json_bytes)
     nodes = gltf.get("nodes", [])
     assert nodes, f"no nodes in gltf; got {gltf}"
@@ -814,9 +853,9 @@ def test_glb_floor_violation_raises(tmp_path):
     with pytest.raises(Exception) as exc:
         gen.generate_3dtiles(str(out_dir), bounds)
     msg = str(exc.value).lower()
-    assert "ceiling" in msg or "floor" in msg, (
-        f"floor-violation error should name the ceiling/floor; got: {exc.value}"
-    )
+    assert (
+        "ceiling" in msg or "floor" in msg
+    ), f"floor-violation error should name the ceiling/floor; got: {exc.value}"
 
     # The Fatal record must be in errors.jsonl with kind ceiling_floor.
     log = (run_dir / "errors.jsonl").read_text()

@@ -22,11 +22,11 @@ import hashlib
 import os
 from pathlib import Path
 
-import numpy as np
 import pytest
 
 try:
     from mudm_tools._rs import StreamingTileGenerator, scan_obj_bounds
+
     RUST_AVAILABLE = True
 except ImportError:
     RUST_AVAILABLE = False
@@ -34,9 +34,7 @@ except ImportError:
 from mudm_tools.tiling3d.parquet_writer import generate_parquet
 from mudm_tools.tiling3d.parquet_reader import read_parquet
 
-pytestmark = pytest.mark.skipif(
-    not RUST_AVAILABLE, reason="Rust extensions not compiled"
-)
+pytestmark = pytest.mark.skipif(not RUST_AVAILABLE, reason="Rust extensions not compiled")
 
 
 # ---------------------------------------------------------------------------
@@ -44,6 +42,7 @@ pytestmark = pytest.mark.skipif(
 # 2+ zooms (mirrors the WS-C gate fixture in test_tiling3d_3dtiles.py, but
 # small + deterministic so it is fast and the assertions are exact).
 # ---------------------------------------------------------------------------
+
 
 def _make_obj_fixture(obj_dir: Path) -> list[str]:
     """Write tiny single-triangle .obj files spread across world space.
@@ -58,11 +57,15 @@ def _make_obj_fixture(obj_dir: Path) -> list[str]:
     # Deterministic centers: a few tight clusters (share tiles) plus spread
     # ones (distinct tiles), all inside [0, 100]^3.
     centers = [
-        (10.0, 10.0, 10.0), (10.5, 10.3, 10.2), (11.0, 10.1, 9.8),  # cluster A
-        (60.0, 60.0, 60.0), (60.4, 59.7, 60.3),                      # cluster B
-        (90.0, 20.0, 80.0),                                          # lone
-        (25.0, 85.0, 35.0),                                          # lone
-        (45.0, 45.0, 55.0), (45.6, 44.8, 54.9),                      # cluster C
+        (10.0, 10.0, 10.0),
+        (10.5, 10.3, 10.2),
+        (11.0, 10.1, 9.8),  # cluster A
+        (60.0, 60.0, 60.0),
+        (60.4, 59.7, 60.3),  # cluster B
+        (90.0, 20.0, 80.0),  # lone
+        (25.0, 85.0, 35.0),  # lone
+        (45.0, 45.0, 55.0),
+        (45.6, 44.8, 54.9),  # cluster C
     ]
     paths: list[str] = []
     for i, (cx, cy, cz) in enumerate(centers):
@@ -89,12 +92,19 @@ def _canon_parquet(rows) -> list:
     comparing positions+indices bytes (modulo row order)."""
     sig = []
     for r in rows:
-        sig.append((
-            int(r["zoom"]), int(r["tile_x"]), int(r["tile_y"]),
-            int(r["tile_d"]), int(r["feature_id"]), int(r["geom_type"]),
-            r["positions"].tobytes(), r["indices"].tobytes(),
-            tuple(sorted(r["tags"].items())),
-        ))
+        sig.append(
+            (
+                int(r["zoom"]),
+                int(r["tile_x"]),
+                int(r["tile_y"]),
+                int(r["tile_d"]),
+                int(r["feature_id"]),
+                int(r["geom_type"]),
+                r["positions"].tobytes(),
+                r["indices"].tobytes(),
+                tuple(sorted(r["tags"].items())),
+            )
+        )
     return sorted(sig)
 
 
@@ -172,12 +182,12 @@ def test_emit_all_byte_identical_to_separate(tmp_path):
     del gen_pq
 
     # (c) frag_dir count: EMIT-ALL == 1, SEPARATE == 2.
-    assert len(emit_all_frags) == 1, (
-        f"EMIT-ALL must create exactly ONE frag_dir; saw {sorted(emit_all_frags)}"
-    )
-    assert len(separate_frags) == 2, (
-        f"SEPARATE must create exactly TWO frag_dirs; saw {sorted(separate_frags)}"
-    )
+    assert (
+        len(emit_all_frags) == 1
+    ), f"EMIT-ALL must create exactly ONE frag_dir; saw {sorted(emit_all_frags)}"
+    assert (
+        len(separate_frags) == 2
+    ), f"SEPARATE must create exactly TWO frag_dirs; saw {sorted(separate_frags)}"
 
     # (a) GLB byte-identity: same tile set + same sha256 per tile.
     assert glb_a, "no GLB tiles produced"
@@ -193,9 +203,9 @@ def test_emit_all_byte_identical_to_separate(tmp_path):
 
     # (b) Parquet byte-identity modulo row order.
     assert rows_a, "no parquet rows produced"
-    assert len(rows_a) == len(rows_b), (
-        f"parquet row count differs: emit_all={len(rows_a)} separate={len(rows_b)}"
-    )
+    assert len(rows_a) == len(
+        rows_b
+    ), f"parquet row count differs: emit_all={len(rows_a)} separate={len(rows_b)}"
     assert rows_a == rows_b, (
         "parquet positions/indices/tags differ between emit-all and separate "
         "(canonicalized by zoom,tile_x,tile_y,tile_d,feature_id)"

@@ -22,6 +22,7 @@ try:
         decimate_tin,
         parse_obj,
     )
+
     RUST_AVAILABLE = True
 except ImportError:
     RUST_AVAILABLE = False
@@ -29,18 +30,18 @@ except ImportError:
 from mudm_tools.tiling3d.clip3d import (
     _clip_surface_py,
     _clip_line_py,
-    clip_3d,
 )
 from mudm_tools.tiling3d.encoder3d import _build_indexed_mesh_py, encode_tile_3d_py
 from mudm_tools.tiling3d.tile3d import transform_tile_3d_py
 
-
 # --- Helpers to get Rust functions when available ---
+
 
 def _get_rs_clip_surface():
     if not RUST_AVAILABLE:
         return None
     from mudm_tools._rs import clip_surface
+
     return clip_surface
 
 
@@ -48,6 +49,7 @@ def _get_rs_clip_line():
     if not RUST_AVAILABLE:
         return None
     from mudm_tools._rs import clip_line
+
     return clip_line
 
 
@@ -55,6 +57,7 @@ def _get_rs_build_indexed_mesh():
     if not RUST_AVAILABLE:
         return None
     from mudm_tools._rs import build_indexed_mesh
+
     return build_indexed_mesh
 
 
@@ -62,6 +65,7 @@ def _get_rs_encode_tile_3d():
     if not RUST_AVAILABLE:
         return None
     from mudm_tools._rs import encode_tile_3d
+
     return encode_tile_3d
 
 
@@ -69,10 +73,12 @@ def _get_rs_transform_tile_3d():
     if not RUST_AVAILABLE:
         return None
     from mudm_tools._rs import transform_tile_3d
+
     return transform_tile_3d
 
 
 # --- Fixtures ---
+
 
 @pytest.fixture(params=["python", "rust"])
 def backend(request):
@@ -106,6 +112,7 @@ def _transform_tile_3d_fn(backend):
 
 
 # --- _clip_surface tests ---
+
 
 class TestClipSurface:
     """Tests for _clip_surface (TIN/PS per-face clipping)."""
@@ -156,8 +163,7 @@ class TestClipSurface:
         # Face 1: X in [0.1, 0.3] — inside [0, 0.5)
         # Face 2: X in [0.6, 0.8] — outside [0, 0.5)
         feat = self._make_surface(
-            [0.1, 0.1, 0.3, 0.1, 0.2, 0.3, 0.1, 0.1,
-             0.6, 0.1, 0.8, 0.1, 0.7, 0.3, 0.6, 0.1],
+            [0.1, 0.1, 0.3, 0.1, 0.2, 0.3, 0.1, 0.1, 0.6, 0.1, 0.8, 0.1, 0.7, 0.3, 0.6, 0.1],
             [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
             [4, 4],
         )
@@ -193,6 +199,7 @@ class TestClipSurface:
 
 
 # --- _clip_line tests ---
+
 
 class TestClipLine:
     """Tests for _clip_line (LineString3D clipping)."""
@@ -240,6 +247,7 @@ class TestClipLine:
 
 # --- _build_indexed_mesh tests ---
 
+
 class TestBuildIndexedMesh:
     """Tests for _build_indexed_mesh (vertex dedup + bytes packing)."""
 
@@ -255,7 +263,7 @@ class TestBuildIndexedMesh:
         n_indices = len(idx_bytes) // 4
         assert n_indices == 3
 
-        positions = struct.unpack(f"<{n_floats}f", pos_bytes)
+        struct.unpack(f"<{n_floats}f", pos_bytes)
         indices = struct.unpack(f"<{n_indices}I", idx_bytes)
         assert set(indices) == {0, 1, 2}
 
@@ -265,8 +273,22 @@ class TestBuildIndexedMesh:
         # Triangle 1: (0,0,0), (100,0,0), (50,100,0)
         # Triangle 2: (100,0,0), (150,100,0), (50,100,0)
         xy = [
-            0, 0, 100, 0, 50, 100, 0, 0,       # ring 1
-            100, 0, 150, 100, 50, 100, 100, 0,  # ring 2
+            0,
+            0,
+            100,
+            0,
+            50,
+            100,
+            0,
+            0,  # ring 1
+            100,
+            0,
+            150,
+            100,
+            50,
+            100,
+            100,
+            0,  # ring 2
         ]
         z = [0, 0, 0, 0, 0, 0, 0, 0]
         pos_bytes, idx_bytes = fn(xy, z, [4, 4])
@@ -287,6 +309,7 @@ class TestBuildIndexedMesh:
 
 
 # --- transform_tile_3d tests ---
+
 
 class TestTransformTile3D:
     """Tests for transform_tile_3d (coordinate transform)."""
@@ -365,6 +388,7 @@ class TestTransformTile3D:
 
 # --- Rust import test ---
 
+
 class TestRustImport:
     """Verify that all expected symbols are importable from mudm_tools._rs."""
 
@@ -382,6 +406,7 @@ class TestRustImport:
             decimate_tin,
             parse_obj,
         )
+
         # Verify they are callable
         assert callable(clip_surface)
         assert callable(clip_line)
@@ -396,6 +421,7 @@ class TestRustImport:
 
 # --- Bit-identical comparison tests ---
 
+
 class TestBitIdentical:
     """Verify Python and Rust backends produce identical output."""
 
@@ -405,15 +431,20 @@ class TestBitIdentical:
         py_fn = _clip_surface_py
         rs_fn = _get_rs_clip_surface()
 
-        xy = [0.1, 0.2, 0.3, 0.2, 0.2, 0.4, 0.1, 0.2,
-              0.6, 0.2, 0.8, 0.2, 0.7, 0.4, 0.6, 0.2]
+        xy = [0.1, 0.2, 0.3, 0.2, 0.2, 0.4, 0.1, 0.2, 0.6, 0.2, 0.8, 0.2, 0.7, 0.4, 0.6, 0.2]
         z = [0.1, 0.2, 0.3, 0.1, 0.5, 0.6, 0.7, 0.5]
         feat = {
-            "geometry": xy, "geometry_z": z,
-            "ring_lengths": [4, 4], "type": 5,
+            "geometry": xy,
+            "geometry_z": z,
+            "ring_lengths": [4, 4],
+            "type": 5,
             "tags": {"id": 1},
-            "minX": 0.1, "minY": 0.2, "minZ": 0.1,
-            "maxX": 0.8, "maxY": 0.4, "maxZ": 0.7,
+            "minX": 0.1,
+            "minY": 0.2,
+            "minZ": 0.1,
+            "maxX": 0.8,
+            "maxY": 0.4,
+            "maxZ": 0.7,
         }
 
         py_result = py_fn(feat, 0.0, 0.5, 0)
@@ -430,9 +461,14 @@ class TestBitIdentical:
         feat = {
             "geometry": [0.1, 0.5, 0.3, 0.5, 0.6, 0.5, 0.9, 0.5],
             "geometry_z": [0.0, 0.0, 0.0, 0.0],
-            "type": 2, "tags": {"line": True},
-            "minX": 0.1, "minY": 0.5, "minZ": 0.0,
-            "maxX": 0.9, "maxY": 0.5, "maxZ": 0.0,
+            "type": 2,
+            "tags": {"line": True},
+            "minX": 0.1,
+            "minY": 0.5,
+            "minZ": 0.0,
+            "maxX": 0.9,
+            "maxY": 0.5,
+            "maxZ": 0.0,
         }
 
         py_result = py_fn(feat, 0.0, 0.5, 0)
@@ -449,8 +485,7 @@ class TestBitIdentical:
         py_fn = _build_indexed_mesh_py
         rs_fn = _get_rs_build_indexed_mesh()
 
-        xy = [0, 0, 100, 0, 50, 100, 0, 0,
-              100, 0, 150, 100, 50, 100, 100, 0]
+        xy = [0, 0, 100, 0, 50, 100, 0, 0, 100, 0, 150, 100, 50, 100, 100, 0]
         z = [0, 0, 0, 0, 0, 0, 0, 0]
 
         py_pos, py_idx = py_fn(xy, z, [4, 4])
@@ -518,8 +553,7 @@ class TestBitIdentical:
                     "tags": {"id": 2, "name": "line"},
                 },
                 {
-                    "geometry": [0, 0, 100, 0, 50, 100, 0, 0,
-                                 100, 0, 200, 0, 150, 100, 100, 0],
+                    "geometry": [0, 0, 100, 0, 50, 100, 0, 0, 100, 0, 200, 0, 150, 100, 100, 0],
                     "geometry_z": [0, 0, 0, 0, 0, 0, 0, 0],
                     "ring_lengths": [4, 4],
                     "type": 5,  # TIN
@@ -557,7 +591,10 @@ class TestBitIdentical:
         }
         tile = {
             "features": [feat],
-            "z": 2, "x": 1, "y": 1, "d": 1,
+            "z": 2,
+            "x": 1,
+            "y": 1,
+            "d": 1,
             "num_features": 1,
             "num_points": 2,
         }
@@ -569,6 +606,7 @@ class TestBitIdentical:
 
 
 # --- StreamingTileGenerator tests ---
+
 
 class TestStreamingTileGenerator:
     """Tests for the Rust StreamingTileGenerator."""
@@ -586,8 +624,12 @@ class TestStreamingTileGenerator:
             "ring_lengths": [3],
             "type": 5,  # TIN
             "tags": {"name": "mesh", "id": 42},
-            "minX": 0.1, "minY": 0.2, "minZ": 0.1,
-            "maxX": 0.5, "maxY": 0.6, "maxZ": 0.3,
+            "minX": 0.1,
+            "minY": 0.2,
+            "minZ": 0.1,
+            "maxX": 0.5,
+            "maxY": 0.6,
+            "maxZ": 0.3,
         }
         fid = gen.add_feature(feat)
         assert fid == 0
@@ -640,7 +682,8 @@ class TestStreamingTileGenerator:
             properties={"name": "b", "color": "blue"},
         )
         collection = MuDMFeatureCollection(
-            type="FeatureCollection", features=[feat1, feat2],
+            type="FeatureCollection",
+            features=[feat1, feat2],
         )
 
         config = OctreeConfig(min_zoom=0, max_zoom=2)
@@ -656,8 +699,10 @@ class TestStreamingTileGenerator:
         bounds = compute_bounds_3d(collection)
         proj = CartesianProjector3D(bounds)
         stream_gen = StreamingTileGenerator(
-            min_zoom=0, max_zoom=2,
-            extent=config.extent, extent_z=config.extent_z,
+            min_zoom=0,
+            max_zoom=2,
+            extent=config.extent,
+            extent_z=config.extent_z,
         )
         for feat in collection.features:
             for ifeat in convert_feature_3d(feat, proj):
@@ -689,8 +734,12 @@ class TestStreamingTileGenerator:
             "geometry_z": [0.5, 0.5],
             "type": 2,  # LINESTRING3D
             "tags": {"road": "main"},
-            "minX": 0.1, "minY": 0.5, "minZ": 0.5,
-            "maxX": 0.9, "maxY": 0.5, "maxZ": 0.5,
+            "minX": 0.1,
+            "minY": 0.5,
+            "minZ": 0.5,
+            "maxX": 0.9,
+            "maxY": 0.5,
+            "maxZ": 0.5,
         }
         gen.add_feature(feat)
         count = gen.generate_pbf3(str(tmp_path / "tiles"), "roads")
@@ -706,7 +755,6 @@ class TestStreamingTileGenerator:
     def test_point_feature(self, tmp_path):
         """Point3D feature clips and encodes correctly."""
         from mudm_tools._rs import StreamingTileGenerator
-        from mudm_tools.tiling3d.reader3d import decode_tile
 
         gen = StreamingTileGenerator(min_zoom=0, max_zoom=0)
         feat = {
@@ -714,8 +762,12 @@ class TestStreamingTileGenerator:
             "geometry_z": [0.5],
             "type": 1,  # POINT3D
             "tags": {"label": "center"},
-            "minX": 0.5, "minY": 0.5, "minZ": 0.5,
-            "maxX": 0.5, "maxY": 0.5, "maxZ": 0.5,
+            "minX": 0.5,
+            "minY": 0.5,
+            "minZ": 0.5,
+            "maxX": 0.5,
+            "maxY": 0.5,
+            "maxZ": 0.5,
         }
         gen.add_feature(feat)
         count = gen.generate_pbf3(str(tmp_path / "tiles"))
@@ -763,8 +815,12 @@ class TestStreamingTileGenerator:
                 "ring_lengths": [3],
                 "type": 5,
                 "tags": {"id": i},
-                "minX": 0.1 + i * 0.1, "minY": 0.2, "minZ": 0.1,
-                "maxX": 0.2 + i * 0.1, "maxY": 0.5, "maxZ": 0.3,
+                "minX": 0.1 + i * 0.1,
+                "minY": 0.2,
+                "minZ": 0.1,
+                "maxX": 0.2 + i * 0.1,
+                "maxY": 0.5,
+                "maxZ": 0.3,
             }
             fid = gen.add_feature(feat)
             assert fid == i
@@ -793,8 +849,12 @@ class TestStreamingGlb:
             "ring_lengths": [3],
             "type": 5,  # TIN
             "tags": {"name": "mesh", "id": 42},
-            "minX": 0.1, "minY": 0.2, "minZ": 0.1,
-            "maxX": 0.5, "maxY": 0.6, "maxZ": 0.3,
+            "minX": 0.1,
+            "minY": 0.2,
+            "minZ": 0.1,
+            "maxX": 0.5,
+            "maxY": 0.6,
+            "maxZ": 0.3,
         }
         gen.add_feature(feat)
 
@@ -811,6 +871,7 @@ class TestStreamingGlb:
 
         # Find and verify GLB files
         import os
+
         glb_files = []
         for root, _, files in os.walk(str(tmp_path / "tiles")):
             for fn in files:
@@ -831,8 +892,12 @@ class TestStreamingGlb:
             "ring_lengths": [3],
             "type": 5,
             "tags": {"species": "mouse"},
-            "minX": 0.1, "minY": 0.2, "minZ": 0.1,
-            "maxX": 0.5, "maxY": 0.6, "maxZ": 0.3,
+            "minX": 0.1,
+            "minY": 0.2,
+            "minZ": 0.1,
+            "maxX": 0.5,
+            "maxY": 0.6,
+            "maxZ": 0.3,
         }
         gen.add_feature(feat)
 
@@ -854,7 +919,7 @@ class TestStreamingGlb:
         json_type = int.from_bytes(data[16:20], "little")
         assert json_type == 0x4E4F534A  # "JSON"
 
-        json_str = data[20:20 + json_len].decode("utf-8").strip()
+        json_str = data[20 : 20 + json_len].decode("utf-8").strip()
         gltf = json.loads(json_str)
         assert gltf["asset"]["version"] == "2.0"
         assert gltf["asset"]["generator"] == "mudm-rs"
@@ -872,8 +937,12 @@ class TestStreamingGlb:
             "ring_lengths": [3],
             "type": 5,
             "tags": {"neuron_id": 12345, "species": "mouse", "volume": 42.5, "traced": True},
-            "minX": 0.2, "minY": 0.3, "minZ": 0.1,
-            "maxX": 0.4, "maxY": 0.7, "maxZ": 0.6,
+            "minX": 0.2,
+            "minY": 0.3,
+            "minZ": 0.1,
+            "maxX": 0.4,
+            "maxY": 0.7,
+            "maxZ": 0.6,
         }
         gen.add_feature(feat)
 
@@ -883,7 +952,7 @@ class TestStreamingGlb:
         glb_path = tmp_path / "tiles" / "0" / "0" / "0" / "0.glb"
         data = glb_path.read_bytes()
         json_len = int.from_bytes(data[12:16], "little")
-        gltf = json.loads(data[20:20 + json_len].decode("utf-8").strip())
+        gltf = json.loads(data[20 : 20 + json_len].decode("utf-8").strip())
 
         extras = gltf["nodes"][0]["extras"]
         assert extras["neuron_id"] == 12345
@@ -906,8 +975,12 @@ class TestStreamingGlb:
             "ring_lengths": [3],
             "type": 5,
             "tags": {},
-            "minX": 0.48, "minY": 0.48, "minZ": 0.48,
-            "maxX": 0.52, "maxY": 0.52, "maxZ": 0.52,
+            "minX": 0.48,
+            "minY": 0.48,
+            "minZ": 0.48,
+            "maxX": 0.52,
+            "maxY": 0.52,
+            "maxZ": 0.52,
         }
         gen.add_feature(feat)
 
@@ -917,7 +990,7 @@ class TestStreamingGlb:
         glb_path = tmp_path / "tiles" / "0" / "0" / "0" / "0.glb"
         data = glb_path.read_bytes()
         json_len = int.from_bytes(data[12:16], "little")
-        gltf = json.loads(data[20:20 + json_len].decode("utf-8").strip())
+        gltf = json.loads(data[20 : 20 + json_len].decode("utf-8").strip())
 
         # Check position accessor min/max — should be in world coords near center
         # bounds = (100, 200, 300, 400, 600, 900), range = (300, 400, 600)
@@ -931,7 +1004,6 @@ class TestStreamingGlb:
     @pytest.mark.skipif(not RUST_AVAILABLE, reason="Rust extensions not compiled")
     def test_glb_simplification(self, tmp_path):
         """Non-leaf tiles get simplified (fewer vertices than leaf tiles)."""
-        import json
         from mudm_tools._rs import StreamingTileGenerator
 
         gen = StreamingTileGenerator(min_zoom=0, max_zoom=2)
@@ -945,8 +1017,12 @@ class TestStreamingGlb:
                 "ring_lengths": [3],
                 "type": 5,
                 "tags": {"face": i},
-                "minX": nx, "minY": ny, "minZ": 0.3,
-                "maxX": nx + 0.08, "maxY": ny + 0.1, "maxZ": 0.5,
+                "minX": nx,
+                "minY": ny,
+                "minZ": 0.3,
+                "maxX": nx + 0.08,
+                "maxY": ny + 0.1,
+                "maxZ": 0.5,
             }
             gen.add_feature(feat)
 
@@ -956,6 +1032,7 @@ class TestStreamingGlb:
 
         # Collect GLB files by zoom level
         import os
+
         glb_by_zoom = {}
         for root, _, files in os.walk(str(tmp_path / "tiles")):
             for fn in files:
@@ -986,8 +1063,12 @@ class TestStreamingGlb:
             "ring_lengths": [3],
             "type": 5,
             "tags": {},
-            "minX": 0.1, "minY": 0.1, "minZ": 0.1,
-            "maxX": 0.9, "maxY": 0.9, "maxZ": 0.9,
+            "minX": 0.1,
+            "minY": 0.1,
+            "minZ": 0.1,
+            "maxX": 0.9,
+            "maxY": 0.9,
+            "maxZ": 0.9,
         }
         gen.add_feature(feat)
 
@@ -1024,8 +1105,12 @@ class TestStreamingGlb:
             "geometry_z": [0.5, 0.5, 0.5],
             "type": 2,
             "tags": {"road": "A1"},
-            "minX": 0.1, "minY": 0.5, "minZ": 0.5,
-            "maxX": 0.9, "maxY": 0.5, "maxZ": 0.5,
+            "minX": 0.1,
+            "minY": 0.5,
+            "minZ": 0.5,
+            "maxX": 0.9,
+            "maxY": 0.5,
+            "maxZ": 0.5,
         }
         gen.add_feature(feat)
 
@@ -1035,7 +1120,7 @@ class TestStreamingGlb:
         glb_path = tmp_path / "tiles" / "0" / "0" / "0" / "0.glb"
         data = glb_path.read_bytes()
         json_len = int.from_bytes(data[12:16], "little")
-        gltf = json.loads(data[20:20 + json_len].decode("utf-8").strip())
+        gltf = json.loads(data[20 : 20 + json_len].decode("utf-8").strip())
 
         # Primitive mode 1 = GL_LINES
         assert gltf["meshes"][0]["primitives"][0]["mode"] == 1
@@ -1053,8 +1138,12 @@ class TestStreamingGlb:
             "geometry_z": [0.5],
             "type": 1,  # POINT3D
             "tags": {"label": "origin"},
-            "minX": 0.5, "minY": 0.5, "minZ": 0.5,
-            "maxX": 0.5, "maxY": 0.5, "maxZ": 0.5,
+            "minX": 0.5,
+            "minY": 0.5,
+            "minZ": 0.5,
+            "maxX": 0.5,
+            "maxY": 0.5,
+            "maxZ": 0.5,
         }
         gen.add_feature(feat)
 
@@ -1064,7 +1153,7 @@ class TestStreamingGlb:
         glb_path = tmp_path / "tiles" / "0" / "0" / "0" / "0.glb"
         data = glb_path.read_bytes()
         json_len = int.from_bytes(data[12:16], "little")
-        gltf = json.loads(data[20:20 + json_len].decode("utf-8").strip())
+        gltf = json.loads(data[20 : 20 + json_len].decode("utf-8").strip())
 
         # Primitive mode 0 = GL_POINTS, no indices
         prim = gltf["meshes"][0]["primitives"][0]
@@ -1101,8 +1190,12 @@ class TestStreamingGlb:
                     "ring_lengths": [4],
                     "type": 5,
                     "tags": {"face": i},
-                    "minX": nx, "minY": ny, "minZ": 0.5,
-                    "maxX": nx + 0.04, "maxY": ny + 0.06, "maxZ": 0.52,
+                    "minX": nx,
+                    "minY": ny,
+                    "minZ": 0.5,
+                    "maxX": nx + 0.04,
+                    "maxY": ny + 0.06,
+                    "maxZ": 0.52,
                 }
                 g.add_feature(feat)
             return g
@@ -1140,9 +1233,9 @@ class TestStreamingGlb:
         count = gen.generate_3dtiles(str(out), bounds)
 
         # (b) returned count excludes the failed tile.
-        assert count == clean_count - 1, (
-            f"expected {clean_count - 1} (one tile pruned), got {count}"
-        )
+        assert (
+            count == clean_count - 1
+        ), f"expected {clean_count - 1} (one tile pruned), got {count}"
 
         # (a) errors.jsonl records the failed write.
         errlog = run_dir / "errors.jsonl"
@@ -1157,16 +1250,15 @@ class TestStreamingGlb:
 
         # (c) the failed tile key is absent from tileset.json.
         tileset_text = (out / "tileset.json").read_text()
-        assert blocked_uri not in tileset_text, (
-            "tileset.json must not reference the missing .glb"
-        )
+        assert blocked_uri not in tileset_text, "tileset.json must not reference the missing .glb"
 
 
 def _parse_glb_json(data: bytes):
     """Parse the JSON chunk from GLB bytes."""
     import json
+
     json_len = int.from_bytes(data[12:16], "little")
-    return json.loads(data[20:20 + json_len].decode("utf-8").strip())
+    return json.loads(data[20 : 20 + json_len].decode("utf-8").strip())
 
 
 def _make_large_tin_feature(n_triangles: int = 20):
@@ -1177,6 +1269,7 @@ def _make_large_tin_feature(n_triangles: int = 20):
     Returns a dict suitable for StreamingTileGenerator.add_feature().
     """
     import math
+
     cols = max(1, int(math.ceil(math.sqrt(n_triangles))))
     step = 0.9 / cols if cols > 0 else 0.9
     tri_size = step * 0.45
@@ -1199,8 +1292,12 @@ def _make_large_tin_feature(n_triangles: int = 20):
         "ring_lengths": ring_lengths,
         "type": 5,  # TIN
         "tags": {"name": "large_mesh"},
-        "minX": 0.05, "minY": 0.05, "minZ": 0.5,
-        "maxX": 0.95, "maxY": 0.95, "maxZ": 0.52,
+        "minX": 0.05,
+        "minY": 0.05,
+        "minZ": 0.5,
+        "maxX": 0.95,
+        "maxY": 0.95,
+        "maxZ": 0.52,
     }
 
 
@@ -1255,9 +1352,9 @@ class TestStreamingDracoGlb:
         gen_draco.generate_3dtiles(draco_dir, bounds, use_draco=True)
         draco_glb = (tmp_path / "draco" / "0" / "0" / "0" / "0.glb").read_bytes()
 
-        assert len(draco_glb) < len(raw_glb), (
-            f"Draco GLB ({len(draco_glb)}) should be smaller than raw ({len(raw_glb)})"
-        )
+        assert len(draco_glb) < len(
+            raw_glb
+        ), f"Draco GLB ({len(draco_glb)}) should be smaller than raw ({len(raw_glb)})"
 
     @pytest.mark.skipif(not RUST_AVAILABLE, reason="Rust extensions not compiled")
     def test_use_draco_false_regression(self, tmp_path):
@@ -1296,8 +1393,12 @@ class TestStreamingDracoGlb:
             "ring_lengths": [4],
             "type": 5,
             "tags": {"name": "tiny"},
-            "minX": 0.1, "minY": 0.2, "minZ": 0.1,
-            "maxX": 0.5, "maxY": 0.6, "maxZ": 0.3,
+            "minX": 0.1,
+            "minY": 0.2,
+            "minZ": 0.1,
+            "maxX": 0.5,
+            "maxY": 0.6,
+            "maxZ": 0.3,
         }
         gen.add_feature(feat)
 
@@ -1309,8 +1410,9 @@ class TestStreamingDracoGlb:
         gltf = _parse_glb_json(data)
 
         # No Draco extension should be present
-        assert "extensionsUsed" not in gltf or \
-            "KHR_draco_mesh_compression" not in gltf.get("extensionsUsed", [])
+        assert "extensionsUsed" not in gltf or "KHR_draco_mesh_compression" not in gltf.get(
+            "extensionsUsed", []
+        )
         # If accessors exist, position accessor should have a bufferView (raw encoding)
         if "accessors" in gltf:
             assert "bufferView" in gltf["accessors"][0]

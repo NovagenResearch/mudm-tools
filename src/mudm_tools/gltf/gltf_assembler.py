@@ -19,7 +19,6 @@ from pygltflib import (
     UNSIGNED_INT,
     Asset,
     Attributes,
-    Buffer,
     GLTF2,
     Material,
     Mesh,
@@ -49,13 +48,9 @@ from ._buffers import create_accessor
 from .models import GltfConfig
 from .triangulator import multipolygon_to_mesh, polygon_to_mesh
 
-
 # Z-up → Y-up rotation matrix (rotate -90° around X)
 _Z_UP_TO_Y_UP = np.array(
-    [1, 0, 0, 0,
-     0, 0, 1, 0,
-     0, -1, 0, 0,
-     0, 0, 0, 1],
+    [1, 0, 0, 0, 0, 0, 1, 0, 0, -1, 0, 0, 0, 0, 0, 1],
     dtype=np.float64,
 ).reshape(4, 4)
 
@@ -107,6 +102,7 @@ def _init_gltf(
 
     if config.draco:
         from ._draco import ensure_draco_extensions
+
         ensure_draco_extensions(gltf)
 
     return gltf, value_to_material
@@ -128,8 +124,14 @@ def _add_triangle_mesh(
 
     if config.draco:
         from ._draco import add_draco_triangle_mesh
+
         return add_draco_triangle_mesh(
-            gltf, vertices, indices, normals, config, material_idx,
+            gltf,
+            vertices,
+            indices,
+            normals,
+            config,
+            material_idx,
         )
 
     verts_f32 = vertices.astype(np.float32)
@@ -146,7 +148,11 @@ def _add_triangle_mesh(
 
     mesh_idx = len(gltf.meshes)
     gltf.meshes.append(
-        Mesh(primitives=[Primitive(attributes=attrs, indices=idx_acc, material=material_idx, mode=TRIANGLES)])
+        Mesh(
+            primitives=[
+                Primitive(attributes=attrs, indices=idx_acc, material=material_idx, mode=TRIANGLES)
+            ]
+        )
     )
     return mesh_idx
 
@@ -169,7 +175,16 @@ def _add_line_primitive(
 
     mesh_idx = len(gltf.meshes)
     gltf.meshes.append(
-        Mesh(primitives=[Primitive(attributes=Attributes(POSITION=pos_acc), indices=idx_acc, material=material_idx, mode=LINES)])
+        Mesh(
+            primitives=[
+                Primitive(
+                    attributes=Attributes(POSITION=pos_acc),
+                    indices=idx_acc,
+                    material=material_idx,
+                    mode=LINES,
+                )
+            ]
+        )
     )
     return mesh_idx
 
@@ -189,7 +204,13 @@ def _add_point_primitive(
 
     mesh_idx = len(gltf.meshes)
     gltf.meshes.append(
-        Mesh(primitives=[Primitive(attributes=Attributes(POSITION=pos_acc), material=material_idx, mode=POINTS)])
+        Mesh(
+            primitives=[
+                Primitive(
+                    attributes=Attributes(POSITION=pos_acc), material=material_idx, mode=POINTS
+                )
+            ]
+        )
     )
     return mesh_idx
 
@@ -215,6 +236,7 @@ def _add_node(
 # ---------------------------------------------------------------------------
 # Geometry dispatchers
 # ---------------------------------------------------------------------------
+
 
 def _convert_tin(
     gltf: GLTF2,
@@ -427,6 +449,7 @@ def _convert_multipoint(
 # Public API
 # ---------------------------------------------------------------------------
 
+
 def _convert_geometry(
     gltf: GLTF2,
     geom: Any,
@@ -463,8 +486,7 @@ def _add_nodes_for_mesh(
     if isinstance(mesh_result, list):
         for j, midx in enumerate(mesh_result):
             node_name = f"{name}_{j}" if name else None
-            _add_node(gltf, midx, name=node_name,
-                      extras=extras if j == 0 else None)
+            _add_node(gltf, midx, name=node_name, extras=extras if j == 0 else None)
     elif mesh_result >= 0:
         _add_node(gltf, mesh_result, name=name, extras=extras)
 
@@ -558,8 +580,7 @@ def collection_to_gltf(
         if config.include_metadata and feature.properties:
             extras = dict(feature.properties)
 
-        _add_nodes_for_mesh(gltf, mesh_result, name=f"feature_{i}",
-                            extras=extras)
+        _add_nodes_for_mesh(gltf, mesh_result, name=f"feature_{i}", extras=extras)
 
     # Store collection-level metadata in scene extras
     if config.include_metadata and collection.properties:

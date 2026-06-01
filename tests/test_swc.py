@@ -12,7 +12,6 @@ from mudm_tools.swc import (
     swc_to_feature_collection,
 )
 
-
 FIXTURE_DIR = Path(__file__).parent / "fixtures"
 SAMPLE_SWC = FIXTURE_DIR / "sample_neuron.swc"
 
@@ -117,7 +116,7 @@ class TestSWCConverters:
         """microjson_to_swc accepts a NeuronMorphology directly."""
         morphology = _parse_swc(str(SAMPLE_SWC))
         swc_text = microjson_to_swc(morphology)
-        lines = [l for l in swc_text.strip().split("\n") if not l.startswith("#")]
+        lines = [line for line in swc_text.strip().split("\n") if not line.startswith("#")]
         assert len(lines) == 8
         # first data line: id=1, type=1, parent=-1
         parts = lines[0].split()
@@ -130,7 +129,7 @@ class TestSWCConverters:
         morphology = _parse_swc(str(SAMPLE_SWC))
         swc_text = microjson_to_swc(morphology)
         # Parse the generated SWC text back
-        lines = [l for l in swc_text.strip().split("\n") if not l.startswith("#")]
+        lines = [line for line in swc_text.strip().split("\n") if not line.startswith("#")]
         assert len(lines) == 8
         for line in lines:
             parts = line.split()
@@ -258,6 +257,7 @@ class TestSWCToFeatureCollection:
     def test_neuromorpho_name_strips_cng(self):
         """NeuroMorpho .CNG.swc suffix is stripped from the name."""
         from mudm_tools.swc import _neuron_name_from_path
+
         assert _neuron_name_from_path("swcs/cnic_041.CNG.swc") == "cnic_041"
         assert _neuron_name_from_path("foo/bar.swc") == "bar"
 
@@ -280,6 +280,7 @@ class TestFloatFormattedIds:
     def test_parse_float_ids(self):
         """SWCs with '1.000000'-style integer columns must parse (cnn-nmo convention)."""
         from mudm_tools.swc import _parse_swc
+
         fixture = Path(__file__).parent / "fixtures" / "sample_neuron_float_ids.swc"
         morph = _parse_swc(str(fixture))
         assert len(morph.tree) == 3

@@ -1,9 +1,6 @@
 """Tests for mesh generation utilities and neuron tube mesh generation."""
 
-import math
-
 import numpy as np
-import pytest
 
 from mudm_tools.swc import (
     NeuronMorphology,
@@ -92,11 +89,13 @@ class TestExtractPaths:
         return [SWCSample(**s) for s in samples]
 
     def test_linear_chain(self):
-        tree = self._make_tree([
-            {"id": 1, "type": 1, "x": 0, "y": 0, "z": 0, "r": 1, "parent": -1},
-            {"id": 2, "type": 3, "x": 1, "y": 0, "z": 0, "r": 1, "parent": 1},
-            {"id": 3, "type": 3, "x": 2, "y": 0, "z": 0, "r": 1, "parent": 2},
-        ])
+        tree = self._make_tree(
+            [
+                {"id": 1, "type": 1, "x": 0, "y": 0, "z": 0, "r": 1, "parent": -1},
+                {"id": 2, "type": 3, "x": 1, "y": 0, "z": 0, "r": 1, "parent": 1},
+                {"id": 3, "type": 3, "x": 2, "y": 0, "z": 0, "r": 1, "parent": 2},
+            ]
+        )
         id_to_sample = {s.id: s for s in tree}
         paths = _extract_paths(tree, id_to_sample)
 
@@ -104,11 +103,13 @@ class TestExtractPaths:
         assert paths[0] == [1, 2, 3]
 
     def test_branching(self):
-        tree = self._make_tree([
-            {"id": 1, "type": 1, "x": 0, "y": 0, "z": 0, "r": 1, "parent": -1},
-            {"id": 2, "type": 3, "x": 1, "y": 0, "z": 0, "r": 1, "parent": 1},
-            {"id": 3, "type": 3, "x": 0, "y": 1, "z": 0, "r": 1, "parent": 1},
-        ])
+        tree = self._make_tree(
+            [
+                {"id": 1, "type": 1, "x": 0, "y": 0, "z": 0, "r": 1, "parent": -1},
+                {"id": 2, "type": 3, "x": 1, "y": 0, "z": 0, "r": 1, "parent": 1},
+                {"id": 3, "type": 3, "x": 0, "y": 1, "z": 0, "r": 1, "parent": 1},
+            ]
+        )
         id_to_sample = {s.id: s for s in tree}
         paths = _extract_paths(tree, id_to_sample)
 
@@ -121,13 +122,15 @@ class TestExtractPaths:
 
     def test_deep_branching(self):
         """Root -> chain -> branch point -> two branches."""
-        tree = self._make_tree([
-            {"id": 1, "type": 1, "x": 0, "y": 0, "z": 0, "r": 1, "parent": -1},
-            {"id": 2, "type": 3, "x": 1, "y": 0, "z": 0, "r": 1, "parent": 1},
-            {"id": 3, "type": 3, "x": 2, "y": 0, "z": 0, "r": 1, "parent": 2},
-            {"id": 4, "type": 3, "x": 3, "y": 1, "z": 0, "r": 1, "parent": 3},
-            {"id": 5, "type": 3, "x": 3, "y": -1, "z": 0, "r": 1, "parent": 3},
-        ])
+        tree = self._make_tree(
+            [
+                {"id": 1, "type": 1, "x": 0, "y": 0, "z": 0, "r": 1, "parent": -1},
+                {"id": 2, "type": 3, "x": 1, "y": 0, "z": 0, "r": 1, "parent": 1},
+                {"id": 3, "type": 3, "x": 2, "y": 0, "z": 0, "r": 1, "parent": 2},
+                {"id": 4, "type": 3, "x": 3, "y": 1, "z": 0, "r": 1, "parent": 3},
+                {"id": 5, "type": 3, "x": 3, "y": -1, "z": 0, "r": 1, "parent": 3},
+            ]
+        )
         id_to_sample = {s.id: s for s in tree}
         paths = _extract_paths(tree, id_to_sample)
 
@@ -410,7 +413,11 @@ class TestThinPath:
         assert len(tr) == 50
 
     def test_preserves_endpoints(self):
-        pts = [np.array([0, 0, 0.0])] + [np.array([float(i), 1, 0]) for i in range(1, 9)] + [np.array([9, 0, 0.0])]
+        pts = (
+            [np.array([0, 0, 0.0])]
+            + [np.array([float(i), 1, 0]) for i in range(1, 9)]
+            + [np.array([9, 0, 0.0])]
+        )
         radii = [2.0] + [1.0] * 8 + [3.0]
         tp, tr = thin_path(pts, radii, 0.3)
         np.testing.assert_allclose(tp[0], [0, 0, 0])
@@ -430,33 +437,40 @@ class TestMeshQuality:
         """Neuron with many nodes -- good for testing quality reduction."""
         samples = [SWCSample(id=1, type=1, x=0, y=0, z=0, r=5, parent=-1)]
         for i in range(2, 52):
-            samples.append(SWCSample(
-                id=i, type=3, x=float(i * 2), y=float(i % 5), z=0, r=1.5, parent=i - 1,
-            ))
+            samples.append(
+                SWCSample(
+                    id=i,
+                    type=3,
+                    x=float(i * 2),
+                    y=float(i % 5),
+                    z=0,
+                    r=1.5,
+                    parent=i - 1,
+                )
+            )
         return NeuronMorphology(type="NeuronMorphology", tree=samples)
 
     def test_quality_reduces_vertices(self):
         neuron = self._long_neuron()
         v_full, _, _ = neuron_to_tube_mesh(
-            neuron, segments=8, smooth_subdivisions=5, mesh_quality=1.0)
+            neuron, segments=8, smooth_subdivisions=5, mesh_quality=1.0
+        )
         v_half, _, _ = neuron_to_tube_mesh(
-            neuron, segments=8, smooth_subdivisions=5, mesh_quality=0.5)
+            neuron, segments=8, smooth_subdivisions=5, mesh_quality=0.5
+        )
         # Half quality should have significantly fewer tube vertices
         assert v_half.shape[0] < v_full.shape[0]
 
     def test_quality_valid_indices(self):
         neuron = self._long_neuron()
-        v, _, idx = neuron_to_tube_mesh(
-            neuron, segments=8, smooth_subdivisions=5, mesh_quality=0.3)
+        v, _, idx = neuron_to_tube_mesh(neuron, segments=8, smooth_subdivisions=5, mesh_quality=0.3)
         assert idx.max() < v.shape[0]
         assert idx.min() >= 0
 
     def test_typed_meshes_quality(self):
         neuron = self._long_neuron()
-        t_full = neuron_to_typed_meshes(
-            neuron, segments=8, smooth_subdivisions=5, mesh_quality=1.0)
-        t_half = neuron_to_typed_meshes(
-            neuron, segments=8, smooth_subdivisions=5, mesh_quality=0.5)
+        t_full = neuron_to_typed_meshes(neuron, segments=8, smooth_subdivisions=5, mesh_quality=1.0)
+        t_half = neuron_to_typed_meshes(neuron, segments=8, smooth_subdivisions=5, mesh_quality=0.5)
         # Dendrite mesh (type 3) should shrink; soma (type 1) unaffected
         assert t_half[3][0].shape[0] < t_full[3][0].shape[0]
         assert t_half[1][0].shape[0] == t_full[1][0].shape[0]
@@ -465,8 +479,8 @@ class TestMeshQuality:
         """mesh_quality=1.0 should produce identical output to no thinning."""
         neuron = self._long_neuron()
         v1, n1, idx1 = neuron_to_tube_mesh(
-            neuron, segments=8, smooth_subdivisions=3, mesh_quality=1.0)
-        v2, n2, idx2 = neuron_to_tube_mesh(
-            neuron, segments=8, smooth_subdivisions=3)
+            neuron, segments=8, smooth_subdivisions=3, mesh_quality=1.0
+        )
+        v2, n2, idx2 = neuron_to_tube_mesh(neuron, segments=8, smooth_subdivisions=3)
         assert v1.shape == v2.shape
         np.testing.assert_array_equal(idx1, idx2)

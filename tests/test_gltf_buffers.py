@@ -1,7 +1,6 @@
 """Tests for glTF buffer packing utilities."""
 
 import numpy as np
-import pytest
 from pygltflib import ARRAY_BUFFER, ELEMENT_ARRAY_BUFFER, FLOAT, UNSIGNED_INT, GLTF2
 
 from mudm_tools.gltf._buffers import (

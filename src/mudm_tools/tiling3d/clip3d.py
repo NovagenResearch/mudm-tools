@@ -93,21 +93,30 @@ def _clip_points(feat: dict, k1: float, k2: float, axis: int) -> list[dict]:
         if k1 <= val < k2:
             px, py = xy[i * 2], xy[i * 2 + 1]
             pz = z[i]
-            results.append({
-                "geometry": [px, py],
-                "geometry_z": [pz],
-                "type": POINT3D,
-                "tags": feat.get("tags", {}),
-                "minX": px, "minY": py, "minZ": pz,
-                "maxX": px, "maxY": py, "maxZ": pz,
-            })
+            results.append(
+                {
+                    "geometry": [px, py],
+                    "geometry_z": [pz],
+                    "type": POINT3D,
+                    "tags": feat.get("tags", {}),
+                    "minX": px,
+                    "minY": py,
+                    "minZ": pz,
+                    "maxX": px,
+                    "maxY": py,
+                    "maxZ": pz,
+                }
+            )
     return results
 
 
 def _intersect(
-    xy: list[float], z: list[float],
-    i: int, j: int,
-    k: float, axis: int,
+    xy: list[float],
+    z: list[float],
+    i: int,
+    j: int,
+    k: float,
+    axis: int,
 ) -> tuple[float, float, float]:
     """Interpolate intersection point where the line (i→j) crosses axis=k."""
     ax, ay, az = xy[i * 2], xy[i * 2 + 1], z[i]
@@ -155,19 +164,21 @@ def _clip_line(feat: dict, k1: float, k2: float, axis: int) -> list[dict]:
         nonlocal out_xy, out_z
         if len(out_z) >= 2:
             nn = len(out_z)
-            segments.append({
-                "geometry": out_xy,
-                "geometry_z": out_z,
-                "type": LINESTRING3D,
-                "tags": feat.get("tags", {}),
-                "ring_lengths": feat.get("ring_lengths"),
-                "minX": min(out_xy[j * 2] for j in range(nn)),
-                "minY": min(out_xy[j * 2 + 1] for j in range(nn)),
-                "minZ": min(out_z),
-                "maxX": max(out_xy[j * 2] for j in range(nn)),
-                "maxY": max(out_xy[j * 2 + 1] for j in range(nn)),
-                "maxZ": max(out_z),
-            })
+            segments.append(
+                {
+                    "geometry": out_xy,
+                    "geometry_z": out_z,
+                    "type": LINESTRING3D,
+                    "tags": feat.get("tags", {}),
+                    "ring_lengths": feat.get("ring_lengths"),
+                    "minX": min(out_xy[j * 2] for j in range(nn)),
+                    "minY": min(out_xy[j * 2 + 1] for j in range(nn)),
+                    "minZ": min(out_z),
+                    "maxX": max(out_xy[j * 2] for j in range(nn)),
+                    "maxY": max(out_xy[j * 2 + 1] for j in range(nn)),
+                    "maxZ": max(out_z),
+                }
+            )
         out_xy = []
         out_z = []
 
@@ -261,8 +272,8 @@ def _clip_surface(feat: dict, k1: float, k2: float, axis: int) -> dict | None:
             continue
 
         # Face overlaps — keep it whole
-        out_xy.extend(xy[offset * 2:(offset + rl) * 2])
-        out_z.extend(z[offset:offset + rl])
+        out_xy.extend(xy[offset * 2 : (offset + rl) * 2])
+        out_z.extend(z[offset : offset + rl])
         out_ring_lengths.append(rl)
         offset += rl
 
@@ -283,8 +294,12 @@ def _clip_surface(feat: dict, k1: float, k2: float, axis: int) -> dict | None:
         "ring_lengths": out_ring_lengths,
         "type": feat["type"],
         "tags": feat.get("tags", {}),
-        "minX": min_x, "minY": min_y, "minZ": min_z,
-        "maxX": max_x, "maxY": max_y, "maxZ": max_z,
+        "minX": min_x,
+        "minY": min_y,
+        "minZ": min_z,
+        "maxX": max_x,
+        "maxY": max_y,
+        "maxZ": max_z,
     }
 
 
@@ -310,10 +325,10 @@ try:
     from mudm_tools._rs import clip_surface as _clip_surface_rs  # noqa: F401
     from mudm_tools._rs import clip_line as _clip_line_rs  # noqa: F401
 
-    def _clip_surface(feat, k1, k2, axis):  # noqa: F811
+    def _clip_surface(feat: dict, k1: float, k2: float, axis: int) -> dict | None:  # noqa: F811
         return _clip_surface_rs(feat, k1, k2, axis)
 
-    def _clip_line(feat, k1, k2, axis):  # noqa: F811
+    def _clip_line(feat: dict, k1: float, k2: float, axis: int) -> list[dict]:  # noqa: F811
         return _clip_line_rs(feat, k1, k2, axis)
 
 except ImportError:

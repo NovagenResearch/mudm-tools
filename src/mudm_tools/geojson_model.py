@@ -18,25 +18,25 @@ class Items3(BaseModel):
 
 class Items2(BaseModel):
     type: str
-    min_items: Optional[int] = Field(None, alias='minItems')
+    min_items: Optional[int] = Field(None, alias="minItems")
     items: Optional[Items3] = None
 
 
 class Items1(BaseModel):
     type: str
-    min_items: Optional[int] = Field(None, alias='minItems')
+    min_items: Optional[int] = Field(None, alias="minItems")
     items: Optional[Items2] = None
 
 
 class Items(BaseModel):
     type: str
-    min_items: Optional[int] = Field(None, alias='minItems')
+    min_items: Optional[int] = Field(None, alias="minItems")
     items: Optional[Items1] = None
 
 
 class Coordinates(BaseModel):
     type: str
-    min_items: Optional[int] = Field(None, alias='minItems')
+    min_items: Optional[int] = Field(None, alias="minItems")
     items: Items
 
 
@@ -46,7 +46,7 @@ class Items4(Items3):
 
 class Bbox(BaseModel):
     type: str
-    min_items: int = Field(..., alias='minItems')
+    min_items: int = Field(..., alias="minItems")
     items: Items4
 
 
@@ -60,25 +60,25 @@ class Items9(Items3):
 
 class Items8(BaseModel):
     type: str
-    min_items: Optional[int] = Field(None, alias='minItems')
+    min_items: Optional[int] = Field(None, alias="minItems")
     items: Optional[Items9] = None
 
 
 class Items7(BaseModel):
     type: str
-    min_items: Optional[int] = Field(None, alias='minItems')
+    min_items: Optional[int] = Field(None, alias="minItems")
     items: Optional[Items8] = None
 
 
 class Items6(BaseModel):
     type: str
-    min_items: Optional[int] = Field(None, alias='minItems')
+    min_items: Optional[int] = Field(None, alias="minItems")
     items: Optional[Items7] = None
 
 
 class Coordinates1(BaseModel):
     type: str
-    min_items: Optional[int] = Field(None, alias='minItems')
+    min_items: Optional[int] = Field(None, alias="minItems")
     items: Items6
 
 
@@ -88,7 +88,7 @@ class Items10(Items3):
 
 class Bbox1(BaseModel):
     type: str
-    min_items: int = Field(..., alias='minItems')
+    min_items: int = Field(..., alias="minItems")
     items: Items10
 
 
@@ -106,7 +106,7 @@ class OneOfItem1(BaseModel):
 
 
 class Items5(BaseModel):
-    one_of: List[OneOfItem1] = Field(..., alias='oneOf')
+    one_of: List[OneOfItem1] = Field(..., alias="oneOf")
 
 
 class Geometries(BaseModel):
@@ -119,7 +119,7 @@ class OneOfItem2(Items3):
 
 
 class Id(BaseModel):
-    one_of: List[OneOfItem2] = Field(..., alias='oneOf')
+    one_of: List[OneOfItem2] = Field(..., alias="oneOf")
 
 
 class OneOfItem3(Items3):
@@ -127,7 +127,7 @@ class OneOfItem3(Items3):
 
 
 class Properties2(BaseModel):
-    one_of: List[OneOfItem3] = Field(..., alias='oneOf')
+    one_of: List[OneOfItem3] = Field(..., alias="oneOf")
 
 
 class Type2(Type):
@@ -140,25 +140,25 @@ class Items14(Items3):
 
 class Items13(BaseModel):
     type: str
-    min_items: Optional[int] = Field(None, alias='minItems')
+    min_items: Optional[int] = Field(None, alias="minItems")
     items: Optional[Items14] = None
 
 
 class Items12(BaseModel):
     type: str
-    min_items: Optional[int] = Field(None, alias='minItems')
+    min_items: Optional[int] = Field(None, alias="minItems")
     items: Optional[Items13] = None
 
 
 class Items11(BaseModel):
     type: str
-    min_items: Optional[int] = Field(None, alias='minItems')
+    min_items: Optional[int] = Field(None, alias="minItems")
     items: Optional[Items12] = None
 
 
 class Coordinates2(BaseModel):
     type: str
-    min_items: Optional[int] = Field(None, alias='minItems')
+    min_items: Optional[int] = Field(None, alias="minItems")
     items: Items11
 
 
@@ -168,7 +168,7 @@ class Items15(Items3):
 
 class Bbox2(BaseModel):
     type: str
-    min_items: int = Field(..., alias='minItems')
+    min_items: int = Field(..., alias="minItems")
     items: Items15
 
 
@@ -182,25 +182,25 @@ class Items20(Items3):
 
 class Items19(BaseModel):
     type: str
-    min_items: Optional[int] = Field(None, alias='minItems')
+    min_items: Optional[int] = Field(None, alias="minItems")
     items: Optional[Items20] = None
 
 
 class Items18(BaseModel):
     type: str
-    min_items: Optional[int] = Field(None, alias='minItems')
+    min_items: Optional[int] = Field(None, alias="minItems")
     items: Optional[Items19] = None
 
 
 class Items17(BaseModel):
     type: str
-    min_items: Optional[int] = Field(None, alias='minItems')
+    min_items: Optional[int] = Field(None, alias="minItems")
     items: Optional[Items18] = None
 
 
 class Coordinates3(BaseModel):
     type: str
-    min_items: Optional[int] = Field(None, alias='minItems')
+    min_items: Optional[int] = Field(None, alias="minItems")
     items: Items17
 
 
@@ -210,7 +210,7 @@ class Items21(Items3):
 
 class Bbox3(BaseModel):
     type: str
-    min_items: int = Field(..., alias='minItems')
+    min_items: int = Field(..., alias="minItems")
     items: Items21
 
 
@@ -228,7 +228,7 @@ class OneOfItem5(BaseModel):
 
 
 class Items16(BaseModel):
-    one_of: List[OneOfItem5] = Field(..., alias='oneOf')
+    one_of: List[OneOfItem5] = Field(..., alias="oneOf")
 
 
 class Geometries1(BaseModel):
@@ -251,7 +251,7 @@ class OneOfItem4(BaseModel):
 
 
 class Geometry(BaseModel):
-    one_of: List[OneOfItem4] = Field(..., alias='oneOf')
+    one_of: List[OneOfItem4] = Field(..., alias="oneOf")
 
 
 class Type4(Type):
@@ -263,7 +263,7 @@ class OneOfItem6(Items3):
 
 
 class Id1(BaseModel):
-    one_of: List[OneOfItem6] = Field(..., alias='oneOf')
+    one_of: List[OneOfItem6] = Field(..., alias="oneOf")
 
 
 class OneOfItem7(Items3):
@@ -271,7 +271,7 @@ class OneOfItem7(Items3):
 
 
 class Properties6(BaseModel):
-    one_of: List[OneOfItem7] = Field(..., alias='oneOf')
+    one_of: List[OneOfItem7] = Field(..., alias="oneOf")
 
 
 class Type5(Type):
@@ -284,25 +284,25 @@ class Items26(Items3):
 
 class Items25(BaseModel):
     type: str
-    min_items: Optional[int] = Field(None, alias='minItems')
+    min_items: Optional[int] = Field(None, alias="minItems")
     items: Optional[Items26] = None
 
 
 class Items24(BaseModel):
     type: str
-    min_items: Optional[int] = Field(None, alias='minItems')
+    min_items: Optional[int] = Field(None, alias="minItems")
     items: Optional[Items25] = None
 
 
 class Items23(BaseModel):
     type: str
-    min_items: Optional[int] = Field(None, alias='minItems')
+    min_items: Optional[int] = Field(None, alias="minItems")
     items: Optional[Items24] = None
 
 
 class Coordinates4(BaseModel):
     type: str
-    min_items: Optional[int] = Field(None, alias='minItems')
+    min_items: Optional[int] = Field(None, alias="minItems")
     items: Items23
 
 
@@ -312,7 +312,7 @@ class Items27(Items3):
 
 class Bbox4(BaseModel):
     type: str
-    min_items: int = Field(..., alias='minItems')
+    min_items: int = Field(..., alias="minItems")
     items: Items27
 
 
@@ -326,25 +326,25 @@ class Items32(Items3):
 
 class Items31(BaseModel):
     type: str
-    min_items: Optional[int] = Field(None, alias='minItems')
+    min_items: Optional[int] = Field(None, alias="minItems")
     items: Optional[Items32] = None
 
 
 class Items30(BaseModel):
     type: str
-    min_items: Optional[int] = Field(None, alias='minItems')
+    min_items: Optional[int] = Field(None, alias="minItems")
     items: Optional[Items31] = None
 
 
 class Items29(BaseModel):
     type: str
-    min_items: Optional[int] = Field(None, alias='minItems')
+    min_items: Optional[int] = Field(None, alias="minItems")
     items: Optional[Items30] = None
 
 
 class Coordinates5(BaseModel):
     type: str
-    min_items: Optional[int] = Field(None, alias='minItems')
+    min_items: Optional[int] = Field(None, alias="minItems")
     items: Items29
 
 
@@ -354,7 +354,7 @@ class Items33(Items3):
 
 class Bbox5(BaseModel):
     type: str
-    min_items: int = Field(..., alias='minItems')
+    min_items: int = Field(..., alias="minItems")
     items: Items33
 
 
@@ -372,7 +372,7 @@ class OneOfItem9(BaseModel):
 
 
 class Items28(BaseModel):
-    one_of: List[OneOfItem9] = Field(..., alias='oneOf')
+    one_of: List[OneOfItem9] = Field(..., alias="oneOf")
 
 
 class Geometries2(BaseModel):
@@ -395,7 +395,7 @@ class OneOfItem8(BaseModel):
 
 
 class Geometry1(BaseModel):
-    one_of: List[OneOfItem8] = Field(..., alias='oneOf')
+    one_of: List[OneOfItem8] = Field(..., alias="oneOf")
 
 
 class Items34(Items3):
@@ -404,7 +404,7 @@ class Items34(Items3):
 
 class Bbox6(BaseModel):
     type: str
-    min_items: int = Field(..., alias='minItems')
+    min_items: int = Field(..., alias="minItems")
     items: Items34
 
 
@@ -447,7 +447,7 @@ class OneOfItem(BaseModel):
 
 
 class Model(BaseModel):
-    _schema: str = Field(..., alias='$schema')
-    _id: str = Field(..., alias='$id')
+    _schema: str = Field(..., alias="$schema")
+    _id: str = Field(..., alias="$id")
     title: str
-    one_of: List[OneOfItem] = Field(..., alias='oneOf')
+    one_of: List[OneOfItem] = Field(..., alias="oneOf")

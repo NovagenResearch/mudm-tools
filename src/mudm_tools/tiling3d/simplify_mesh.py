@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import numpy as np
 
-
 # Base grid resolution at zoom 0. Surface cells ≈ 6 * N^2, so:
 #   z0: 10 cells → ~600 surface cells → ~1.7% of 35K faces
 #   z1: 20 cells → ~2400 → ~6.9%

@@ -30,5 +30,9 @@ def generate_pbf(
     out = Path(output_path)
     out.mkdir(parents=True, exist_ok=True)
     return generator.generate_pbf(
-        str(out), world_bounds, extent, simplify, layer_name,
+        str(out),
+        world_bounds,
+        extent,
+        simplify,
+        layer_name,
     )

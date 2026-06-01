@@ -45,12 +45,7 @@ def _load_download_hemibrain():
 def _write_tri_obj(path: Path, base: float) -> None:
     """Write a tiny valid single-triangle OBJ at an offset."""
     b = base
-    path.write_text(
-        f"v {b} {b} {b}\n"
-        f"v {b + 1} {b} {b}\n"
-        f"v {b} {b + 1} {b}\n"
-        f"f 1 2 3\n"
-    )
+    path.write_text(f"v {b} {b} {b}\n" f"v {b + 1} {b} {b}\n" f"v {b} {b + 1} {b}\n" f"f 1 2 3\n")
 
 
 @pytest.mark.skipif(not RUST_AVAILABLE, reason="Rust extensions not compiled")
@@ -64,10 +59,16 @@ def test_tile_streaming_writes_and_surfaces_run_summary(tmp_path, caplog):
     _write_tri_obj(mesh_dir / "1002.obj", 5.0)
 
     metadata_path = tmp_path / "metadata.json"
-    metadata_path.write_text(json.dumps({"neurons": [
-        {"bodyId": 1001, "type": "X", "instance": "x_1001"},
-        {"bodyId": 1002, "type": "Y", "instance": "y_1002"},
-    ]}))
+    metadata_path.write_text(
+        json.dumps(
+            {
+                "neurons": [
+                    {"bodyId": 1001, "type": "X", "instance": "x_1001"},
+                    {"bodyId": 1002, "type": "Y", "instance": "y_1002"},
+                ]
+            }
+        )
+    )
 
     output_dir = tmp_path / "out"
     output_dir.mkdir()

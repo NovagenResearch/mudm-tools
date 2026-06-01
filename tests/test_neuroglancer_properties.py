@@ -1,9 +1,7 @@
 """Tests for Neuroglancer segment_properties writer."""
 
 import json
-from pathlib import Path
 
-import pytest
 
 from mudm.model import MuDMFeature
 from mudm_tools.neuroglancer.properties_writer import (

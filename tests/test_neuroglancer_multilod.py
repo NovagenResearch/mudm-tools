@@ -6,19 +6,17 @@ Morton ordering, segment properties, and end-to-end pipeline.
 
 import json
 import struct
-from pathlib import Path
 
 import pytest
 
 try:
     from mudm_tools._rs import StreamingTileGenerator
+
     RUST_AVAILABLE = True
 except ImportError:
     RUST_AVAILABLE = False
 
-pytestmark = pytest.mark.skipif(
-    not RUST_AVAILABLE, reason="Rust extensions not compiled"
-)
+pytestmark = pytest.mark.skipif(not RUST_AVAILABLE, reason="Rust extensions not compiled")
 
 
 # ---------------------------------------------------------------------------
@@ -49,6 +47,7 @@ def _make_tin_feature(xy, z, ring_lengths, tags=None):
 def _make_dense_tin_feature(n_triangles=20):
     """Build a TIN feature with many triangles spread across [0.1, 0.9]³."""
     import random
+
     random.seed(42)
     xy = []
     z = []
@@ -104,7 +103,11 @@ def _parse_index_file(data: bytes) -> dict:
 
     num_fragments_per_lod = read_u32(num_lods)
     if num_lods == 1:
-        num_fragments_per_lod = (num_fragments_per_lod,) if isinstance(num_fragments_per_lod, int) else num_fragments_per_lod
+        num_fragments_per_lod = (
+            (num_fragments_per_lod,)
+            if isinstance(num_fragments_per_lod, int)
+            else num_fragments_per_lod
+        )
 
     lods = []
     for lod_idx in range(num_lods):
@@ -122,10 +125,12 @@ def _parse_index_file(data: bytes) -> dict:
         frag_offsets = read_u32(nf) if nf > 0 else ()
         if nf == 1:
             frag_offsets = (frag_offsets,) if isinstance(frag_offsets, int) else frag_offsets
-        lods.append({
-            "positions": positions,
-            "offsets": list(frag_offsets),
-        })
+        lods.append(
+            {
+                "positions": positions,
+                "offsets": list(frag_offsets),
+            }
+        )
 
     return {
         "chunk_shape": chunk_shape,
@@ -141,6 +146,7 @@ def _parse_index_file(data: bytes) -> dict:
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
+
 
 class TestInfoJsonType:
     """Test that info JSON has correct @type."""
@@ -198,9 +204,9 @@ class TestFragmentCountPerLod:
         frag_counts = parsed["num_fragments_per_lod"]
         # finest LOD (lod 0) should have >= coarser LODs
         for i in range(len(frag_counts) - 1):
-            assert frag_counts[i] >= frag_counts[i + 1], (
-                f"lod {i} ({frag_counts[i]} frags) < lod {i+1} ({frag_counts[i+1]} frags)"
-            )
+            assert (
+                frag_counts[i] >= frag_counts[i + 1]
+            ), f"lod {i} ({frag_counts[i]} frags) < lod {i+1} ({frag_counts[i+1]} frags)"
 
 
 class TestFragmentDataSize:
@@ -219,9 +225,7 @@ class TestFragmentDataSize:
         data_path = tmp_path / "ng_multilod" / "0"
         data_size = data_path.stat().st_size
 
-        total_offsets = sum(
-            sum(lod["offsets"]) for lod in parsed["lods"]
-        )
+        total_offsets = sum(sum(lod["offsets"]) for lod in parsed["lods"])
         assert data_size == total_offsets
 
 
@@ -255,14 +259,16 @@ class TestMortonOrder:
 
         def morton_3d(x, y, z):
             """Simple Morton code for comparison."""
+
             def spread(v):
-                v &= 0x1fffff
-                v = (v | (v << 32)) & 0x1f00000000ffff
-                v = (v | (v << 16)) & 0x1f0000ff0000ff
-                v = (v | (v << 8)) & 0x100f00f00f00f00f
-                v = (v | (v << 4)) & 0x10c30c30c30c30c3
+                v &= 0x1FFFFF
+                v = (v | (v << 32)) & 0x1F00000000FFFF
+                v = (v | (v << 16)) & 0x1F0000FF0000FF
+                v = (v | (v << 8)) & 0x100F00F00F00F00F
+                v = (v | (v << 4)) & 0x10C30C30C30C30C3
                 v = (v | (v << 2)) & 0x1249249249249249
                 return v
+
             return spread(x) | (spread(y) << 1) | (spread(z) << 2)
 
         for lod in parsed["lods"]:

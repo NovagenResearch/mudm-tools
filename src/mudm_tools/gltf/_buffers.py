@@ -5,13 +5,11 @@ Packs numpy arrays into the binary layout expected by pygltflib's GLTF2 object.
 
 from __future__ import annotations
 
-import struct
 from typing import Literal
 
 import numpy as np
 from pygltflib import (
     ARRAY_BUFFER,
-    ELEMENT_ARRAY_BUFFER,
     FLOAT,
     UNSIGNED_INT,
     Accessor,
@@ -74,7 +72,11 @@ def create_accessor(
         Index of the newly created accessor.
     """
     if component_type == FLOAT:
-        raw = pack_vertices(data) if data.ndim > 1 else np.ascontiguousarray(data, dtype="<f4").tobytes()
+        raw = (
+            pack_vertices(data)
+            if data.ndim > 1
+            else np.ascontiguousarray(data, dtype="<f4").tobytes()
+        )
     elif component_type == UNSIGNED_INT:
         raw = pack_indices(data)
     else:

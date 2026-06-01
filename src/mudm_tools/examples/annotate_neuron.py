@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import argparse
 import functools
-import json
 import math
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
@@ -28,17 +27,14 @@ from mudm.model import (
     MuDMFeature,
     MuDMFeatureCollection,
 )
-from mudm_tools.swc import NeuronMorphology, SWCSample, _parse_swc, swc_to_microjson
+from mudm_tools.swc import NeuronMorphology, _parse_swc, swc_to_microjson
 from mudm_tools.neuroglancer import to_neuroglancer, write_skeleton
-from mudm_tools.neuroglancer.properties_writer import write_segment_properties
-from mudm_tools.neuroglancer.skeleton_writer import build_skeleton_info
 from mudm_tools.neuroglancer.state import (
     build_annotation_layer,
     build_skeleton_layer,
     build_viewer_state,
     viewer_state_to_url,
 )
-
 
 # ---------------------------------------------------------------------------
 # SWC type codes → human-readable names
@@ -59,24 +55,27 @@ SWC_TYPE_NAMES = {
 # Annotation helpers — extract structural features from the morphology
 # ---------------------------------------------------------------------------
 
+
 def find_soma(morphology: NeuronMorphology) -> list[MuDMFeature]:
     """Create Point annotations for all soma nodes."""
     features = []
     for sample in morphology.tree:
         if sample.type == 1:  # soma
-            features.append(MuDMFeature(
-                type="Feature",
-                geometry={
-                    "type": "Point",
-                    "coordinates": [sample.x, sample.y, sample.z],
-                },
-                properties={
-                    "annotation": "soma",
-                    "node_id": sample.id,
-                    "radius": sample.r,
-                },
-                featureClass="soma",
-            ))
+            features.append(
+                MuDMFeature(
+                    type="Feature",
+                    geometry={
+                        "type": "Point",
+                        "coordinates": [sample.x, sample.y, sample.z],
+                    },
+                    properties={
+                        "annotation": "soma",
+                        "node_id": sample.id,
+                        "radius": sample.r,
+                    },
+                    featureClass="soma",
+                )
+            )
     return features
 
 
@@ -96,20 +95,22 @@ def find_branch_points(morphology: NeuronMorphology) -> list[MuDMFeature]:
     for node_id, count in children_count.items():
         if count >= 2:
             s = by_id[node_id]
-            features.append(MuDMFeature(
-                type="Feature",
-                geometry={
-                    "type": "Point",
-                    "coordinates": [s.x, s.y, s.z],
-                },
-                properties={
-                    "annotation": "branch_point",
-                    "node_id": s.id,
-                    "branch_count": count,
-                    "swc_type": SWC_TYPE_NAMES.get(s.type, str(s.type)),
-                },
-                featureClass="branch_point",
-            ))
+            features.append(
+                MuDMFeature(
+                    type="Feature",
+                    geometry={
+                        "type": "Point",
+                        "coordinates": [s.x, s.y, s.z],
+                    },
+                    properties={
+                        "annotation": "branch_point",
+                        "node_id": s.id,
+                        "branch_count": count,
+                        "swc_type": SWC_TYPE_NAMES.get(s.type, str(s.type)),
+                    },
+                    featureClass="branch_point",
+                )
+            )
     return features
 
 
@@ -122,19 +123,21 @@ def find_terminals(morphology: NeuronMorphology) -> list[MuDMFeature]:
     features = []
     for s in morphology.tree:
         if s.id not in parent_ids and s.type != 1:  # not a parent, not soma
-            features.append(MuDMFeature(
-                type="Feature",
-                geometry={
-                    "type": "Point",
-                    "coordinates": [s.x, s.y, s.z],
-                },
-                properties={
-                    "annotation": "terminal",
-                    "node_id": s.id,
-                    "swc_type": SWC_TYPE_NAMES.get(s.type, str(s.type)),
-                },
-                featureClass="terminal",
-            ))
+            features.append(
+                MuDMFeature(
+                    type="Feature",
+                    geometry={
+                        "type": "Point",
+                        "coordinates": [s.x, s.y, s.z],
+                    },
+                    properties={
+                        "annotation": "terminal",
+                        "node_id": s.id,
+                        "swc_type": SWC_TYPE_NAMES.get(s.type, str(s.type)),
+                    },
+                    featureClass="terminal",
+                )
+            )
     return features
 
 
@@ -188,9 +191,7 @@ def trace_path_to_soma(
         prev = current
         current = by_id[current.parent]
         path_length += math.sqrt(
-            (current.x - prev.x) ** 2 +
-            (current.y - prev.y) ** 2 +
-            (current.z - prev.z) ** 2
+            (current.x - prev.x) ** 2 + (current.y - prev.y) ** 2 + (current.z - prev.z) ** 2
         )
 
     if len(path_coords) < 2:
@@ -216,6 +217,7 @@ def trace_path_to_soma(
 # ---------------------------------------------------------------------------
 # Build the annotated MuDMFeatureCollection
 # ---------------------------------------------------------------------------
+
 
 def annotate_neuron(swc_path: str) -> MuDMFeatureCollection:
     """Load SWC and build a fully annotated MuDMFeatureCollection.
@@ -251,10 +253,7 @@ def annotate_neuron(swc_path: str) -> MuDMFeatureCollection:
 
     # Add measurement from soma to each terminal
     soma_ids = [s.id for s in morphology.tree if s.type == 1]
-    terminal_ids = [
-        int(f.properties["node_id"])
-        for f in terminals
-    ]
+    terminal_ids = [int(f.properties["node_id"]) for f in terminals]
 
     if soma_ids:
         for tid in terminal_ids:
@@ -288,6 +287,7 @@ def annotate_neuron(swc_path: str) -> MuDMFeatureCollection:
 # CORS server
 # ---------------------------------------------------------------------------
 
+
 class CORSHandler(SimpleHTTPRequestHandler):
     def end_headers(self):
         self.send_header("Access-Control-Allow-Origin", "*")
@@ -307,6 +307,7 @@ class CORSHandler(SimpleHTTPRequestHandler):
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(
@@ -333,7 +334,7 @@ def main() -> None:
     collection = annotate_neuron(str(swc_path))
 
     ann = collection.properties["annotations"]
-    print(f"\n  MuDM annotations created:")
+    print("\n  MuDM annotations created:")
     print(f"    Soma markers:     {ann['soma_markers']}")
     print(f"    Branch points:    {ann['branch_points']}")
     print(f"    Terminals:        {ann['terminals']}")
@@ -359,7 +360,7 @@ def main() -> None:
     # Write Point/LineString annotations via orchestrator
     result = to_neuroglancer(collection, output_dir)
 
-    print(f"\n  Neuroglancer output:")
+    print("\n  Neuroglancer output:")
     print(f"    skeletons: {skel_dir}/")
     for key, path in result["paths"].items():
         print(f"    {key}: {path}/")
@@ -393,8 +394,8 @@ def main() -> None:
     handler = functools.partial(CORSHandler, directory=str(output_dir))
     server = HTTPServer(("", args.port), handler)
     print(f"  Server running on http://localhost:{args.port}")
-    print(f"  Copy the Viewer URL above into your browser.")
-    print(f"  Press Ctrl+C to stop.\n")
+    print("  Copy the Viewer URL above into your browser.")
+    print("  Press Ctrl+C to stop.\n")
 
     try:
         server.serve_forever()

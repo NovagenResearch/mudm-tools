@@ -11,8 +11,7 @@ from mudm_tools.polygen import assign_meta_types_and_values, generate_polygons
 
 @pytest.fixture
 def tempfolder():
-    tempfolder = "tmp{}".format("".join(
-        random.choices(string.ascii_lowercase, k=6)))
+    tempfolder = "tmp{}".format("".join(random.choices(string.ascii_lowercase, k=6)))
     os.makedirs(tempfolder, exist_ok=True)
     yield tempfolder
     shutil.rmtree(tempfolder, ignore_errors=True)
@@ -23,16 +22,15 @@ def test_tilecut(tempfolder):
     # Create folder with random name, a string of 6 characters
     microjson_data_path = f"{tempfolder}/polygons.json"
     # Parameters
-    GRID_SIZE = 50000      # Total size of the grid
-    CELL_SIZE = 500        # Size of each cell
-    MIN_VERTICES = 5       # Minimum number of vertices per polygon
-    MAX_VERTICES = 32      # Maximum number of vertices per polygon
-    N_VARIANTS = 40         # Number of possible values for each meta key
-    N_KEYS = 10            # Number of meta keys
+    GRID_SIZE = 50000  # Total size of the grid
+    CELL_SIZE = 500  # Size of each cell
+    MIN_VERTICES = 5  # Minimum number of vertices per polygon
+    MAX_VERTICES = 32  # Maximum number of vertices per polygon
+    N_VARIANTS = 40  # Number of possible values for each meta key
+    N_KEYS = 10  # Number of meta keys
 
     # Assign data types and generate 4 values for each meta key
-    meta_types, meta_values_options = assign_meta_types_and_values(
-        N_KEYS, N_VARIANTS)
+    meta_types, meta_values_options = assign_meta_types_and_values(N_KEYS, N_VARIANTS)
 
     # Generate the feature collection
     feature_collection = generate_polygons(
@@ -42,7 +40,7 @@ def test_tilecut(tempfolder):
         MAX_VERTICES,
         meta_types,
         meta_values_options,
-        microjson_data_path
+        microjson_data_path,
     )
 
     # Check that the feature collection was created
@@ -67,9 +65,7 @@ def test_tilecut(tempfolder):
     maxbounds[0] = 0
     maxbounds[1] = 0
 
-    center = [0,
-              (maxbounds[0] + maxbounds[2]) / 2,
-              (maxbounds[1] + maxbounds[3]) / 2]
+    center = [0, (maxbounds[0] + maxbounds[2]) / 2, (maxbounds[1] + maxbounds[3]) / 2]
 
     tileobj = mj.tilemodel.TileModel(
         tilejson="3.0.0",

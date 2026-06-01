@@ -82,9 +82,7 @@ class TileReader(TileHandler):
                 if not os.path.exists(str(tile_file)):
                     continue
 
-                with open(
-                    str(tile_file), "rb" if str(tile_file).endswith(".pbf") else "r"
-                ) as f:
+                with open(str(tile_file), "rb" if str(tile_file).endswith(".pbf") else "r") as f:
                     tile_data = f.read()
 
                 # decode the tile data
@@ -136,9 +134,7 @@ class TileReader(TileHandler):
                                     geom["coordinates"] = [
                                         [
                                             [
-                                                project(
-                                                    coord, xstart, ystart, xstop, ystop
-                                                )
+                                                project(coord, xstart, ystart, xstop, ystop)
                                                 for coord in ring
                                             ]
                                             for ring in poly
