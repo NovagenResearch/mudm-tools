@@ -12,3 +12,4 @@ rust/target/
 data
 .DS_Store
 uv.lock
+rust/vendor/draco-oxide/target/
