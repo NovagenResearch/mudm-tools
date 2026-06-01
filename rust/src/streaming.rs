@@ -1909,8 +1909,33 @@ fn redistribute_fragments_to_buckets(
 static PEAK_RESIDENT_BYTES: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+/// WS-B test probe: the bucket count `k` used by the last
+/// `generate_neuroglancer_multilod` feature-bucketed read. `k == 1` means the
+/// whole corpus fit one bucket (whole-corpus-equivalent path); `k > 1` proves
+/// the bounded bucketing actually split the corpus. Process-global, one store
+/// per generate call — no effect on output bytes.
+static NG_LAST_BUCKET_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// WS-B test probe (mirrors the WS-C `PEAK_RESIDENT_BYTES` pattern for the NG
+/// path): the maximum *actual* resident decoded-fragment bytes held in any
+/// single bucket's RETAINED feature map during `generate_neuroglancer_multilod`
+/// — i.e. the Σ `Fragment3D::estimate_bytes` over the features kept for that
+/// bucket (`hash(fid) % k == b`), taken as a `fetch_max` across the `k`
+/// buckets. With the bounded filter-during-decode fix this scales ≈ corpus / k,
+/// so a tiny ceiling (large k) yields a substantially smaller peak than a huge
+/// ceiling (k == 1). Read/reset from Python via `_get_ng_peak_resident_bytes` /
+/// `_reset_ng_peak_resident_bytes`. Process-global; one `fetch_max` per bucket,
+/// NOT per fragment — no effect on output bytes.
+static NG_PEAK_RESIDENT_BYTES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 fn observe_resident_bytes(n: usize) {
     PEAK_RESIDENT_BYTES.fetch_max(n, Ordering::Relaxed);
+}
+
+fn observe_ng_resident_bytes(n: usize) {
+    NG_PEAK_RESIDENT_BYTES.fetch_max(n, Ordering::Relaxed);
 }
 
 /// Memory-adaptive pipeline: per-zoom batched read → group → simplify → encode.
@@ -3934,6 +3959,21 @@ impl StreamingTileGenerator {
         self.max_memory_bytes
     }
 
+    /// WS-B test probe: the fragment temp dir, so tests can inject a corrupt
+    /// shard before `generate_neuroglancer_multilod` reads it (to exercise the
+    /// non-fatal parse-error → ErrorCollector folding).
+    fn _frag_dir(&self) -> String {
+        self.frag_dir.to_string_lossy().into_owned()
+    }
+
+    /// WS-B test probe: the bucket count `k` used by the last
+    /// `generate_neuroglancer_multilod` call. `k > 1` proves the bounded
+    /// feature-bucketed read actually split the corpus (e.g. under a tiny
+    /// `_set_max_memory`); `k == 1` is the whole-corpus-equivalent path.
+    fn _get_ng_bucket_count(&self) -> usize {
+        NG_LAST_BUCKET_COUNT.load(Ordering::Relaxed)
+    }
+
     /// WS-C C.2 test probe: read the maximum *actual* resident decoded-fragment
     /// bytes observed in any single GLB batch during the last
     /// `read_group_simplify_encode` (after re-split). Process-global; pair with
@@ -3948,6 +3988,25 @@ impl StreamingTileGenerator {
     /// before the `generate_3dtiles` invocation whose peak is being measured.
     fn _reset_peak_resident_bytes(&self) {
         PEAK_RESIDENT_BYTES.store(0, Ordering::Relaxed);
+    }
+
+    /// WS-B test probe: read the maximum *actual* resident decoded-fragment
+    /// bytes held in any single bucket's RETAINED feature map during the last
+    /// `generate_neuroglancer_multilod` (Σ `Fragment3D::estimate_bytes` over the
+    /// kept features, `fetch_max` across buckets). With the bounded
+    /// filter-during-decode fix this scales ≈ corpus / k, so a tiny ceiling
+    /// (large k) yields a substantially smaller peak than a huge ceiling
+    /// (k == 1). Pair with `_reset_ng_peak_resident_bytes` immediately before
+    /// the `generate_neuroglancer_multilod` call under test.
+    fn _get_ng_peak_resident_bytes(&self) -> usize {
+        NG_PEAK_RESIDENT_BYTES.load(Ordering::Relaxed)
+    }
+
+    /// WS-B test probe: reset the NG peak-resident counter to 0. Call right
+    /// before the `generate_neuroglancer_multilod` invocation whose peak is
+    /// being measured.
+    fn _reset_ng_peak_resident_bytes(&self) {
+        NG_PEAK_RESIDENT_BYTES.store(0, Ordering::Relaxed);
     }
 
     /// Initialize the streaming Parquet iterator.
@@ -5279,11 +5338,10 @@ impl StreamingTileGenerator {
         vertex_quantization_bits: u8,
         max_memory_bytes: usize,
     ) -> PyResult<u32> {
-        // Resolve the per-path memory ceiling (explicit arg wins, else the
-        // generator's resolved ceiling). UNUSED until WS-B wires the bounded
-        // feature-bucketed read; plumbed now so WS-B lands atomically. Behavior
-        // is identical to before — the read path is still whole-corpus here.
-        let _max_memory_bytes = if max_memory_bytes > 0 {
+        // WS-B: resolve the per-path memory ceiling (explicit arg wins, else the
+        // generator's resolved ceiling). Now USED to derive the feature-bucket
+        // count `k` so the read stays bounded to one bucket's decoded bytes.
+        let max_memory_bytes = if max_memory_bytes > 0 {
             detect_max_memory_bytes(max_memory_bytes)
         } else {
             self.max_memory_bytes
@@ -5295,11 +5353,45 @@ impl StreamingTileGenerator {
                 .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
         }
 
-        // Read all fragments grouped by feature_id
-        let mut reader = Fragment3DReader::open_dir(&self.frag_dir)
-            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
-        let feature_groups = reader.read_all_grouped_by_feature()
-            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
+        // WS-B: discover the sorted *.mjf shard paths (mirroring `open_dir`'s
+        // discovery, but kept as an explicit list we hand to `from_paths` per
+        // bucket). We do NOT open a whole-corpus reader.
+        let shard_paths: Vec<PathBuf> = {
+            let mut paths: Vec<PathBuf> = std::fs::read_dir(&self.frag_dir)
+                .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?
+                .filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .filter(|p| p.extension().map_or(false, |ext| ext == "mjf"))
+                .collect();
+            paths.sort(); // deterministic
+            paths
+        };
+
+        // WS-B: derive the bucket count `k` from the configured ceiling. Each
+        // bucket re-reads ALL shards (shards are unlabeled w.r.t. feature
+        // distribution) but keeps ONLY the features whose `hash(fid) % k == b`,
+        // so per-bucket resident bytes ≈ corpus_bytes / k. We fold the ZSTD
+        // decode expansion (`*3`, matching the Parquet chunker at the
+        // `len*3` estimate) into the residency estimate. `k` is capped at the
+        // shard-times-feature granularity implicitly by the loop; a huge ceiling
+        // yields k==1 (whole-corpus-equivalent, byte-identical path).
+        let est_resident_bytes: usize = shard_paths
+            .iter()
+            .map(|p| std::fs::metadata(p).map(|m| m.len() as usize * 3).unwrap_or(0))
+            .sum();
+        let budget = max_memory_bytes.max(1);
+        // ceil(est / budget), at least 1. Cap k so a pathologically tiny ceiling
+        // does not spin an unbounded number of full re-read passes (mirrors the
+        // Parquet `read_k <= 16` spirit, but here it bounds re-read PASSES).
+        let k = {
+            let raw = est_resident_bytes.div_ceil(budget).max(1);
+            raw.min(256)
+        };
+        NG_LAST_BUCKET_COUNT.store(k, Ordering::Relaxed);
+        // WS-B: reset the per-bucket peak-resident probe at the START of the
+        // generate (mirrors WS-C's reset-before-measure). The bucket loop below
+        // observes the RETAINED bucket map's bytes via `observe_ng_resident_bytes`.
+        NG_PEAK_RESIDENT_BYTES.store(0, Ordering::Relaxed);
 
         let (xmin, ymin, zmin, xmax, ymax, zmax) = world_bounds;
         let dx = if xmax != xmin { xmax - xmin } else { 1.0 };
@@ -5311,8 +5403,16 @@ impl StreamingTileGenerator {
         let qmax = ((1u32 << qbits) - 1) as f64;
         let out_dir = PathBuf::from(output_dir);
         let tags_ref = &self.tags_registry;
+        let io_threads = self.io_threads;
 
-        let features: Vec<(u32, Vec<Fragment3D>)> = feature_groups.into_iter().collect();
+        // WS-D: error-log facility. Streams to `run_dir` when set; in-memory only
+        // otherwise (no new file / no behavior change for existing callers).
+        // Built before the GIL is released so a dir-open failure is a normal
+        // early PyErr.
+        let collector = ErrorCollector::new(self.run_dir.clone())
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
+        let collector_ref = &collector;
+        let phase_start = std::time::Instant::now();
 
         // chunk_shape = world extent / 2^max_zoom (finest tile size in world coords)
         let n_tiles = (1u32 << max_zoom) as f64;
@@ -5341,8 +5441,99 @@ impl StreamingTileGenerator {
             let info_str = serde_json::to_string_pretty(&info).unwrap_or_default();
             std::fs::write(out_dir.join("info"), info_str).ok();
 
-            // Process each feature (segment) in parallel
-            let segment_count: u32 = features.par_iter()
+            // WS-B feature-bucketed bounded read + sever the segment_properties
+            // re-borrow. For each bucket b in 0..k we re-read ALL shards in
+            // parallel (non-fatal: per-shard parse errors are folded into the
+            // ErrorCollector, not aborted), keep ONLY the features with
+            // `hash(fid) % k == b` (per-feature completeness — a feature is never
+            // split across buckets), encode+write each, then DROP the bucket map
+            // before the next bucket. Peak ≈ one bucket's decoded bytes, not the
+            // whole corpus.
+            //
+            // We accumulate ONLY a lightweight set of every feature_id seen
+            // across all buckets (geometry-independent) so segment_properties can
+            // be built in a SEPARATE final pass from `tags_ref` — the heavy
+            // per-feature geometry is dropped per bucket. The feature-bucket
+            // partition is now applied INSIDE the reader's decode loop (see the
+            // `(b, k)` args below), so no DefaultHasher is needed here.
+            let mut seen_fids: std::collections::BTreeSet<u32> =
+                std::collections::BTreeSet::new();
+            let mut segment_count: u32 = 0;
+
+            for b in 0..k {
+                let reader = Fragment3DReader::from_paths(shard_paths.clone());
+                // WS-B: pass (b, k) so the reader applies the feature-bucket
+                // filter DURING the per-shard decode loop — only features with
+                // `hash(fid) % k == b` are RETAINED, the rest are dropped before
+                // they ever enter the merged map. `k == 1` is the no-filter
+                // sentinel (whole-corpus-equivalent, byte-identical path). The
+                // returned `bucket_map` is therefore ALREADY this bucket's
+                // features — no post-filter pass is needed.
+                let (bucket_map, errs) = match reader
+                    .read_all_grouped_by_feature_parallel_collect_errors(io_threads, true, b, k)
+                {
+                    Ok(pair) => pair,
+                    Err(e) => {
+                        // Pool-build failure (not a per-shard parse error) — record
+                        // once and skip this bucket.
+                        collector_ref.record_failure(
+                            "neuroglancer",
+                            Severity::NonFatal,
+                            "<bucket read>",
+                            "read",
+                            &e.to_string(),
+                        );
+                        continue;
+                    }
+                };
+
+                // WS-B peak probe: measure the ACTUAL resident decoded-fragment
+                // bytes of the map returned by the reader for this bucket and
+                // take the max across buckets. With the filter-during-decode fix
+                // this map is ALREADY restricted to `hash(fid) % k == b`, so it
+                // scales ≈ corpus / k.
+                let bucket_resident: usize = bucket_map
+                    .values()
+                    .flat_map(|frags| frags.iter())
+                    .map(|f| f.estimate_bytes())
+                    .sum();
+                observe_ng_resident_bytes(bucket_resident);
+
+                // Fold per-shard parse errors into the ErrorCollector ONCE.
+                // Every bucket reads the identical shard set, so the error set is
+                // identical each pass; report only on bucket 0 to avoid k-fold
+                // double-reporting.
+                if b == 0 {
+                    for msg in &errs {
+                        // Split "<path>: <detail>" back into item / message.
+                        let (item, detail) = match msg.split_once(": ") {
+                            Some((p, d)) => (p, d),
+                            None => (msg.as_str(), msg.as_str()),
+                        };
+                        collector_ref.record_failure(
+                            "neuroglancer",
+                            Severity::NonFatal,
+                            item,
+                            "parse",
+                            detail,
+                        );
+                    }
+                }
+
+                // WS-B: `bucket_map` is ALREADY restricted to this bucket's
+                // features (the filter was applied during decode), so we no
+                // longer post-filter — we just materialize it for the parallel
+                // encode. Per-feature completeness still holds: a feature's
+                // fragments are merged across all shards within the one bucket
+                // that owns its hash. This is what bounds peak RSS to ≈ 1/k.
+                let bucket_features: Vec<(u32, Vec<Fragment3D>)> =
+                    bucket_map.into_iter().collect();
+
+                for (fid, _) in &bucket_features {
+                    seen_fids.insert(*fid);
+                }
+
+                let bucket_count: u32 = bucket_features.par_iter()
                 .map(|(feature_id, frags)| {
                     // Group fragments by tile_z → BTreeMap for ordered iteration
                     let mut by_zoom: std::collections::BTreeMap<u32, Vec<&Fragment3D>> = std::collections::BTreeMap::new();
@@ -5478,15 +5669,30 @@ impl StreamingTileGenerator {
                                 quant_positions.push(qz);
                             }
 
-                            // Encode with Draco
-                            match crate::encoder_draco::encode_draco_mesh(&quant_positions, &indices) {
+                            // Encode with Draco. Thread the SAME vertex_quantization_bits
+                            // used to pre-quantize above (`qbits`) into the encoder so the
+                            // lossless grid-identity transform spans [0, 2^qbits - 1].
+                            match crate::encoder_draco::encode_draco_mesh(&quant_positions, &indices, qbits) {
                                 Ok(draco_bytes) => {
                                     frag_positions.push([*tx, *ty, *td]);
                                     frag_offsets.push(draco_bytes.len() as u32);
                                     all_draco_data.extend_from_slice(&draco_bytes);
                                 }
-                                Err(_) => {
-                                    // Skip this fragment on encoding error
+                                Err(e) => {
+                                    // WS-D: a degenerate/un-encodable tile mesh is a
+                                    // NON-FATAL skip — report it (not silently
+                                    // dropped) and continue. The skip itself does
+                                    // not change healthy-feature geometry bytes.
+                                    collector_ref.record_failure(
+                                        "neuroglancer",
+                                        Severity::NonFatal,
+                                        &format!(
+                                            "feature {} tile ({},{},{})",
+                                            feature_id, tx, ty, td
+                                        ),
+                                        "draco_encode",
+                                        &e,
+                                    );
                                 }
                             }
                         }
@@ -5550,7 +5756,18 @@ impl StreamingTileGenerator {
                 })
                 .sum::<u32>();
 
-            // Write segment_properties/info
+                segment_count += bucket_count;
+                // `bucket_features` (the heavy per-feature geometry for THIS
+                // bucket) is dropped here at the end of the loop iteration,
+                // before the next bucket is read — this is what bounds peak RSS.
+            }
+
+            // WS-B: build segment_properties in a SEPARATE final pass over the
+            // lightweight `seen_fids` (the union of every feature_id observed
+            // across all buckets), sorted by fid, preserving the EXACT first-seen
+            // (in fid-sorted order) column order the whole-corpus path produced.
+            // Geometry is already dropped; only `tags_ref` (geometry-independent)
+            // is read here.
             let sp_dir = out_dir.join("segment_properties");
             std::fs::create_dir_all(&sp_dir).ok();
 
@@ -5559,10 +5776,11 @@ impl StreamingTileGenerator {
             let mut seen_keys: AHashMap<String, usize> = AHashMap::new();
             let mut columns: Vec<Vec<serde_json::Value>> = Vec::new();
 
-            let mut sorted_features: Vec<&(u32, Vec<Fragment3D>)> = features.iter().collect();
-            sorted_features.sort_by_key(|(fid, _)| *fid);
+            // `seen_fids` is a BTreeSet → already fid-sorted, matching the prior
+            // `sorted_features.sort_by_key(fid)` order exactly.
+            let sorted_fids: Vec<u32> = seen_fids.iter().copied().collect();
 
-            for (fid, _) in &sorted_features {
+            for fid in &sorted_fids {
                 ids.push(fid.to_string());
                 if let Some(tags) = tags_ref.get(fid) {
                     for (key, _) in tags {
@@ -5576,28 +5794,73 @@ impl StreamingTileGenerator {
                 }
             }
 
-            for (fid, _) in &sorted_features {
+            // Track, per column, whether EVERY non-empty value is numeric (and
+            // whether all are integers) so we can emit `type:"number"` +
+            // `data_type` (T4 / B3). Mirrors `properties_writer.py:60-74`:
+            // all-int → uint32, any-float → float32, else → label.
+            let mut col_all_numeric: Vec<bool> = vec![true; all_keys.len()];
+            let mut col_all_int: Vec<bool> = vec![true; all_keys.len()];
+            let mut col_any_value: Vec<bool> = vec![false; all_keys.len()];
+
+            for fid in &sorted_fids {
                 let tags = tags_ref.get(fid);
                 for (ki, key) in all_keys.iter().enumerate() {
-                    let val = tags.and_then(|t| {
-                        t.iter().find(|(k, _)| k == key).map(|(_, v)| match v {
-                            TagValue::Str(s) => serde_json::json!(s),
-                            TagValue::Int(i) => serde_json::json!(i),
-                            TagValue::Float(f) => serde_json::json!(f),
-                            TagValue::Bool(b) => serde_json::json!(b),
-                        })
-                    }).unwrap_or(serde_json::json!(""));
+                    let found = tags.and_then(|t| {
+                        t.iter().find(|(k, _)| k == key).map(|(_, v)| v)
+                    });
+                    let val = match found {
+                        Some(TagValue::Str(s)) => {
+                            col_all_numeric[ki] = false;
+                            col_any_value[ki] = true;
+                            serde_json::json!(s)
+                        }
+                        Some(TagValue::Int(i)) => {
+                            col_any_value[ki] = true;
+                            serde_json::json!(i)
+                        }
+                        Some(TagValue::Float(f)) => {
+                            col_all_int[ki] = false;
+                            col_any_value[ki] = true;
+                            serde_json::json!(f)
+                        }
+                        Some(TagValue::Bool(b)) => {
+                            // bool is non-numeric for NG segment props.
+                            col_all_numeric[ki] = false;
+                            col_any_value[ki] = true;
+                            serde_json::json!(b)
+                        }
+                        None => {
+                            // Missing value: empty string sentinel, matching the
+                            // prior behavior AND `properties_writer.py` (which
+                            // ignores `""` when inferring the column type).
+                            serde_json::json!("")
+                        }
+                    };
                     columns[ki].push(val);
                 }
             }
 
             let mut properties = Vec::new();
             for (ki, key) in all_keys.iter().enumerate() {
-                properties.push(serde_json::json!({
-                    "id": key,
-                    "type": "label",
-                    "values": columns[ki]
-                }));
+                // A column is numeric only if it has at least one value and every
+                // non-empty value is numeric (matches the Python `all(...)` over
+                // non-`""` values, which is vacuously true but we additionally
+                // require a present value to avoid labeling an empty column).
+                if col_all_numeric[ki] && col_any_value[ki] {
+                    let data_type = if col_all_int[ki] { "uint32" } else { "float32" };
+                    properties.push(serde_json::json!({
+                        "id": key,
+                        "type": "number",
+                        "data_type": data_type,
+                        "values": columns[ki]
+                    }));
+                } else {
+                    properties.push(serde_json::json!({
+                        "id": key,
+                        "type": "label",
+                        "values": columns[ki]
+                    }));
+                }
             }
 
             let sp_info = serde_json::json!({
@@ -5612,6 +5875,11 @@ impl StreamingTileGenerator {
 
             segment_count
         });
+
+        // WS-D: honest summary (no-op when run_dir is None).
+        collector
+            .finish_summary("neuroglancer", phase_start.elapsed().as_secs_f64())
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
 
         self.tiles_written = count;
         Ok(count)

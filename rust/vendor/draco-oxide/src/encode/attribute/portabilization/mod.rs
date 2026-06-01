@@ -112,6 +112,14 @@ impl PortabilizationType {
 pub struct Config {
     pub type_: PortabilizationType,
     pub quantization_bits: u8,
+    /// mudm-tools fork patch (A1): grid-identity override for the lossless NG
+    /// path. `None` = upstream data-bbox behavior (unchanged — every existing
+    /// arm defaults to this, so the f32/GLB path is byte-identical BY
+    /// CONSTRUCTION). `Some(())` = make `QuantizationCoordinateWise` the IDENTITY
+    /// over the NG integer grid `[0, 2^quantization_bits - 1]` with `min = 0`, so
+    /// encode/dequant is v->v EXACT. Only the u32 NG caller ever sets this (via
+    /// `encode::Config::with_ng_lossless`).
+    pub grid_identity: Option<()>,
 }
 
 impl ConfigType for Config {
@@ -119,6 +127,7 @@ impl ConfigType for Config {
         Config {
             type_: PortabilizationType::QuantizationCoordinateWise,
             quantization_bits: 11,
+            grid_identity: None,
         }
     }
 }
@@ -129,14 +138,17 @@ impl Config {
             AttributeType::Normal => Config {
                 type_: PortabilizationType::OctahedralQuantization,
                 quantization_bits: 8,
+                grid_identity: None,
             },
             AttributeType::TextureCoordinate => Config {
                 type_: PortabilizationType::QuantizationCoordinateWise,
                 quantization_bits: 10,
+                grid_identity: None,
             },
             AttributeType::Custom => Config {
                 type_: PortabilizationType::ToBits,
                 quantization_bits: 11, // default quantization bits (not used for ToBits)
+                grid_identity: None,
             },
             _ => Self::default(),
         }

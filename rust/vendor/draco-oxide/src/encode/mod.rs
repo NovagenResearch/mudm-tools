@@ -7,6 +7,7 @@ pub(crate) mod metadata;
 use crate::core::bit_coder::ByteWriter;
 use crate::core::mesh::Mesh;
 use crate::core::shared::ConfigType;
+use crate::encode::attribute::portabilization::PortabilizationType;
 use crate::{debug_write, shared};
 use thiserror::Error;
 
@@ -29,6 +30,24 @@ pub struct Config {
     geometry_type: header::EncodedGeometryType,
     encoder_method: shared::header::EncoderMethod,
     metdata: bool,
+    /// mudm-tools fork patch (T2b): optional per-encode override of the
+    /// portabilization used for the Position attribute. `None` keeps the
+    /// upstream default (`PortabilizationType::default_for` => the embedded
+    /// QuantizationCoordinateWise quantization transform). `Some(ToBits)` stores
+    /// pre-quantized integer positions LOSSLESSLY, which the Neuroglancer
+    /// multilod_draco format requires (it forbids Draco's built-in quantization).
+    /// The attribute TYPE stays `Position` (spec-correct); only the
+    /// portabilization id written to the stream + the actual portabilization
+    /// switch. Defaults to `None` so the GLB/f32 path is byte-unchanged.
+    pub position_portabilization: Option<PortabilizationType>,
+    /// mudm-tools fork patch (A1): optional per-encode override of the Position
+    /// quantization. `Some((qbits, grid_identity))` forces the Position
+    /// QuantizationCoordinateWise transform to use `qbits` bits and, when
+    /// `grid_identity` is true, to be the IDENTITY over the NG integer grid
+    /// `[0, 2^qbits - 1]` (lossless v->v). `None` keeps the upstream data-bbox
+    /// behavior (default quantization_bits=11). Only the u32 NG caller sets this;
+    /// `None` keeps the GLB/f32 path byte-identical.
+    pub position_quantization: Option<(u8, bool)>,
 }
 
 impl ConfigType for Config {
@@ -39,7 +58,36 @@ impl ConfigType for Config {
             geometry_type: header::EncodedGeometryType::TrianglarMesh,
             encoder_method: shared::header::EncoderMethod::Edgebreaker,
             metdata: false,
+            position_portabilization: None,
+            position_quantization: None,
         }
+    }
+}
+
+impl Config {
+    /// mudm-tools fork patch (T2b): builder for the lossless NG path. Returns a
+    /// `Config` identical to `default()` except the Position attribute uses
+    /// `ToBits` (lossless integer storage) instead of the quantizing default.
+    pub fn with_position_to_bits() -> Self {
+        let mut cfg = <Self as ConfigType>::default();
+        cfg.position_portabilization = Some(PortabilizationType::ToBits);
+        cfg
+    }
+
+    /// mudm-tools fork patch (A1): builder for the LOSSLESS, libdraco-conformant
+    /// NG path. Keeps `QuantizationCoordinateWise` (portabilization id=2, which
+    /// libdraco decodes today) but forces its quantization transform to be the
+    /// IDENTITY over the NG integer grid `[0, 2^qbits - 1]` (min=0,
+    /// range=2^qbits-1, bits=qbits). Then encode/dequant is v->v EXACT.
+    ///
+    /// `qbits` MUST equal the `vertex_quantization_bits` the NG caller
+    /// pre-quantized the positions with (so the grid range matches the
+    /// pre-quantization). The f32/GLB path keeps `Config::default()` untouched.
+    pub fn with_ng_lossless(qbits: u8) -> Self {
+        let mut cfg = <Self as ConfigType>::default();
+        cfg.position_portabilization = Some(PortabilizationType::QuantizationCoordinateWise);
+        cfg.position_quantization = Some((qbits, true));
+        cfg
     }
 }
 

@@ -51,6 +51,8 @@ fn _rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     // Draco encoder
     m.add_function(wrap_pyfunction!(encoder_draco::draco_encode_mesh, m)?)?;
+    // Test-only: direct NG (u32) Draco path for lossless round-trip tests.
+    m.add_function(wrap_pyfunction!(encoder_draco::draco_encode_ng_u32, m)?)?;
 
     // 2D tiling pipeline
     m.add_class::<projector2d::CartesianProjector2D>()?;

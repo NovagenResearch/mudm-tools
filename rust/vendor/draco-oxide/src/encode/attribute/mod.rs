@@ -7,8 +7,21 @@ use crate::encode::connectivity::ConnectivityEncoderOutput;
 #[cfg(feature = "evaluation")]
 use crate::eval;
 
-use crate::prelude::{Attribute, ByteWriter, ConfigType};
+use crate::prelude::{Attribute, AttributeType, ByteWriter, ConfigType};
 use crate::shared::connectivity::edgebreaker::TraversalType;
+
+/// mudm-tools fork patch (T2b): the effective portabilization for an attribute,
+/// applying the optional Position override carried on the top-level encode
+/// `Config`. Non-Position attributes are unaffected; if no override is set the
+/// upstream `PortabilizationType::default_for` is used (byte-unchanged).
+fn effective_portabilization(ty: AttributeType, cfg: &super::Config) -> PortabilizationType {
+    if ty == AttributeType::Position {
+        if let Some(p) = cfg.position_portabilization {
+            return p;
+        }
+    }
+    PortabilizationType::default_for(ty)
+}
 
 pub fn encode_attributes<W>(
     atts: Vec<Attribute>,
@@ -54,7 +67,10 @@ where
         writer.write_u8(att.get_id().as_usize() as u8); // unique id
 
         // write the decoder type.
-        PortabilizationType::default_for(att.get_attribute_type()).write_to(writer);
+        // mudm-tools fork patch (T2b): honor the optional Position portabilization
+        // override so the id written here matches the portabilization actually
+        // applied in AttributeEncoder (otherwise the stream is invalid).
+        effective_portabilization(att.get_attribute_type(), cfg).write_to(writer);
     }
 
     for (i, att) in atts.into_iter().enumerate() {
@@ -69,13 +85,27 @@ where
 
         let ty = att.get_attribute_type();
         let len = att.len();
+        // mudm-tools fork patch (T2b): resolve the effective portabilization for
+        // this attribute (override applies to Position only) and build the
+        // per-attribute Config with it, so the encoder applies exactly what was
+        // declared in the stream header above.
+        let mut enc_cfg = attribute_encoder::Config::default_for(ty, len);
+        enc_cfg.set_position_portabilization(effective_portabilization(ty, cfg));
+        // mudm-tools fork patch (A1): thread the Position quantization override
+        // (qbits + grid-identity flag) down to the portabilization config site.
+        // Applies to Position only; non-Position attributes ignore it.
+        if ty == AttributeType::Position {
+            if let Some((qbits, grid_identity)) = cfg.position_quantization {
+                enc_cfg.set_position_quantization(qbits, grid_identity);
+            }
+        }
         let encoder = attribute_encoder::AttributeEncoder::new(
             att,
             i,
             &parents,
             &conn_out,
             writer,
-            attribute_encoder::Config::default_for(ty, len),
+            enc_cfg,
         );
 
         let port_att = encoder.encode::<true, false>()?;

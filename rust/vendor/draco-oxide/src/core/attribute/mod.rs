@@ -398,67 +398,52 @@ impl Attribute {
     where
         Data: Vector<N>,
     {
-        let mut duplicate_indeces = Vec::new();
-        // start with identity mapping
-        let mut point_to_att_val_map = VecPointIdx::<_>::from(
-            (0..self.len())
-                .map(|i| i.into())
-                .collect::<Vec<AttributeValueIdx>>(),
-        );
-        for (i, val) in self.unique_vals_as_slice::<Data>().iter().enumerate() {
-            if i == self.len() - 1 {
-                // last element, no need to check for duplicates
-                break;
-            }
-            if duplicate_indeces.contains(&i) {
-                // already processed this value
-                continue;
-            }
-            let mut local_duplicate_indeces = Vec::new();
-            for (j, other_val) in self.unique_vals_as_slice::<Data>()[i + 1..]
-                .iter()
-                .enumerate()
-            {
-                if val == other_val {
-                    local_duplicate_indeces.push(i + 1 + j);
-                }
-            }
-            if local_duplicate_indeces.is_empty() {
-                continue;
-            }
-
-            for &duplicate_idx in local_duplicate_indeces.iter() {
-                // update the mapping
-                let duplicate_idx = PointIdx::from(duplicate_idx);
-                point_to_att_val_map[duplicate_idx] = i.into();
-            }
-            duplicate_indeces.extend(local_duplicate_indeces);
+        // O(V) duplicate-value collapse. The previous implementation was O(V^2):
+        // an all-pairs equality scan, a gap-renumber with a nested loop, and a
+        // per-duplicate buffer shift. We instead record, in a single pass, the
+        // compacted rank of each value's FIRST occurrence (a HashMap keyed by the
+        // value's raw bytes); later equal values map to that rank. This reproduces
+        // the old outputs EXACTLY: `buffer` keeps the first occurrences in their
+        // original order, `point_to_att_val_map[p]` is the compacted rank of point
+        // p's canonical value, and the map stays `None` when there are no dups.
+        //
+        // Byte-equality matches the position dedup already used by
+        // MeshBuilder::deduplicate_vertices_based_on_positions (its hash_vertex
+        // hashes raw bytes). It differs from `==` only on -0.0/+0.0 and NaN,
+        // neither of which occurs in our inputs (NG positions are exact
+        // integer-grid f32; GLB coordinates are finite) — held byte-identical by
+        // the Draco rebake guards plus a duplicate-heavy regression mesh.
+        let n = self.buffer.len();
+        if n <= 1 {
+            return;
         }
-        let mut curr_max = 0;
-        for p in 0..point_to_att_val_map.len() {
-            let p = PointIdx::from(p);
-            let val_idx = point_to_att_val_map[p];
-            if usize::from(val_idx) == curr_max + 1 {
-                // no gap
-                curr_max += 1;
-            } else if usize::from(val_idx) > curr_max + 1 {
-                // gap found, update the index
-                curr_max += 1;
-                for q in usize::from(p)..point_to_att_val_map.len() {
-                    let q = PointIdx::from(q);
-                    if point_to_att_val_map[q] == val_idx {
-                        point_to_att_val_map[q] = curr_max.into();
-                    }
+        let val_size = std::mem::size_of::<Data>();
+        let mut first_rank: std::collections::HashMap<Vec<u8>, usize> =
+            std::collections::HashMap::with_capacity(n);
+        let mut pmap: Vec<AttributeValueIdx> = Vec::with_capacity(n);
+        let mut unique_vals: Vec<Data> = Vec::new();
+        let mut had_duplicate = false;
+        {
+            let vals = self.unique_vals_as_slice::<Data>();
+            for v in vals.iter() {
+                // Safety: `v` points to one live `Data` of exactly `val_size` bytes.
+                let key =
+                    unsafe { std::slice::from_raw_parts(v as *const Data as *const u8, val_size) }
+                        .to_vec();
+                if let Some(&rank) = first_rank.get(&key) {
+                    pmap.push(rank.into());
+                    had_duplicate = true;
+                } else {
+                    let rank = unique_vals.len();
+                    first_rank.insert(key, rank);
+                    unique_vals.push(*v);
+                    pmap.push(rank.into());
                 }
             }
         }
-        if !duplicate_indeces.is_empty() {
-            self.point_to_att_val_map = Some(point_to_att_val_map);
-        }
-        // remove the duplicates from the buffer
-        duplicate_indeces.sort_unstable();
-        for i in duplicate_indeces.into_iter().rev() {
-            self.buffer.remove::<Data, N>(i);
+        if had_duplicate {
+            self.buffer = buffer::attribute::AttributeBuffer::from_vec(unique_vals);
+            self.point_to_att_val_map = Some(VecPointIdx::from(pmap));
         }
     }
 
@@ -493,6 +478,67 @@ impl Attribute {
             // no mapping, just remove the value
             let a_idx = AttributeValueIdx::from(usize::from(p_idx));
             self.remove_unique_val::<Data, N>(a_idx);
+        }
+    }
+
+    /// Remove every point `p` where `keep[p]` is false, in a single O(len) pass.
+    /// Byte-identical to calling `remove::<Data, N>(p)` for each removed point in
+    /// descending index order (the loop pattern in MeshBuilder::remap_attribute),
+    /// but without the per-point O(len) buffer/map shifts that made that loop
+    /// O(removed * len). The final (buffer, point_to_att_val_map) is a pure
+    /// function of which points survive — independent of removal order — so it
+    /// matches the repeated-`remove` result exactly. `Data`/`N` must be the
+    /// attribute's real component layout (callers dispatch on get_component_type /
+    /// get_num_components), so the rebuilt buffer keeps the correct component type.
+    pub(crate) fn retain_points<Data, const N: usize>(&mut self, keep: &[bool])
+    where
+        Data: Vector<N>,
+    {
+        debug_assert_eq!(keep.len(), self.len());
+        if let Some(map) = self.point_to_att_val_map.take() {
+            let num_vals = self.buffer.len();
+            // A unique value survives iff some surviving point still references it.
+            let mut referenced = vec![false; num_vals];
+            for (p, &k) in keep.iter().enumerate() {
+                if k {
+                    referenced[usize::from(map[PointIdx::from(p)])] = true;
+                }
+            }
+            // Compact surviving values (original order) + build old->new value idx.
+            let mut new_value_idx = vec![0usize; num_vals];
+            let mut new_vals: Vec<Data> = Vec::new();
+            {
+                let old_vals = self.unique_vals_as_slice::<Data>();
+                let mut next = 0usize;
+                for v in 0..num_vals {
+                    if referenced[v] {
+                        new_value_idx[v] = next;
+                        new_vals.push(old_vals[v]);
+                        next += 1;
+                    }
+                }
+            }
+            // Surviving points, remapped to the compacted value indices.
+            let mut new_map: Vec<AttributeValueIdx> = Vec::with_capacity(new_vals.len());
+            for (p, &k) in keep.iter().enumerate() {
+                if k {
+                    new_map.push(new_value_idx[usize::from(map[PointIdx::from(p)])].into());
+                }
+            }
+            self.buffer = buffer::attribute::AttributeBuffer::from_vec(new_vals);
+            self.point_to_att_val_map = Some(VecPointIdx::from(new_map));
+        } else {
+            // No map: identity (each point owns one buffer value); keep survivors.
+            let mut new_vals: Vec<Data> = Vec::new();
+            {
+                let old_vals = self.unique_vals_as_slice::<Data>();
+                for (p, &k) in keep.iter().enumerate() {
+                    if k {
+                        new_vals.push(old_vals[p]);
+                    }
+                }
+            }
+            self.buffer = buffer::attribute::AttributeBuffer::from_vec(new_vals);
         }
     }
 

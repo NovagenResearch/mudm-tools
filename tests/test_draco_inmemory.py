@@ -6,14 +6,17 @@ round-trip to a direct in-memory `MeshBuilder` build. The contract verified here
   1. DRACO magic + non-empty output (no decoder needed).
   2. Byte-determinism across repeated calls (no decoder needed).
   3. Decode-equivalence: decoded geometry matches the input AS A SET within
-     quantization tolerance, AND triangle/vertex COUNT parity holds
+     quantization tolerance, AND triangle-count + UNIQUE-vertex-count parity holds
      (DracoPy-gated, since the vendored draco-oxide decode module is a stub and
-     DracoPy is the only working decoder).
+     DracoPy is the only working decoder). The raw decoded point count is NOT
+     asserted: libdraco's decode-side corner-table split inflates it (the benign
+     4->8 artifact) on any QuantizationCoordinateWise stream.
 
-The re-bake itself is asserted on the Rust side
-(`encoder_draco::rebake_snapshot::rebake_guard_bytes_unchanged_vs_old_obj_path`):
-empirically the swap is byte-PRESERVING for these position-only meshes because the
-old `load_obj` bridge already used the identical MeshBuilder recipe.
+Note: `draco_encode_mesh` shares the NG u32 encoder path, which (A1) uses the
+lossless grid-identity QuantizationCoordinateWise transform
+(`encode::Config::with_ng_lossless(qbits)`). The re-bake guards live on the Rust
+side: `rebake_guard_f32_byte_identical` (GLB/f32, frozen byte-identical) and
+`rebake_guard_u32_ng_lossless` (NG u32, re-baked for A1).
 """
 
 from __future__ import annotations
@@ -135,37 +138,37 @@ class TestDecodeEquivalence:
         n_in_verts = len(positions) // 3
         n_in_tris = len(indices) // 3
 
-        # COUNT parity (mandatory): this clean tetra has no coincident vertices
-        # and no degenerate faces, so build()'s dedup/degenerate-filter must NOT
-        # drop anything.
+        # FACE-count parity (mandatory): this clean tetra has no coincident
+        # vertices and no degenerate faces, so build()'s dedup/degenerate-filter
+        # must NOT drop any triangle.
         assert df.shape[0] == n_in_tris, (
             f"triangle count changed: in={n_in_tris} out={df.shape[0]}"
         )
-        assert dv.shape[0] == n_in_verts, (
-            f"vertex count changed: in={n_in_verts} out={dv.shape[0]}"
+        # UNIQUE-decoded-vertex-count parity (NOT raw point count): libdraco's
+        # decode-side attribute-corner-table split inflates the reported point
+        # count (the benign 4->8 artifact, present on ANY QuantizationCoordinateWise
+        # stream that decodes — independent of the data-bbox vs grid-identity
+        # transform). Deduplicate before comparing.
+        n_unique_out = len(set(map(tuple, np.round(dv).tolist())))
+        assert n_unique_out == n_in_verts, (
+            f"unique vertex count changed: in={n_in_verts} out={n_unique_out} "
+            f"(raw out={dv.shape[0]})"
         )
 
-        # SET equivalence within quantization tolerance. Vertex order may permute,
-        # so compare as a nearest-neighbour set, not positionally. Decode returns
-        # de-quantized world coords; compare against the encoder's quantized lattice
-        # re-expanded to world space via the same bbox.
+        # SET equivalence — EXACT. A1: the encoder pre-quantizes the world coords
+        # to the integer grid [0, 2^qbits - 1] (the encoder's `_quantize` mirror),
+        # then stores them under the LOSSLESS grid-identity QuantizationCoordinateWise
+        # transform. So Draco/DracoPy decodes back the EXACT grid integers (the
+        # viewer, not Draco, re-expands them to world space via the info transform).
+        # Compare the unique decoded position SET against the grid integers with
+        # zero tolerance.
         in_q = self._quantize(positions, qbits)
-        p = np.asarray(positions, dtype=np.float64).reshape(-1, 3)
-        mins = p.min(axis=0)
-        maxs = p.max(axis=0)
-        rng = maxs - mins
-        qmax = float((1 << qbits) - 1)
-        expected_world = mins + in_q / qmax * rng  # de-quantize back to world
-        # tolerance = one quantization step on the largest axis
-        step = float(np.max(rng)) / qmax
-        tol = step * 4.0 + 1e-4
-
-        for ev in expected_world:
-            dists = np.linalg.norm(dv - ev, axis=1)
-            assert dists.min() <= tol, (
-                f"input vertex {ev} has no decoded match within tol={tol} "
-                f"(nearest={dists.min()})"
-            )
+        in_set = np.array(sorted(set(map(tuple, in_q.tolist()))))
+        out_set = np.array(sorted(set(map(tuple, np.round(dv).tolist()))))
+        assert np.allclose(dv, np.round(dv), atol=0.0), (
+            "decoded positions are not exact integers (lossless transform broken)"
+        )
+        np.testing.assert_array_equal(out_set, in_set)
 
     def test_count_parity_large_mesh(self):
         pytest.importorskip("DracoPy")

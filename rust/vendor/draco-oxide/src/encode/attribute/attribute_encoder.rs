@@ -113,6 +113,14 @@ impl GroupConfig {
 pub struct Config {
     group_cfgs: Vec<GroupConfig>,
     rans_encoding: bool,
+    /// mudm-tools fork patch (T2b): when set, overrides the portabilization used
+    /// for this attribute (only ever set for Position by the caller). `None`
+    /// keeps the upstream `default_for(attribute_type)` behavior.
+    position_portabilization: Option<portabilization::PortabilizationType>,
+    /// mudm-tools fork patch (A1): when set, overrides the Position quantization
+    /// `(qbits, grid_identity)` so the portabilization Config uses the NG grid.
+    /// `None` keeps the upstream default quantization bits/data-bbox behavior.
+    position_quantization: Option<(u8, bool)>,
 }
 
 // ToDo: THIS IMPLEMENTATION IS NOT FINAL
@@ -121,6 +129,8 @@ impl ConfigType for Config {
         Self {
             group_cfgs: Vec::new(),
             rans_encoding: true,
+            position_portabilization: None,
+            position_quantization: None,
         }
     }
 }
@@ -130,7 +140,22 @@ impl Config {
         Self {
             group_cfgs: vec![GroupConfig::default_for(att_ty, size)],
             rans_encoding: true,
+            position_portabilization: None,
+            position_quantization: None,
         }
+    }
+
+    /// mudm-tools fork patch (T2b): record the resolved portabilization for this
+    /// attribute so `encode_impl_edgebreaker` applies it instead of the default.
+    pub fn set_position_portabilization(&mut self, p: portabilization::PortabilizationType) {
+        self.position_portabilization = Some(p);
+    }
+
+    /// mudm-tools fork patch (A1): record the resolved Position quantization
+    /// override `(qbits, grid_identity)` so `encode_impl_edgebreaker` builds the
+    /// portabilization Config over the NG grid instead of the data bbox.
+    pub fn set_position_quantization(&mut self, qbits: u8, grid_identity: bool) {
+        self.position_quantization = Some((qbits, grid_identity));
     }
 }
 
@@ -285,7 +310,25 @@ where
         NdVector<N, i32>: Vector<N, Component = i32>,
         NdVector<N, f32>: Vector<N, Component = f32> + Portable,
     {
-        let por_cfg = portabilization::Config::default_for(self.att.get_attribute_type());
+        // mudm-tools fork patch (T2b): honor the per-attribute portabilization
+        // override (set for Position on the lossless NG path). Without an
+        // override this is exactly the upstream `default_for(attribute_type)`.
+        let mut por_cfg = match self.cfg.position_portabilization {
+            Some(ty) => {
+                let mut c = portabilization::Config::default_for(self.att.get_attribute_type());
+                c.type_ = ty;
+                c
+            }
+            None => portabilization::Config::default_for(self.att.get_attribute_type()),
+        };
+        // mudm-tools fork patch (A1): apply the Position quantization override so
+        // QuantizationCoordinateWise uses `qbits` over the NG integer grid and,
+        // when grid_identity is set, becomes the IDENTITY (lossless v->v). This
+        // is where qbits starts mattering (the upstream default is bits=11).
+        if let Some((qbits, grid_identity)) = self.cfg.position_quantization {
+            por_cfg.quantization_bits = qbits;
+            por_cfg.grid_identity = if grid_identity { Some(()) } else { None };
+        }
 
         let mut att = Attribute::new(
             Vec::<Data>::new(),

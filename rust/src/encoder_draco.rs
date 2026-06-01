@@ -12,6 +12,16 @@
 use draco_oxide::prelude::*;
 use draco_oxide::encode;
 use draco_oxide::prelude::{AttributeDomain, AttributeId};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+// Aggregate build-vs-encode profiling (MUDM_DRACO_PROFILE). Per-call printing is
+// far too noisy for the NG path (tens of thousands of encodes); instead we
+// accumulate and emit a running split every 2000 calls, so even a killed run
+// shows the stabilized ratio.
+static PROF_ADD_US: AtomicU64 = AtomicU64::new(0);
+static PROF_BUILD_US: AtomicU64 = AtomicU64::new(0);
+static PROF_ENC_US: AtomicU64 = AtomicU64::new(0);
+static PROF_CALLS: AtomicU64 = AtomicU64::new(0);
 
 /// Build a Draco `Mesh` from `NdVector<3,f32>` positions + triangle faces, then
 /// encode it to a byte buffer. Shared by both the u32 and f32 entry points.
@@ -23,13 +33,20 @@ use draco_oxide::prelude::{AttributeDomain, AttributeId};
 fn build_and_encode(
     positions: Vec<NdVector<3, f32>>,
     faces: Vec<[usize; 3]>,
+    config: encode::Config,
 ) -> Result<Vec<u8>, String> {
     // Light profiling: when MUDM_DRACO_PROFILE is set, time build() (dedup +
     // degenerate-filter + remove_unused) vs encode::encode (edgebreaker + rANS)
     // separately. The former temp-OBJ write/parse overhead is gone, so this
     // isolates the remaining build-vs-encode split (informs the skip-dedup call).
     let profile = std::env::var_os("MUDM_DRACO_PROFILE").is_some();
+    let n_tris = faces.len();
+    let n_verts = positions.len();
 
+    // Time attribute creation SEPARATELY from build(): Attribute::from() runs
+    // remove_duplicate_values (an UNCONDITIONAL O(V^2) all-pairs scan) here,
+    // BEFORE build() — so without this split it was untimed and invisible.
+    let t_add = std::time::Instant::now();
     let mut builder = MeshBuilder::new();
     builder.set_connectivity_attribute(faces);
     let _id: AttributeId = builder.add_attribute(
@@ -38,6 +55,7 @@ fn build_and_encode(
         AttributeDomain::Position,
         vec![],
     );
+    let add_us = t_add.elapsed().as_micros();
 
     let t_build = std::time::Instant::now();
     let mesh = builder.build().map_err(|e| format!("MeshBuilder build error: {:?}", e))?;
@@ -45,21 +63,34 @@ fn build_and_encode(
 
     let mut buffer: Vec<u8> = Vec::new();
     let t_enc = std::time::Instant::now();
-    encode::encode(mesh, &mut buffer, encode::Config::default())
+    encode::encode(mesh, &mut buffer, config)
         .map_err(|e| format!("Draco encode error: {:?}", e))?;
     let enc_us = t_enc.elapsed().as_micros();
 
     if profile {
-        let total = (build_us + enc_us).max(1);
-        eprintln!(
-            "MUDM_DRACO_PROFILE build={}us ({:.1}%) encode={}us ({:.1}%) total={}us out={}B",
-            build_us,
-            100.0 * build_us as f64 / total as f64,
-            enc_us,
-            100.0 * enc_us as f64 / total as f64,
-            build_us + enc_us,
-            buffer.len(),
-        );
+        let calls = PROF_CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+        let a = PROF_ADD_US.fetch_add(add_us as u64, Ordering::Relaxed) + add_us as u64;
+        let b = PROF_BUILD_US.fetch_add(build_us as u64, Ordering::Relaxed) + build_us as u64;
+        let e = PROF_ENC_US.fetch_add(enc_us as u64, Ordering::Relaxed) + enc_us as u64;
+        // Flag a pathologically slow SINGLE encode (catches the "stuck on one
+        // mesh" case the aggregate misses) — names the phase + mesh size so we
+        // can tell build()-dedup vs encode()-compression apart immediately.
+        if add_us > 200_000 || build_us > 200_000 || enc_us > 200_000 {
+            eprintln!(
+                "MUDM_DRACO_PROFILE SLOW call#{}: tris={} verts={} add={}ms build={}ms encode={}ms",
+                calls, n_tris, n_verts, add_us / 1000, build_us / 1000, enc_us / 1000,
+            );
+        }
+        if calls % 200 == 0 {
+            let tot = (a + b + e).max(1);
+            eprintln!(
+                "MUDM_DRACO_PROFILE agg: calls={} add={}ms ({:.1}%) build={}ms ({:.1}%) encode={}ms ({:.1}%)",
+                calls,
+                a / 1000, 100.0 * a as f64 / tot as f64,
+                b / 1000, 100.0 * b as f64 / tot as f64,
+                e / 1000, 100.0 * e as f64 / tot as f64,
+            );
+        }
     }
     Ok(buffer)
 }
@@ -68,13 +99,17 @@ fn build_and_encode(
 ///
 /// Arguments:
 /// - `positions`: flat array of pre-quantized position components [x0,y0,z0, x1,y1,z1, ...]
-///   Each value in [0, 2^quantization_bits). Values must be < 2^24 for exact f32 representation.
+///   Each value in [0, 2^qbits). Values must be < 2^24 for exact f32 representation.
 /// - `indices`: triangle indices (length must be multiple of 3)
+/// - `qbits`: the SAME `vertex_quantization_bits` the caller pre-quantized the
+///   positions with. Threaded into the Draco encoder so the lossless grid-identity
+///   QuantizationCoordinateWise transform spans exactly `[0, 2^qbits - 1]`.
 ///
 /// Returns Draco-encoded bytes.
 pub fn encode_draco_mesh(
     positions: &[u32],
     indices: &[u32],
+    qbits: u8,
 ) -> Result<Vec<u8>, String> {
     let n_verts = positions.len() / 3;
     if n_verts == 0 || indices.is_empty() {
@@ -99,8 +134,26 @@ pub fn encode_draco_mesh(
         .map(|c| [c[0] as usize, c[1] as usize, c[2] as usize])
         .collect();
 
+    // A1 LOSSLESS, libdraco-conformant NG path:
+    // The positions arrive pre-quantized to the integer grid [0, 2^qbits - 1]
+    // (the NG assembler quantizes with this same `qbits`). We keep
+    // QuantizationCoordinateWise (portabilization id=2, which libdraco/DracoPy and
+    // the Neuroglancer WASM viewer decode today) but force its quantization
+    // transform to be the IDENTITY over that grid: min=0, range=(2^qbits - 1),
+    // bits=qbits. Then encode is round((v-0)/(2^qbits-1) * (2^qbits-1)) = v and
+    // libdraco dequant is v * (2^qbits-1)/(2^qbits-1) + 0 = v — EXACT (500 decodes
+    // as 500.0, not 500.244). The wire format/metadata layout is unchanged (only
+    // the metadata VALUES), so the stream stays conformant.
+    //
+    // qbits is threaded from the NG caller's `vertex_quantization_bits` (NOT
+    // hardcoded) so the grid range always matches the pre-quantization.
+    //
+    // (The earlier T2b ToBits route is BLOCKED — its id=1 bitstream is not
+    // libdraco-decodable; this A1 grid-identity QCW supersedes it.)
+    let config = encode::Config::with_ng_lossless(qbits);
+
     // build() + encode can still panic on degenerate input, so guard them.
-    let result = std::panic::catch_unwind(move || build_and_encode(pos, faces));
+    let result = std::panic::catch_unwind(move || build_and_encode(pos, faces, config));
 
     match result {
         Ok(Ok(buffer)) => Ok(buffer),
@@ -142,7 +195,14 @@ pub fn encode_draco_mesh_f32(
         .map(|c| [c[0] as usize, c[1] as usize, c[2] as usize])
         .collect();
 
-    let result = std::panic::catch_unwind(move || build_and_encode(pos, faces));
+    // GLB / 3DTiles consumer (encoder_glb.rs): the viewer wants world-space
+    // positions back via Draco's built-in quantization, so this path MUST keep
+    // the quantizing Config::default() (QuantizationCoordinateWise). Do NOT route
+    // it to ToBits — that would change the GLB bytes and stop re-baking world
+    // coords on decode.
+    let config = encode::Config::default();
+
+    let result = std::panic::catch_unwind(move || build_and_encode(pos, faces, config));
 
     match result {
         Ok(Ok(buffer)) => Ok(buffer),
@@ -191,9 +251,34 @@ pub fn draco_encode_mesh(
         }
     }
 
-    let bytes = encode_draco_mesh(&quant, &indices)
+    // Pass the SAME qbits used to bbox-quantize above into the encoder, so the
+    // lossless grid-identity transform spans exactly [0, 2^qbits - 1].
+    let bytes = encode_draco_mesh(&quant, &indices, qbits)
         .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
 
+    pyo3::Python::with_gil(|py| {
+        Ok(pyo3::types::PyBytes::new(py, &bytes).into())
+    })
+}
+
+/// Test-only direct entry into the NG (u32) Draco path.
+///
+/// Unlike `draco_encode_mesh` (which bbox-quantizes f32 first), this passes the
+/// caller's pre-quantized integers straight to `encode_draco_mesh` — exactly what
+/// the Neuroglancer multilod assembly does. `qbits` is the
+/// `vertex_quantization_bits` the integers were pre-quantized with (default 10,
+/// matching `generate_neuroglancer_multilod`). Used by the A1 lossless round-trip
+/// tests to prove the NG path stores integers LOSSLESSLY via the grid-identity
+/// QuantizationCoordinateWise transform.
+#[pyo3::pyfunction]
+#[pyo3(signature = (positions, indices, qbits=10))]
+pub fn draco_encode_ng_u32(
+    positions: Vec<u32>,
+    indices: Vec<u32>,
+    qbits: u8,
+) -> pyo3::PyResult<pyo3::Py<pyo3::types::PyBytes>> {
+    let bytes = encode_draco_mesh(&positions, &indices, qbits)
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
     pyo3::Python::with_gil(|py| {
         Ok(pyo3::types::PyBytes::new(py, &bytes).into())
     })
@@ -208,7 +293,7 @@ mod tests {
         let positions = vec![0u32, 0, 0, 100, 0, 0, 50, 100, 0];
         let indices = vec![0u32, 1, 2];
 
-        let result = encode_draco_mesh(&positions, &indices);
+        let result = encode_draco_mesh(&positions, &indices, 10);
         assert!(result.is_ok(), "Draco encoding failed: {:?}", result.err());
 
         let bytes = result.unwrap();
@@ -226,14 +311,14 @@ mod tests {
         ];
         let indices = vec![0, 1, 2, 1, 2, 3];
 
-        let result = encode_draco_mesh(&positions, &indices);
+        let result = encode_draco_mesh(&positions, &indices, 10);
         assert!(result.is_ok(), "Draco encoding failed: {:?}", result.err());
         assert!(result.unwrap().len() > 5);
     }
 
     #[test]
     fn test_encode_empty_fails() {
-        let result = encode_draco_mesh(&[], &[]);
+        let result = encode_draco_mesh(&[], &[], 10);
         assert!(result.is_err());
     }
 
@@ -291,12 +376,11 @@ mod tests {
 
     // ---- T2: in-memory encoder swap gates ----------------------------------
 
-    /// Reference in-memory encode of u32 positions, identical to the T1 recipe.
-    /// `encode_draco_mesh` MUST produce these exact bytes once it stops routing
-    /// through the temp-OBJ bridge. On the OLD OBJ path the bytes differ
-    /// (load_obj single_index re-weld + dedup reorder vs a direct array build),
-    /// so this is the RED→GREEN gate that proves the bridge is gone.
-    fn reference_in_memory_u32(positions: &[u32], indices: &[u32]) -> Vec<u8> {
+    /// Reference in-memory encode of u32 positions, identical to the production
+    /// `encode_draco_mesh` recipe. `encode_draco_mesh` MUST produce these exact
+    /// bytes. `qbits` mirrors the production caller so the grid-identity config
+    /// matches.
+    fn reference_in_memory_u32(positions: &[u32], indices: &[u32], qbits: u8) -> Vec<u8> {
         use draco_oxide::prelude::AttributeId;
         let pos: Vec<NdVector<3, f32>> = positions
             .chunks_exact(3)
@@ -312,7 +396,11 @@ mod tests {
             b.add_attribute(pos, AttributeType::Position, draco_oxide::prelude::AttributeDomain::Position, vec![]);
         let mesh = b.build().expect("reference build failed");
         let mut buf: Vec<u8> = Vec::new();
-        encode::encode(mesh, &mut buf, encode::Config::default()).expect("reference encode failed");
+        // A1: the NG path uses the LOSSLESS grid-identity QuantizationCoordinateWise
+        // (Config::with_ng_lossless(qbits)). Reference must use the same config to
+        // byte-match encode_draco_mesh.
+        encode::encode(mesh, &mut buf, encode::Config::with_ng_lossless(qbits))
+            .expect("reference encode failed");
         buf
     }
 
@@ -339,11 +427,11 @@ mod tests {
             0, 5, 2,
         ];
 
-        let got = encode_draco_mesh(&positions, &indices).expect("encode failed");
-        let reference = reference_in_memory_u32(&positions, &indices);
+        let got = encode_draco_mesh(&positions, &indices, 10).expect("encode failed");
+        let reference = reference_in_memory_u32(&positions, &indices, 10);
         assert_eq!(
             got, reference,
-            "encode_draco_mesh must equal the direct in-memory recipe (temp-OBJ bridge still present?)"
+            "encode_draco_mesh must equal the direct in-memory recipe (with_ng_lossless)"
         );
     }
 
@@ -357,9 +445,9 @@ mod tests {
         ];
         let indices = vec![0u32, 1, 2, 0, 1, 3, 1, 2, 3, 0, 2, 3];
 
-        let a = encode_draco_mesh(&positions, &indices).expect("a");
-        let b = encode_draco_mesh(&positions, &indices).expect("b");
-        let c = encode_draco_mesh(&positions, &indices).expect("c");
+        let a = encode_draco_mesh(&positions, &indices, 10).expect("a");
+        let b = encode_draco_mesh(&positions, &indices, 10).expect("b");
+        let c = encode_draco_mesh(&positions, &indices, 10).expect("c");
         assert_eq!(a, b, "encode is non-deterministic (a != b)");
         assert_eq!(b, c, "encode is non-deterministic (b != c)");
         assert_eq!(&a[..5], b"DRACO", "missing DRACO magic");
@@ -398,18 +486,28 @@ mod rebake_snapshot {
         h
     }
 
-    /// T2 re-bake guard. These FNV-1a hashes + lengths were captured from the
-    /// OLD temp-OBJ-bridge encoder BEFORE the in-memory rewrite (run 2026-05-31).
-    /// EMPIRICAL FINDING: the in-memory swap is BYTE-PRESERVING for these
-    /// position-only meshes — `load_obj` already used the identical MeshBuilder
-    /// recipe (set_connectivity_attribute + add_attribute(Position) + build) with
-    /// tobj single_index, so removing the OBJ text round-trip does NOT re-bake the
-    /// stream. If draco-oxide's encoder ever changes, these constants will trip and
-    /// must be DELIBERATELY re-baked (do not silently bump).
-    const OLD_U32_LEN: usize = 2013;
-    const OLD_U32_FNV: u64 = 0xeda50e757a14d9d5;
+    /// Re-bake guards.
+    ///
+    /// f32 / GLB path (FROZEN): captured from the OLD temp-OBJ-bridge encoder
+    /// (run 2026-05-31) and CONFIRMED unchanged by the T2 in-memory swap. The A1
+    /// lossless-NG change does NOT touch the f32 path (`encode_draco_mesh_f32`
+    /// keeps `Config::default()` and never sets the grid-identity override), so
+    /// these MUST stay byte-identical. This is the backstop proving the f32 path
+    /// is unaffected by construction.
     const OLD_F32_LEN: usize = 2068;
     const OLD_F32_FNV: u64 = 0x9f1998421548f6a8;
+
+    /// u32 / NG path (RE-BAKED for A1 on 2026-05-31): the NG stream bytes
+    /// LEGITIMATELY changed when the Position transform became the grid-identity
+    /// QuantizationCoordinateWise (Config::with_ng_lossless(qbits)) instead of the
+    /// data-bbox quantization. The old (pre-A1, data-bbox) constants were
+    /// len=2013 / fnv=0xeda50e757a14d9d5. These NEW constants were deliberately
+    /// re-baked ONLY AFTER the f32 guard above was confirmed still GREEN (so the
+    /// re-bake cannot mask an unintended f32-path change). qbits=10 here matches
+    /// the NG default. If the encoder changes again, these trip and must be
+    /// DELIBERATELY re-baked (do not silently bump).
+    const OLD_U32_LEN: usize = 101;
+    const OLD_U32_FNV: u64 = 0xc933a9922fea5fec;
 
     /// Light build-vs-encode profile on a moderately-large synthetic mesh
     /// (a few thousand tris). Run with:
@@ -444,23 +542,89 @@ mod rebake_snapshot {
         eprintln!("draco_profile_split: {} verts, {} tris", positions.len() / 3, n_tris);
         // Force-enable the profile span regardless of caller env.
         std::env::set_var("MUDM_DRACO_PROFILE", "1");
-        let bytes = encode_draco_mesh(&positions, &indices).expect("profile encode failed");
+        let bytes = encode_draco_mesh(&positions, &indices, 10).expect("profile encode failed");
         assert!(bytes.len() > 5);
         assert_eq!(&bytes[..5], b"DRACO");
     }
 
+    /// f32 / GLB guard — the HARD gate that must be GREEN before (and after) the
+    /// u32 re-bake. The f32 path is untouched by A1.
     #[test]
-    fn rebake_guard_bytes_unchanged_vs_old_obj_path() {
-        let positions = vec![0u32, 0, 0, 100, 0, 0, 50, 100, 0, 50, 50, 100, 0, 0, 0, 25, 25, 25];
-        let indices = vec![0u32, 1, 2, 4, 2, 3, 1, 3, 5, 0, 5, 2];
-        let bytes = encode_draco_mesh(&positions, &indices).expect("enc");
-        assert_eq!(bytes.len(), OLD_U32_LEN, "u32 Draco length changed vs OLD OBJ path");
-        assert_eq!(fnv1a(&bytes), OLD_U32_FNV, "u32 Draco bytes changed vs OLD OBJ path");
-
+    fn rebake_guard_f32_byte_identical() {
         let pf = vec![0.0f32, 0.0, 0.0, 10.0, 0.0, 0.0, 5.0, 10.0, 0.0, 5.0, 5.0, 10.0];
         let idxf = vec![0u32, 1, 2, 0, 1, 3, 1, 2, 3, 0, 2, 3];
         let bf = encode_draco_mesh_f32(&pf, &idxf).expect("encf");
-        assert_eq!(bf.len(), OLD_F32_LEN, "f32 Draco length changed vs OLD OBJ path");
-        assert_eq!(fnv1a(&bf), OLD_F32_FNV, "f32 Draco bytes changed vs OLD OBJ path");
+        assert_eq!(bf.len(), OLD_F32_LEN, "f32 Draco length changed (must stay byte-identical)");
+        assert_eq!(fnv1a(&bf), OLD_F32_FNV, "f32 Draco bytes changed (must stay byte-identical)");
+    }
+
+    /// u32 / NG guard — re-baked for A1 (lossless grid-identity QCW). qbits=10.
+    #[test]
+    fn rebake_guard_u32_ng_lossless() {
+        let positions = vec![0u32, 0, 0, 100, 0, 0, 50, 100, 0, 50, 50, 100, 0, 0, 0, 25, 25, 25];
+        let indices = vec![0u32, 1, 2, 4, 2, 3, 1, 3, 5, 0, 5, 2];
+        let bytes = encode_draco_mesh(&positions, &indices, 10).expect("enc");
+        assert_eq!(bytes.len(), OLD_U32_LEN, "u32 Draco length changed unexpectedly");
+        assert_eq!(fnv1a(&bytes), OLD_U32_FNV, "u32 Draco bytes changed unexpectedly");
+    }
+
+    /// DUPLICATE-HEAVY + unused-vertex guard. The unique-vertex lattice guards
+    /// above barely exercise build()'s dedup compaction (remap_attribute /
+    /// remove_unused_vertices) — that path only runs when vertices coincide, which
+    /// NG position-quantization makes the norm. The vertex array here is a 16x16
+    /// base grid duplicated 2x (every vertex i has a coincident twin i+K); ~half
+    /// the triangles reference the twin copy, and twins referenced by no face are
+    /// dropped by remove_unused_vertices. This LOCKS the encoded bytes so the
+    /// O(V^2)->O(V) compaction rewrite of remap_attribute / remove_unused_vertices
+    /// stays byte-identical (captured on the post-dedup-fix, pre-compaction-fix
+    /// encoder).
+    const DUP_HEAVY_LEN: usize = 287;
+    const DUP_HEAVY_FNV: u64 = 0x699c351327d1db9f;
+    #[test]
+    fn rebake_guard_u32_duplicate_heavy() {
+        const N: u32 = 16;
+        let mut base: Vec<[u32; 3]> = Vec::new();
+        for y in 0..N {
+            for x in 0..N {
+                let z = ((x * 7 + y * 13) % 97) as u32;
+                base.push([x * 16, y * 16, z]);
+            }
+        }
+        let k = base.len() as u32;
+        let mut positions: Vec<u32> = Vec::with_capacity(base.len() * 6);
+        for p in &base {
+            positions.extend_from_slice(p);
+        }
+        for p in &base {
+            positions.extend_from_slice(p); // coincident twin at index +k
+        }
+        let mut indices: Vec<u32> = Vec::new();
+        let mut t: u32 = 0;
+        for y in 0..N - 1 {
+            for x in 0..N - 1 {
+                let i = y * N + x;
+                let r = i + 1;
+                let d = i + N;
+                let dr = d + 1;
+                // On alternating quads, route the i and d corners to their twin
+                // copy so faces reference duplicates; base[i]/[r]/[d]/[dr] are
+                // distinct so triangles stay non-degenerate after the collapse.
+                let use_twin = t % 2 == 0;
+                let tw = |v: u32| if use_twin { v + k } else { v };
+                indices.extend_from_slice(&[tw(i), r, tw(d), r, dr, tw(d)]);
+                t += 1;
+            }
+        }
+        let bytes = encode_draco_mesh(&positions, &indices, 10).expect("dup-heavy enc");
+        assert_eq!(
+            bytes.len(),
+            DUP_HEAVY_LEN,
+            "dup-heavy Draco length changed (build() compaction must stay byte-identical)"
+        );
+        assert_eq!(
+            fnv1a(&bytes),
+            DUP_HEAVY_FNV,
+            "dup-heavy Draco bytes changed (build() compaction must stay byte-identical)"
+        );
     }
 }

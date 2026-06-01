@@ -507,6 +507,110 @@ impl Fragment3DReader {
         }
         Ok(groups.into_iter().collect())
     }
+
+    /// Non-fatal sibling of `read_all_grouped_by_feature_parallel`.
+    ///
+    /// Identical par_iter + thread-local-map + `DashMap` merge, keyed by
+    /// `feature_id`, but per-shard parse/open errors are **collected and
+    /// returned alongside the partial map** instead of aborting the read. The
+    /// healthy shards are still merged; the bad ones are skipped. The caller
+    /// (the WS-B feature-bucketed NG read) folds the returned errors into the
+    /// `ErrorCollector` and continues — a corrupt shard is reported, not
+    /// run-aborting, matching the non-fatal skip contract.
+    ///
+    /// WS-B BOUNDED READ: `(bucket_index, bucket_count)` apply a feature
+    /// partition filter **inside each worker's per-shard decode loop** so only
+    /// fragments whose feature_id hashes into this bucket are RETAINED — the
+    /// rest are dropped immediately, never entering the thread-local or merged
+    /// map. Thus per-bucket resident bytes ≈ corpus / k instead of the whole
+    /// corpus materialized then filtered. The hash MUST match the NG caller's
+    /// partition: `std::collections::hash_map::DefaultHasher`, `fid.hash(&mut
+    /// h)`, `(h.finish() as usize) % k == b`. `bucket_count <= 1` is a no-filter
+    /// sentinel (keep all) so non-bucketing callers are unaffected.
+    ///
+    /// Returns `(groups, errors)` where `errors` is `"<path>: <msg>"` strings,
+    /// one per failed shard (in nondeterministic order). The returned map is a
+    /// multiset equal to the healthy subset of the serial read RESTRICTED to
+    /// this bucket.
+    pub fn read_all_grouped_by_feature_parallel_collect_errors(
+        &self,
+        io_threads: usize,
+        fadvise: bool,
+        bucket_index: usize,
+        bucket_count: usize,
+    ) -> io::Result<(ahash::AHashMap<u32, Vec<Fragment3D>>, Vec<String>)> {
+        use ahash::AHashMap;
+        use dashmap::DashMap;
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        use std::sync::Mutex;
+        if self.paths.is_empty() {
+            return Ok((AHashMap::new(), Vec::new()));
+        }
+        // `bucket_count <= 1` => keep everything (whole-corpus-equivalent).
+        let filtering = bucket_count > 1;
+        let groups: DashMap<u32, Vec<Fragment3D>> = DashMap::new();
+        let errors: Mutex<Vec<String>> = Mutex::new(Vec::new());
+        let run = || {
+            use rayon::prelude::*;
+            self.paths.par_iter().with_min_len(1).for_each(|p| {
+                if fadvise {
+                    prefetch_advise(p);
+                }
+                let mut reader = match ShardReader3D::open(p) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        errors
+                            .lock()
+                            .unwrap()
+                            .push(format!("{}: {}", p.display(), e));
+                        return;
+                    }
+                };
+                let mut local: AHashMap<u32, Vec<Fragment3D>> = AHashMap::new();
+                loop {
+                    match reader.read_next() {
+                        Ok(Some(frag)) => {
+                            // WS-B: filter DURING decode — discard fragments not
+                            // in this bucket immediately so the thread-local +
+                            // merged maps hold only ~1/k of the corpus. Uses the
+                            // SAME DefaultHasher partition as the NG caller.
+                            if filtering {
+                                let mut h = DefaultHasher::new();
+                                frag.feature_id.hash(&mut h);
+                                if (h.finish() as usize) % bucket_count != bucket_index {
+                                    continue;
+                                }
+                            }
+                            local.entry(frag.feature_id).or_default().push(frag);
+                        }
+                        Ok(None) => break,
+                        Err(e) => {
+                            errors
+                                .lock()
+                                .unwrap()
+                                .push(format!("{}: {}", p.display(), e));
+                            break;
+                        }
+                    }
+                }
+                for (k, mut v) in local {
+                    groups.entry(k).or_default().extend(v.drain(..));
+                }
+            });
+        };
+        if io_threads > 0 {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(io_threads)
+                .build()
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            pool.install(run);
+        } else {
+            run(); // global pool
+        }
+        let errs = errors.into_inner().unwrap();
+        Ok((groups.into_iter().collect(), errs))
+    }
 }
 
 #[cfg(test)]
@@ -852,6 +956,140 @@ mod tests {
             res.is_err(),
             "a corrupt/truncated shard must produce Err, not be silently skipped"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_read_by_feature_parallel_collect_errors_is_nonfatal() {
+        // The NON-FATAL sibling used by the WS-B NG bucketed read must return the
+        // HEALTHY shard's fragments AND a per-shard error string for the corrupt
+        // shard — NOT abort. This is what lets the NG caller report a bad shard
+        // exactly once while still emitting healthy-feature geometry.
+        let dir = std::env::temp_dir().join("test_frag_by_feature_collect_errors");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+
+        let frag = Fragment3D {
+            feature_id: 7,
+            tile_z: 0,
+            tile_x: 0,
+            tile_y: 0,
+            tile_d: 0,
+            geom_type: 5,
+            xy: vec![0.1f32, 0.2, 0.3, 0.4, 0.5, 0.6],
+            z: vec![0.7f32, 0.8, 0.9],
+            ring_lengths: vec![3],
+        };
+        {
+            let mut w = Fragment3DWriter::new(&dir.join("a_valid.mjf")).unwrap();
+            for _ in 0..3 {
+                w.write(&frag).unwrap();
+            }
+            w.flush().unwrap();
+        }
+        std::fs::write(
+            dir.join("b_corrupt.mjf"),
+            b"NOT_A_VALID_ZSTD_FRAME________________________________",
+        )
+        .unwrap();
+
+        let reader = Fragment3DReader::open_dir(&dir).unwrap();
+        // bucket_count == 0 => no-filter sentinel (keep all).
+        let (groups, errs) = reader
+            .read_all_grouped_by_feature_parallel_collect_errors(2, false, 0, 0)
+            .expect("non-fatal variant must not abort on a bad shard");
+
+        // Healthy shard's fragments survive.
+        assert_eq!(groups.get(&7).map(|v| v.len()), Some(3));
+        // The corrupt shard is reported exactly once.
+        assert_eq!(errs.len(), 1, "expected one per-shard error, got {:?}", errs);
+        assert!(errs[0].contains("b_corrupt.mjf"), "error must name the bad shard: {:?}", errs);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_by_feature_collect_errors_bucket_filter_partitions() {
+        // WS-B: the (bucket_index, bucket_count) filter applied DURING decode
+        // must partition the corpus — each bucket retains only the features
+        // whose feature_id hashes into it, and the disjoint union over all
+        // buckets reconstructs the full no-filter read EXACTLY (same key set,
+        // same per-key fragment count). Hashing must match the NG caller.
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let dir = std::env::temp_dir().join("test_frag_bucket_filter_partition");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+
+        // Several distinct feature_ids spread across two shards.
+        let mk = |fid: u32| Fragment3D {
+            feature_id: fid,
+            tile_z: 0,
+            tile_x: 0,
+            tile_y: 0,
+            tile_d: 0,
+            geom_type: 5,
+            xy: vec![0.1f32, 0.2, 0.3, 0.4, 0.5, 0.6],
+            z: vec![0.7f32, 0.8, 0.9],
+            ring_lengths: vec![3],
+        };
+        {
+            let mut w0 = Fragment3DWriter::new(&dir.join("s0.mjf")).unwrap();
+            let mut w1 = Fragment3DWriter::new(&dir.join("s1.mjf")).unwrap();
+            for fid in 0u32..20 {
+                // Two fragments per feature, split across the two shards, so the
+                // per-feature count is shard-independent (tests cross-shard merge
+                // under filtering).
+                w0.write(&mk(fid)).unwrap();
+                w1.write(&mk(fid)).unwrap();
+            }
+            w0.flush().unwrap();
+            w1.flush().unwrap();
+        }
+
+        // No-filter (sentinel) baseline.
+        let base_reader = Fragment3DReader::open_dir(&dir).unwrap();
+        let (base, base_errs) = base_reader
+            .read_all_grouped_by_feature_parallel_collect_errors(2, false, 0, 0)
+            .unwrap();
+        assert!(base_errs.is_empty());
+        // 20 features, 2 fragments each.
+        assert_eq!(base.len(), 20);
+        for fid in 0u32..20 {
+            assert_eq!(base[&fid].len(), 2);
+        }
+
+        let k = 4usize;
+        let mut union: std::collections::BTreeMap<u32, usize> =
+            std::collections::BTreeMap::new();
+        for b in 0..k {
+            let reader = Fragment3DReader::open_dir(&dir).unwrap();
+            let (bucket, errs) = reader
+                .read_all_grouped_by_feature_parallel_collect_errors(2, false, b, k)
+                .unwrap();
+            assert!(errs.is_empty());
+            for (fid, frags) in &bucket {
+                // Every retained feature MUST belong to this bucket.
+                let mut h = DefaultHasher::new();
+                fid.hash(&mut h);
+                assert_eq!(
+                    (h.finish() as usize) % k,
+                    b,
+                    "feature {} leaked into bucket {}",
+                    fid,
+                    b
+                );
+                let prev = union.insert(*fid, frags.len());
+                assert!(prev.is_none(), "feature {} appeared in two buckets", fid);
+            }
+        }
+        // Disjoint union over buckets == full no-filter read.
+        assert_eq!(union.len(), base.len());
+        for fid in 0u32..20 {
+            assert_eq!(union[&fid], 2, "feature {} lost fragments under bucketing", fid);
+        }
 
         let _ = std::fs::remove_dir_all(&dir);
     }

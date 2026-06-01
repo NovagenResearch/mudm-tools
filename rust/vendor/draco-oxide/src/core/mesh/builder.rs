@@ -186,15 +186,33 @@ impl MeshBuilder {
         unused_vertices.sort();
 
         for att in attributes.iter_mut() {
-            // first remove any vertices greater than the maximum used vertex index
-            for p in ((usize::from(max_vertex_index) + 1)..att.len()).rev() {
-                let p = PointIdx::from(p);
-                att.remove_dyn(p);
+            // Drop, in a single O(len) pass, every point that is either beyond the
+            // max referenced index or explicitly unused. Previously this removed
+            // each one with remove_dyn() — an O(len) shift per call, O(removed*len)
+            // total — the second build()-side quadratic (after remap_attribute).
+            // keep[p] survives iff p is a referenced (used) vertex within range.
+            let len = att.len();
+            let mut keep = vec![true; len];
+            for p in (usize::from(max_vertex_index) + 1)..len {
+                keep[p] = false;
             }
-            // Now remove the unused vertices computed above
-            for &p in unused_vertices.iter().rev() {
-                let p = PointIdx::from(p);
-                att.remove_dyn(p);
+            for &p in &unused_vertices {
+                keep[p] = false;
+            }
+            match (att.get_component_type(), att.get_num_components()) {
+                (ComponentDataType::F32, 3) => att.retain_points::<NdVector<3, f32>, 3>(&keep),
+                (ComponentDataType::F32, 2) => att.retain_points::<NdVector<2, f32>, 2>(&keep),
+                (ComponentDataType::F32, 4) => att.retain_points::<NdVector<4, f32>, 4>(&keep),
+                // Scalar / other types (rare; not on the NG/GLB hot path): keep the
+                // original per-point removal (scalars don't implement Vector<1>).
+                _ => {
+                    for p in ((usize::from(max_vertex_index) + 1)..len).rev() {
+                        att.remove_dyn(PointIdx::from(p));
+                    }
+                    for &p in unused_vertices.iter().rev() {
+                        att.remove_dyn(PointIdx::from(p));
+                    }
+                }
             }
         }
 
@@ -345,66 +363,55 @@ impl MeshBuilder {
             })
             .collect::<Vec<_>>();
 
-        // Create new attribute by extracting unique vertices
-        // We'll handle this by copying data element by element
+        // Compact the attribute to the surviving (first-occurrence) points in a
+        // single O(len) pass. Previously each duplicate point was dropped with
+        // attribute.remove() — an O(len) buffer/map shift per call, i.e.
+        // O(removed * len) — which dominated NG generate on quantization-collapsed
+        // tiles. `keep[p] == false` marks a removed (non-first-occurrence) point.
+        // The mask spans the WHOLE attribute (not point_mapping.len(), which is
+        // num_vertices from faces and can be smaller when trailing vertices are
+        // unreferenced): remap drops only `removed_vertices`; any trailing
+        // unreferenced points survive here and are cleaned by remove_unused_vertices,
+        // exactly as the original per-point remove loop did.
+        let mut keep = vec![true; attribute.len()];
+        for &p in &removed_vertices {
+            keep[p] = false;
+        }
         match (
             attribute.get_component_type(),
             attribute.get_num_components(),
         ) {
-            (ComponentDataType::F32, 3) => {
-                for p in removed_vertices.into_iter().rev() {
-                    // Remove the vertex from the mapping
-                    let p = PointIdx::from(p);
-                    attribute.remove::<NdVector<3, f32>, 3>(p);
-                }
-            }
-            (ComponentDataType::F32, 2) => {
-                for p in removed_vertices.into_iter().rev() {
-                    // Remove the vertex from the mapping
-                    let p = PointIdx::from(p);
-                    attribute.remove::<NdVector<2, f32>, 2>(p);
-                }
-            }
+            // Vector-typed arms (Position/Normal/Texcoord/Tangent) — the only arms
+            // the tiler exercises — use the single-pass byte-identical retain.
+            (ComponentDataType::F32, 3) => attribute.retain_points::<NdVector<3, f32>, 3>(&keep),
+            (ComponentDataType::F32, 2) => attribute.retain_points::<NdVector<2, f32>, 2>(&keep),
+            (ComponentDataType::F32, 4) => attribute.retain_points::<NdVector<4, f32>, 4>(&keep),
+            // Scalar arms (rare; not on the NG/GLB hot path): scalars don't
+            // implement Vector<1>, so keep the original per-point removal. Same
+            // result, just O(removed * len).
             (ComponentDataType::F32, 1) => {
                 for p in removed_vertices.into_iter().rev() {
-                    // Remove the vertex from the mapping
-                    let p = PointIdx::from(p);
-                    attribute.remove::<f32, 1>(p);
-                }
-            }
-            (ComponentDataType::F32, 4) => {
-                for p in removed_vertices.into_iter().rev() {
-                    // Remove the vertex from the mapping
-                    let p = PointIdx::from(p);
-                    attribute.remove::<NdVector<4, f32>, 4>(p);
+                    attribute.remove::<f32, 1>(PointIdx::from(p));
                 }
             }
             (ComponentDataType::U32, 1) => {
                 for p in removed_vertices.into_iter().rev() {
-                    // Remove the vertex from the mapping
-                    let p = PointIdx::from(p);
-                    attribute.remove::<u32, 1>(p);
+                    attribute.remove::<u32, 1>(PointIdx::from(p));
                 }
             }
             (ComponentDataType::I32, 1) => {
                 for p in removed_vertices.into_iter().rev() {
-                    // Remove the vertex from the mapping
-                    let p = PointIdx::from(p);
-                    attribute.remove::<i32, 1>(p);
+                    attribute.remove::<i32, 1>(PointIdx::from(p));
                 }
             }
             (ComponentDataType::I8, 1) => {
                 for p in removed_vertices.into_iter().rev() {
-                    // Remove the vertex from the mapping
-                    let p = PointIdx::from(p);
-                    attribute.remove::<i8, 1>(p);
+                    attribute.remove::<i8, 1>(PointIdx::from(p));
                 }
             }
             (ComponentDataType::U16, 1) => {
                 for p in removed_vertices.into_iter().rev() {
-                    // Remove the vertex from the mapping
-                    let p = PointIdx::from(p);
-                    attribute.remove::<u16, 1>(p);
+                    attribute.remove::<u16, 1>(PointIdx::from(p));
                 }
             }
             _ => {

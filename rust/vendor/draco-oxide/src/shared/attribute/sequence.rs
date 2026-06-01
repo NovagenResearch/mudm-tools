@@ -71,6 +71,10 @@ where
             // Coming here means that we are visiting a new face.
             let face_idx = self.corner_table.face_idx_containing(curr_corner);
             self.visited_faces[usize::from(face_idx)] = true;
+            // Once a face is marked visited it is never unmarked, and the pop
+            // loop above skips any corner whose face is already visited. So stale
+            // corners of this face still left on the stack (the handle case) are
+            // harmlessly skipped when popped; we no longer scan-and-remove them.
 
             // If we have not yet visited the vertex of the current corner and if it is not on a boundary then we can simply return it.
             if !self.is_vertex_visited(v) {
@@ -94,24 +98,8 @@ where
                 // Right face has been visited
                 if left_face.is_some() && self.visited_faces[usize::from(left_face.unwrap())] {
                     // Both neighboring faces are visited, we can continue traversing. No update to the stack.
-                    // check whether the left or right face is a handle.
-                    for i in (0..self.corner_traversal_stack.len()).rev() {
-                        let c = self.corner_traversal_stack[i];
-                        if self.corner_table.face_idx_containing(c) == face_idx {
-                            self.corner_traversal_stack.remove(i);
-                        }
-                    }
                 } else {
                     // Left face is unvisited or does not exist.
-                    // check whether the left face is a handle.
-                    for i in (0..self.corner_traversal_stack.len()).rev() {
-                        let c = self.corner_traversal_stack[i];
-                        if self.corner_table.face_idx_containing(c) == face_idx {
-                            self.corner_traversal_stack.remove(i);
-                            // ToDo: Consider adding break here
-                        }
-                    }
-
                     // We need to traverse the left face if it exists.
                     if let Some(lc) = left_corner {
                         self.corner_traversal_stack.push(lc);
@@ -121,15 +109,6 @@ where
                 // Right face is unvisited or does not exist.
                 if left_face.is_some() && self.visited_faces[usize::from(left_face.unwrap())] {
                     // Left face is visited.
-                    // check whether the left face is a handle.
-                    for i in (0..self.corner_traversal_stack.len()).rev() {
-                        let c = self.corner_traversal_stack[i];
-                        if self.corner_table.face_idx_containing(c) == face_idx {
-                            self.corner_traversal_stack.remove(i);
-                            // ToDo: Consider adding break here
-                        }
-                    }
-
                     // we need to traverse the right face if it exists.
                     if let Some(rc) = right_corner {
                         self.corner_traversal_stack.push(rc);
