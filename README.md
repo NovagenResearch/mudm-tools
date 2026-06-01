@@ -1,6 +1,11 @@
 # mudm-tools
 
+[![Documentation](https://img.shields.io/badge/docs-mkdocs--material-526CFE)](https://novagenresearch.github.io/mudm-tools/)
+[![Docs build](https://github.com/NovagenResearch/mudm-tools/actions/workflows/docs.yml/badge.svg)](https://github.com/NovagenResearch/mudm-tools/actions/workflows/docs.yml)
+
 Processing pipelines, tiling engines, and format converters for [muDM](https://github.com/NovagenResearch/mudm) spatial data. Includes optional Rust acceleration via prebuilt wheels.
+
+📖 **Documentation:** <https://novagenresearch.github.io/mudm-tools/>
 
 ## Install
 

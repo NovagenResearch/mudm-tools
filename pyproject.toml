@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mudm-tools"
-version = "0.6.2"
+version = "0.6.3"
 description = "Processing pipelines, tiling engines, and format converters for muDM spatial data."
 readme = "README.md"
 authors = [
@@ -52,8 +52,10 @@ xenium = [
 mudm-serve = "mudm_tools.serve:main"
 
 [project.urls]
-Documentation = "https://github.com/NovagenResearch/mudm-tools"
+Homepage = "https://github.com/NovagenResearch/mudm-tools"
+Documentation = "https://novagenresearch.github.io/mudm-tools/"
 Source = "https://github.com/NovagenResearch/mudm-tools"
+Issues = "https://github.com/NovagenResearch/mudm-tools/issues"
 
 [tool.maturin]
 manifest-path = "rust/Cargo.toml"
