@@ -27,6 +27,24 @@ gltf = { version = "1.4", features = ["import", "utils"] }
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
 
+# --- Build profiles -------------------------------------------------------
+# Optimize ALL dependencies (incl. the vendored draco-oxide, pyo3, rayon) even
+# in dev / `maturin develop` builds, while keeping THIS crate at the default
+# dev opt-level for fast incremental compiles. Without this, `maturin develop`
+# (no --release) builds draco-oxide at opt-level=0 — the cause of earlier
+# pathologically-slow local Draco timings. Float-reorder-safe (Rust applies no
+# implicit fast-math), so encoded bytes are unchanged across opt-levels — held
+# by the Draco rebake guards.
+[profile.dev.package."*"]
+opt-level = 3
+
+# Release wheels (CI `maturin build --release`): full cross-crate optimization.
+# NG generate is encode-bound in draco-oxide, so LTO across the crate boundary
+# (our crate <-> draco-oxide) is worth the longer build.
+[profile.release]
+lto = true
+codegen-units = 1
+
 # mudm-tools vendored fork of draco-oxide 0.1.0-alpha.4 with a one-line
 # prelude visibility patch (exposes AttributeDomain + AttributeId) so the
 # Draco encoder can build meshes in-memory instead of round-tripping ASCII

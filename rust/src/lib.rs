@@ -15,6 +15,7 @@ mod streaming;
 mod morton;
 mod encoder_draco;
 mod encoder_meshopt;
+mod ng_sharded;
 mod types2d;
 mod projector2d;
 mod clip2d;
