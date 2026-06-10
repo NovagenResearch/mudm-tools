@@ -13,6 +13,7 @@ use crate::encoder_meshopt;
 // glTF component types
 const FLOAT: u32 = 5126;
 const UNSIGNED_INT: u32 = 5125;
+const UNSIGNED_SHORT: u32 = 5123;
 
 // Buffer view targets
 const ARRAY_BUFFER: u32 = 34962;
@@ -695,6 +696,251 @@ pub(crate) fn encode_glb_meshopt(
     assemble_glb(&gltf_json, &bin_data)
 }
 
+/// Like `encode_glb_meshopt`, but POSITION is u16-quantized via
+/// **KHR_mesh_quantization** (per-node TRS dequant) before the meshopt vertex
+/// codec — the "meshopt-u16 quick win" (doc §5 #1 / §7.5): smaller wire on real
+/// neuron fragments than raw-f32 meshopt or any custom-codec attempt, decoded
+/// natively by three.js / CesiumJS (full stock-viewer interop). Indices stay
+/// u32 in this prototype. Non-triangle / small / failed meshes fall back to raw.
+pub(crate) fn encode_glb_meshopt_quantized(
+    features: &[GlbFeature],
+    min_vertices: usize,
+    qbits: u8,
+) -> Vec<u8> {
+    let mut bin_data: Vec<u8> = Vec::new();
+    let mut buffer_views: Vec<Value> = Vec::new();
+    let mut accessors: Vec<Value> = Vec::new();
+    let mut meshes: Vec<Value> = Vec::new();
+    let mut nodes: Vec<Value> = Vec::new();
+    let mut scene_nodes: Vec<Value> = Vec::new();
+    let mut any_meshopt = false;
+
+    for feat in features {
+        if feat.positions.is_empty() {
+            continue;
+        }
+        let n_verts = feat.positions.len() / 3;
+
+        // raw bbox (used only by the fallback path)
+        let mut pos_min = [f32::INFINITY; 3];
+        let mut pos_max = [f32::NEG_INFINITY; 3];
+        for v in 0..n_verts {
+            for d in 0..3 {
+                let val = feat.positions[v * 3 + d];
+                if val < pos_min[d] { pos_min[d] = val; }
+                if val > pos_max[d] { pos_max[d] = val; }
+            }
+        }
+
+        let use_meshopt = feat.mode == MODE_TRIANGLES
+            && !feat.indices.is_empty()
+            && n_verts >= min_vertices;
+        let enc = if use_meshopt {
+            encoder_meshopt::encode_meshopt_mesh_quantized(&feat.positions, &feat.indices, qbits).ok()
+        } else {
+            None
+        };
+
+        if let Some(enc) = enc {
+            any_meshopt = true;
+
+            // --- u16 position bufferView (stride 8) + EXT_meshopt_compression ---
+            let pos_off = bin_data.len();
+            let pos_size = enc.vertex_data.len();
+            bin_data.extend_from_slice(&enc.vertex_data);
+            let pad = (4 - (bin_data.len() % 4)) % 4;
+            bin_data.extend(std::iter::repeat(0u8).take(pad));
+
+            let pos_bv = buffer_views.len();
+            buffer_views.push(json!({
+                "buffer": 0,
+                "byteOffset": pos_off,
+                "byteLength": pos_size,
+                "byteStride": 8,
+                "target": ARRAY_BUFFER,
+                "extensions": {
+                    "EXT_meshopt_compression": {
+                        "buffer": 0,
+                        "byteOffset": pos_off,
+                        "byteLength": pos_size,
+                        "byteStride": 8,
+                        "count": enc.vertex_count,
+                        "mode": "ATTRIBUTES",
+                        "filter": "NONE"
+                    }
+                }
+            }));
+
+            let pos_acc = accessors.len();
+            accessors.push(json!({
+                "bufferView": pos_bv,
+                "byteOffset": 0,
+                "componentType": UNSIGNED_SHORT,
+                "count": enc.vertex_count,
+                "type": "VEC3",
+                "min": [enc.quant_min[0], enc.quant_min[1], enc.quant_min[2]],
+                "max": [enc.quant_max[0], enc.quant_max[1], enc.quant_max[2]],
+            }));
+
+            // --- index bufferView: u16 when the mesh fits (halves index VRAM —
+            // the dominant GPU cost for these index-heavy neuron meshes), else
+            // u32. The meshopt index-codec stream is width-agnostic, so the same
+            // encoded bytes are reused; only the accessor componentType + the
+            // EXT byteStride (2 vs 4) tell the decoder which width to emit. ---
+            let idx_u16 = enc.vertex_count < 65536; // max index ≤ 65534, fits u16
+            let (idx_ct, idx_stride) = if idx_u16 { (UNSIGNED_SHORT, 2) } else { (UNSIGNED_INT, 4) };
+            let idx_off = bin_data.len();
+            let idx_size = enc.index_data.len();
+            bin_data.extend_from_slice(&enc.index_data);
+            let pad = (4 - (bin_data.len() % 4)) % 4;
+            bin_data.extend(std::iter::repeat(0u8).take(pad));
+
+            let idx_bv = buffer_views.len();
+            buffer_views.push(json!({
+                "buffer": 0,
+                "byteOffset": idx_off,
+                "byteLength": idx_size,
+                "target": ELEMENT_ARRAY_BUFFER,
+                "extensions": {
+                    "EXT_meshopt_compression": {
+                        "buffer": 0,
+                        "byteOffset": idx_off,
+                        "byteLength": idx_size,
+                        "byteStride": idx_stride,
+                        "count": enc.indices.len(),
+                        "mode": "TRIANGLES",
+                        "filter": "NONE"
+                    }
+                }
+            }));
+
+            let idx_acc = accessors.len();
+            accessors.push(json!({
+                "bufferView": idx_bv,
+                "byteOffset": 0,
+                "componentType": idx_ct,
+                "count": enc.indices.len(),
+                "type": "SCALAR",
+            }));
+
+            let mesh_idx = meshes.len();
+            meshes.push(json!({"primitives": [json!({
+                "attributes": {"POSITION": pos_acc},
+                "indices": idx_acc,
+                "material": 0,
+                "mode": MODE_TRIANGLES,
+            })]}));
+
+            // node carries the dequant transform (KHR_mesh_quantization)
+            let mut node = json!({
+                "mesh": mesh_idx,
+                "name": format!("feature_{}", nodes.len()),
+                "translation": [enc.translation[0], enc.translation[1], enc.translation[2]],
+                "scale": [enc.scale[0], enc.scale[1], enc.scale[2]],
+            });
+            if let Some(extras) = &feat.extras {
+                node.as_object_mut().unwrap().insert("extras".to_string(), extras.clone());
+            }
+            let node_idx = nodes.len();
+            nodes.push(node);
+            scene_nodes.push(json!(node_idx));
+        } else {
+            // --- raw fallback (identical to encode_glb's f32 path) ---
+            let pos_offset = bin_data.len();
+            let pos_bytes: Vec<u8> = feat.positions.iter().flat_map(|f| f.to_le_bytes()).collect();
+            let pos_byte_len = pos_bytes.len();
+            bin_data.extend_from_slice(&pos_bytes);
+            let pad = (4 - (bin_data.len() % 4)) % 4;
+            bin_data.extend(std::iter::repeat(0u8).take(pad));
+
+            let pos_bv_idx = buffer_views.len();
+            buffer_views.push(json!({
+                "buffer": 0, "byteOffset": pos_offset, "byteLength": pos_byte_len,
+                "target": ARRAY_BUFFER,
+            }));
+            let pos_acc_idx = accessors.len();
+            accessors.push(json!({
+                "bufferView": pos_bv_idx, "byteOffset": 0, "componentType": FLOAT,
+                "count": n_verts, "type": "VEC3",
+                "min": [pos_min[0], pos_min[1], pos_min[2]],
+                "max": [pos_max[0], pos_max[1], pos_max[2]],
+            }));
+
+            let primitive = if !feat.indices.is_empty() {
+                let idx_offset = bin_data.len();
+                let idx_bytes: Vec<u8> = feat.indices.iter().flat_map(|i| i.to_le_bytes()).collect();
+                let idx_byte_len = idx_bytes.len();
+                bin_data.extend_from_slice(&idx_bytes);
+                let pad = (4 - (bin_data.len() % 4)) % 4;
+                bin_data.extend(std::iter::repeat(0u8).take(pad));
+                let idx_bv_idx = buffer_views.len();
+                buffer_views.push(json!({
+                    "buffer": 0, "byteOffset": idx_offset, "byteLength": idx_byte_len,
+                    "target": ELEMENT_ARRAY_BUFFER,
+                }));
+                let idx_acc_idx = accessors.len();
+                accessors.push(json!({
+                    "bufferView": idx_bv_idx, "byteOffset": 0, "componentType": UNSIGNED_INT,
+                    "count": feat.indices.len(), "type": "SCALAR",
+                }));
+                json!({"attributes": {"POSITION": pos_acc_idx}, "indices": idx_acc_idx, "material": 0, "mode": feat.mode})
+            } else {
+                json!({"attributes": {"POSITION": pos_acc_idx}, "material": 0, "mode": feat.mode})
+            };
+
+            let mesh_idx = meshes.len();
+            meshes.push(json!({"primitives": [primitive]}));
+            let mut node = json!({"mesh": mesh_idx, "name": format!("feature_{}", nodes.len())});
+            if let Some(extras) = &feat.extras {
+                node.as_object_mut().unwrap().insert("extras".to_string(), extras.clone());
+            }
+            let node_idx = nodes.len();
+            nodes.push(node);
+            scene_nodes.push(json!(node_idx));
+        }
+    }
+
+    if meshes.is_empty() {
+        return encode_empty_glb();
+    }
+
+    let material = json!({
+        "pbrMetallicRoughness": {
+            "baseColorFactor": [0.8, 0.8, 0.8, 1.0],
+            "metallicFactor": 0.1,
+            "roughnessFactor": 0.8,
+        },
+        "doubleSided": true,
+    });
+
+    let mut gltf_json = json!({
+        "asset": {"version": "2.0", "generator": "mudm-rs"},
+        "scene": 0,
+        "scenes": [{"nodes": scene_nodes}],
+        "nodes": nodes,
+        "meshes": meshes,
+        "accessors": accessors,
+        "bufferViews": buffer_views,
+        "buffers": [{"byteLength": bin_data.len()}],
+        "materials": [material],
+    });
+
+    if any_meshopt {
+        // Both extensions required: EXT_meshopt_compression (codec) +
+        // KHR_mesh_quantization (u16 POSITION). Order is informational.
+        gltf_json.as_object_mut().unwrap().insert(
+            "extensionsUsed".to_string(),
+            json!(["EXT_meshopt_compression", "KHR_mesh_quantization"]),
+        );
+        gltf_json.as_object_mut().unwrap().insert(
+            "extensionsRequired".to_string(),
+            json!(["EXT_meshopt_compression", "KHR_mesh_quantization"]),
+        );
+    }
+
+    assemble_glb(&gltf_json, &bin_data)
+}
+
 fn encode_empty_glb() -> Vec<u8> {
     let gltf_json = json!({
         "asset": {"version": "2.0", "generator": "mudm-rs"},
@@ -1003,6 +1249,138 @@ mod tests {
         for bv in bvs {
             assert!(bv["extensions"].is_null());
         }
+    }
+
+    // ----- Meshopt-u16 (KHR_mesh_quantization) tests -----
+
+    #[test]
+    fn test_meshopt_q_has_khr_and_u16_accessor() {
+        let feat = make_large_triangle_mesh(40); // 120 verts
+        let glb = encode_glb_meshopt_quantized(&[feat], 50, 16);
+        let json = parse_glb_json(&glb);
+
+        // Both extensions declared + required.
+        for key in ["extensionsUsed", "extensionsRequired"] {
+            let arr = json[key].as_array().unwrap();
+            assert!(arr.iter().any(|v| v == "EXT_meshopt_compression"), "{key} missing meshopt");
+            assert!(arr.iter().any(|v| v == "KHR_mesh_quantization"), "{key} missing KHR_mesh_quantization");
+        }
+        // POSITION accessor is UNSIGNED_SHORT VEC3 with a bufferView.
+        let prim = &json["meshes"][0]["primitives"][0];
+        let pos_acc = prim["attributes"]["POSITION"].as_u64().unwrap() as usize;
+        let acc = &json["accessors"][pos_acc];
+        assert_eq!(acc["componentType"], UNSIGNED_SHORT);
+        assert_eq!(acc["type"], "VEC3");
+        assert!(acc["bufferView"].is_number());
+        // its bufferView carries EXT_meshopt_compression with byteStride 8.
+        let bv = &json["bufferViews"][acc["bufferView"].as_u64().unwrap() as usize];
+        assert_eq!(bv["byteStride"], 8);
+        assert_eq!(bv["extensions"]["EXT_meshopt_compression"]["byteStride"], 8);
+    }
+
+    #[test]
+    fn test_meshopt_q_node_transform_present() {
+        let feat = make_large_triangle_mesh(40);
+        let glb = encode_glb_meshopt_quantized(&[feat], 50, 16);
+        let json = parse_glb_json(&glb);
+        // node must carry the dequant TRS (translation + scale).
+        let node = &json["nodes"][0];
+        assert!(node["translation"].is_array(), "node needs translation for dequant");
+        assert!(node["scale"].is_array(), "node needs scale for dequant");
+        assert_eq!(node["scale"].as_array().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn test_meshopt_q_smaller_than_f32_meshopt() {
+        // Realistic-scale grid (~8k tris) with NON-integer noisy float coords, so
+        // raw-f32 mantissa bytes are incompressible (the §1.2 finding) and u16
+        // quantization actually wins — mirroring real neuron fragments. (A tiny
+        // clean-integer mesh does NOT win: f32 deltas compress trivially and the
+        // added KHR/node-TRS JSON dominates — the win is a large-mesh effect.)
+        let n = 64u32;
+        let mut positions = Vec::new();
+        let mut indices = Vec::new();
+        for y in 0..n {
+            for x in 0..n {
+                positions.extend_from_slice(&[
+                    x as f32 * 1.37,
+                    y as f32 * 2.11,
+                    ((x * 7 + y * 13) % 97) as f32 * 0.531 + 100.0,
+                ]);
+            }
+        }
+        for y in 0..n - 1 {
+            for x in 0..n - 1 {
+                let i = y * n + x;
+                indices.extend_from_slice(&[i, i + 1, i + n, i + 1, i + n + 1, i + n]);
+            }
+        }
+        let feat = GlbFeature { positions, indices, mode: MODE_TRIANGLES, extras: None };
+        let f32_glb = encode_glb_meshopt(&[feat.clone()], 50);
+        let q_glb = encode_glb_meshopt_quantized(&[feat], 50, 16);
+        assert!(
+            q_glb.len() < f32_glb.len(),
+            "u16-quantized meshopt GLB ({}) should be smaller than f32 meshopt ({})",
+            q_glb.len(), f32_glb.len()
+        );
+    }
+
+    /// Build an N×N grid mesh (N*N verts) with non-degenerate float coords.
+    fn make_grid_mesh(n: u32) -> GlbFeature {
+        let mut positions = Vec::new();
+        let mut indices = Vec::new();
+        for y in 0..n {
+            for x in 0..n {
+                positions.extend_from_slice(&[
+                    x as f32 * 1.37, y as f32 * 2.11, ((x * 7 + y * 13) % 97) as f32 * 0.5,
+                ]);
+            }
+        }
+        for y in 0..n - 1 {
+            for x in 0..n - 1 {
+                let i = y * n + x;
+                indices.extend_from_slice(&[i, i + 1, i + n, i + 1, i + n + 1, i + n]);
+            }
+        }
+        GlbFeature { positions, indices, mode: MODE_TRIANGLES, extras: None }
+    }
+
+    #[test]
+    fn test_meshopt_q_uses_u16_indices_when_small() {
+        // 64×64 = 4096 verts < 65536 → index accessor must be UNSIGNED_SHORT, EXT byteStride 2.
+        let json = parse_glb_json(&encode_glb_meshopt_quantized(&[make_grid_mesh(64)], 50, 14));
+        let prim = &json["meshes"][0]["primitives"][0];
+        let idx_acc = prim["indices"].as_u64().unwrap() as usize;
+        assert_eq!(json["accessors"][idx_acc]["componentType"], UNSIGNED_SHORT,
+                   "small mesh index accessor must be UNSIGNED_SHORT");
+        let bv = json["accessors"][idx_acc]["bufferView"].as_u64().unwrap() as usize;
+        assert_eq!(json["bufferViews"][bv]["extensions"]["EXT_meshopt_compression"]["byteStride"], 2);
+    }
+
+    #[test]
+    fn test_meshopt_q_uses_u32_indices_when_large() {
+        // 261×261 = 68121 verts > 65535 → must stay UNSIGNED_INT, EXT byteStride 4.
+        let json = parse_glb_json(&encode_glb_meshopt_quantized(&[make_grid_mesh(261)], 50, 14));
+        let prim = &json["meshes"][0]["primitives"][0];
+        let idx_acc = prim["indices"].as_u64().unwrap() as usize;
+        assert_eq!(json["accessors"][idx_acc]["componentType"], UNSIGNED_INT,
+                   ">65535-vertex mesh must keep UNSIGNED_INT indices");
+        let bv = json["accessors"][idx_acc]["bufferView"].as_u64().unwrap() as usize;
+        assert_eq!(json["bufferViews"][bv]["extensions"]["EXT_meshopt_compression"]["byteStride"], 4);
+    }
+
+    #[test]
+    fn test_meshopt_q_small_mesh_stays_raw() {
+        // below min_vertices -> raw f32, no extensions.
+        let feat = GlbFeature {
+            positions: vec![0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.5, 1.0, 0.0],
+            indices: vec![0, 1, 2],
+            mode: MODE_TRIANGLES,
+            extras: None,
+        };
+        let json = parse_glb_json(&encode_glb_meshopt_quantized(&[feat], 50, 16));
+        assert!(json["extensionsUsed"].is_null());
+        assert_eq!(json["accessors"][0]["componentType"], FLOAT);
     }
 
     #[test]

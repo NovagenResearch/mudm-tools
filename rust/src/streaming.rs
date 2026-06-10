@@ -2270,6 +2270,12 @@ fn _encode_grouped_fragments(
             let data = match effective_compression {
                 "draco" => encoder_glb::encode_glb_draco(&features, 50),
                 "meshopt" => encoder_glb::encode_glb_meshopt(&features, 50),
+                // meshopt-u16 quick win (doc §7.5): KHR_mesh_quantization positions.
+                // "meshopt-q" defaults to q14 (gltfpack/Draco-GLB convention,
+                // visually lossless for these surfaces); suffix selects precision.
+                "meshopt-q" | "meshopt-q14" => encoder_glb::encode_glb_meshopt_quantized(&features, 50, 14),
+                "meshopt-q16" => encoder_glb::encode_glb_meshopt_quantized(&features, 50, 16),
+                "meshopt-q10" => encoder_glb::encode_glb_meshopt_quantized(&features, 50, 10),
                 _ => encoder_glb::encode_glb(&features),
             };
             let tile_path = out_dir
