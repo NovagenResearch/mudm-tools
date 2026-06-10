@@ -9,6 +9,7 @@ let rasterLayer;
 let hiddenLayers = new Set();
 let hoveredFeatureId = null;
 let geneColorMap = null;  // { gene_name → hex color }
+let currentDatasetId = null;
 
 const BASE_URL = "";
 
@@ -23,13 +24,27 @@ async function loadDatasets() {
         opt.textContent = ds.name;
         select.appendChild(opt);
     });
-    if (datasets.length > 0) {
-        await loadDataset(datasets[0].id);
-    }
+    // Honor ?dataset=<id> (catalogue deep-link) as the initial load; hide the dropdown when
+    // deep-linked (selection is the linking page's job). No/unknown ?dataset= → first dataset +
+    // dropdown stays for standalone browsing. loadDataset() guards duplicate ids, so the deep-link
+    // shim's 'change' is a no-op — no race / double-load.
     select.addEventListener("change", () => loadDataset(select.value));
+    if (datasets.length > 0) {
+        const wantedId = new URLSearchParams(location.search).get("dataset");
+        const wanted = wantedId ? datasets.find((d) => d.id === wantedId) : null;
+        const initial = wanted || datasets[0];
+        select.value = initial.id;
+        if (wanted) {
+            const box = document.getElementById("dataset-selector");
+            if (box) box.style.display = "none";
+        }
+        await loadDataset(initial.id);
+    }
 }
 
 async function loadDataset(datasetId) {
+    if (datasetId === currentDatasetId) return;  // ignore duplicate re-selects (deep-link shim's 'change')
+    currentDatasetId = datasetId;
     const resp = await fetch(`${BASE_URL}/tiles2d/${datasetId}/metadata.json`);
     metadata = await resp.json();
 

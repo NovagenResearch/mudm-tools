@@ -63,6 +63,9 @@ export class TileManager {
         this.featureIndex = {};
         this.maxZoom = 3;
 
+        /** Real-world meters per world unit (for the scale bar); nm by default (EM datasets). */
+        this.metersPerUnit = 1e-9;
+
         /** URI → TileNode for all nodes in the hierarchy. */
         this.nodeByUri = new Map();
 
@@ -70,9 +73,12 @@ export class TileManager {
         this.selectedFeatures = new Set();
 
         /** LOD mode: 'dynamic' (SSE-based) or 'forced' (user-chosen zoom). */
-        this.lodMode = 'dynamic';
+        this.lodMode = 'forced';
         /** Zoom level for forced mode. */
         this.forcedZoom = 3;
+
+        /** Main-view neuron opacity (0..1). 1 = solid. Applied per material. */
+        this._opacity = 1.0;
 
         /** GPU memory budget in MB (configurable via slider). */
         this.maxGpuMB = DEFAULT_GPU_MB;
@@ -93,6 +99,9 @@ export class TileManager {
         this._pendingLoads = 0;
         this._loadQueue = [];
         this._frameNumber = 0;
+        // Render-on-demand: set true whenever an async load/unload mutates the
+        // scene, so the main loop knows to repaint the just-streamed tile.
+        this._dirty = false;
 
         // Stats
         this.loadedCount = 0;
@@ -121,6 +130,7 @@ export class TileManager {
             if (tjResp.ok) {
                 const tjData = await tjResp.json();
                 this.maxZoom = tjData.maxzoom ?? this.maxZoom;
+                this.metersPerUnit = tjData.meters_per_unit ?? this.metersPerUnit;
                 this.idFields = new Set(tjData.id_fields ?? []);
                 this._encodings = tjData.encodings ?? null;
             }
@@ -202,6 +212,14 @@ export class TileManager {
             // Also index by bare tile ID (without extension) for new format
             const bareId = node.uri.replace(/\.[^.]+$/, '');
             this.nodeByUri.set(bareId, node);
+            // And by the canonical "z/x/y/d" tile id, stripping any directory prefix the
+            // tileset bakes into content.uri. A static-serving root tileset roots its URIs
+            // under "3dtiles/" (so plain HTTP/S3 can resolve the GLB without /tiles routing),
+            // but features.json references tiles by bare "z/x/y/d". Indexing the canonical id
+            // lets feature->tile lookups resolve regardless of how the tileset is rooted,
+            // while node.uri (possibly prefixed) is still used to fetch the GLB.
+            const canon = bareId.match(/(\d+\/\d+\/\d+\/\d+)$/);
+            if (canon && canon[1] !== bareId) this.nodeByUri.set(canon[1], node);
         }
         for (const child of node.children) this._indexNodes(child);
     }
@@ -229,6 +247,25 @@ export class TileManager {
                 this._featureState.delete(name);
             }
         }
+    }
+
+    /**
+     * Set main-view neuron opacity (0..1). Applies to all loaded meshes and is
+     * remembered for tiles loaded later (see _loadTile). 1 = solid/opaque.
+     */
+    setOpacity(o) {
+        this._opacity = o;
+        const transparent = o < 1;
+        for (const node of this.nodeByUri.values()) {
+            node.object3D?.traverse(c => {
+                if (!c.isMesh || !c.material) return;
+                c.material.transparent = transparent;
+                c.material.opacity = o;
+                c.material.depthWrite = !transparent;
+                c.material.needsUpdate = true;
+            });
+        }
+        this._dirty = true;
     }
 
     /**
@@ -663,6 +700,11 @@ export class TileManager {
             group.traverse(child => {
                 if (!child.isMesh) return;
                 child.visible = false; // hide all meshes by default
+                // Neuron meshes never move — freeze the local matrix so three.js
+                // skips the per-frame world-matrix recompute across thousands of
+                // static objects. (Transforms are already baked by the loader.)
+                child.matrixAutoUpdate = false;
+                child.updateMatrix();
                 meshCount++;
                 const props = this._findProps(child);
                 if (!props) return;
@@ -677,11 +719,17 @@ export class TileManager {
                 node.meshByFeature[name].push(child);
                 child.userData._featureName = name;
 
-                // Color: use palette if color-by is active, otherwise original
+                // Color: use palette if color-by is active, otherwise original.
+                // Also apply the current global opacity (clone so it's per-mesh).
                 const color = this._getFeatureColor(name) || props.color;
-                if (color) {
+                if (color || this._opacity < 1) {
                     child.material = child.material.clone();
-                    child.material.color.set(color);
+                    if (color) child.material.color.set(color);
+                    if (this._opacity < 1) {
+                        child.material.transparent = true;
+                        child.material.opacity = this._opacity;
+                        child.material.depthWrite = false;
+                    }
                 }
 
                 // GPU accounting
@@ -708,6 +756,7 @@ export class TileManager {
             node.loadState = FAILED;
         } finally {
             this._pendingLoads--;
+            this._dirty = true;   // async load completed → repaint once
         }
     }
 
@@ -786,6 +835,7 @@ export class TileManager {
         node.meshByFeature = {};
         node.gpuBytes = 0;
         node.loadState = UNLOADED;
+        this._dirty = true;   // scene changed → repaint
     }
 
     _recalcStats() {

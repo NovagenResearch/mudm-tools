@@ -122,7 +122,19 @@ def build_index(tiles_dir: Path, id_fields: list[str] | None = None,
                 }
                 # Include whichever metadata fields are present
                 for key in ("acronym", "ccf_id", "body_id", "cell_type", "instance",
-                           "brain_regions", "status", "status_label", "pre", "post"):
+                           "brain_regions", "status", "status_label", "pre", "post",
+                           # MANC (VNC connectome) rich annotations — only captured when set,
+                           # so hemibrain/HRA (which don't emit them) are unaffected.
+                           "neuron_class", "subclass", "systematic_type", "soma_side",
+                           "soma_neuromere", "hemilineage", "predicted_nt",
+                           "entry_nerve", "exit_nerve",
+                           # FlyWire (adult brain connectome) hierarchical annotations.
+                           "super_class", "cell_class", "cell_sub_class", "hemibrain_type",
+                           "flow", "side", "nerve", "supertype",
+                           # MaleCNS (whole male CNS) cross-dataset + sexual-dimorphism.
+                           "dimorphism", "flywire_type", "manc_type", "consensus_nt",
+                           # BANC (whole female CNS): brain-vs-VNC region + male cross-ref.
+                           "region", "malecns_type"):
                     if feat.get(key) is not None:
                         entry[key] = feat[key]
                 feature_map[name] = entry

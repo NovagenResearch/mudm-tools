@@ -654,7 +654,7 @@ class TestParquetPartitioned:
         generate_parquet(gen, out_dir, WORLD_BOUNDS, partitioned=True, batch_size=10)
 
         for z in range(3):
-            part = out_dir / f"zoom={z}" / "part_000.parquet"
+            part = out_dir / f"zoom={z}" / "part_000.mu.parquet"
             assert part.exists(), f"Missing partition for zoom={z}"
 
     def test_partitioned_readable_by_dataset(self, tmp_path):
@@ -1041,7 +1041,7 @@ class TestParquetPrimeDeprime:
 
         assert count == 3  # zoom 0, 1, 2
         for z in range(3):
-            assert (out_dir / f"zoom={z}" / "part_000.arrow").exists()
+            assert (out_dir / f"zoom={z}" / "part_000.mu.arrow").exists()
 
     def test_prime_returns_count(self, tmp_path):
         """prime_parquet returns the number of files written."""
@@ -1055,18 +1055,18 @@ class TestParquetPrimeDeprime:
         count = prime_parquet(out_dir)
         assert count == 3
         for z in range(3):
-            assert (out_dir / f"zoom={z}" / "part_000.arrow").exists()
+            assert (out_dir / f"zoom={z}" / "part_000.mu.arrow").exists()
 
     def test_prime_preserves_parquet(self, tmp_path):
         """prime_parquet does not remove or modify original parquet files."""
         out_dir, _ = _make_partitioned_pyramid(tmp_path)
         sizes_before = {
-            z: (out_dir / f"zoom={z}" / "part_000.parquet").stat().st_size for z in range(3)
+            z: (out_dir / f"zoom={z}" / "part_000.mu.parquet").stat().st_size for z in range(3)
         }
         prime_parquet(out_dir)
         for z in range(3):
-            assert (out_dir / f"zoom={z}" / "part_000.parquet").exists()
-            assert (out_dir / f"zoom={z}" / "part_000.parquet").stat().st_size == sizes_before[z]
+            assert (out_dir / f"zoom={z}" / "part_000.mu.parquet").exists()
+            assert (out_dir / f"zoom={z}" / "part_000.mu.parquet").stat().st_size == sizes_before[z]
 
     def test_prime_compression_lz4(self, tmp_path):
         """prime_parquet with compression='lz4' produces valid readable files."""
@@ -1077,7 +1077,7 @@ class TestParquetPrimeDeprime:
         import pyarrow.feather as feather
 
         for z in range(3):
-            table = feather.read_table(str(out_dir / f"zoom={z}" / "part_000.arrow"))
+            table = feather.read_table(str(out_dir / f"zoom={z}" / "part_000.mu.arrow"))
             assert table.num_rows > 0
 
     def test_prime_compression_zstd(self, tmp_path):
@@ -1114,7 +1114,7 @@ class TestParquetPrimeDeprime:
 
         assert count == 3
         for z in range(3):
-            assert not (out_dir / f"zoom={z}" / "part_000.arrow").exists()
+            assert not (out_dir / f"zoom={z}" / "part_000.mu.arrow").exists()
 
     def test_deprime_leaves_parquet_intact(self, tmp_path):
         """deprime_parquet does not touch .parquet files."""
@@ -1123,7 +1123,7 @@ class TestParquetPrimeDeprime:
         deprime_parquet(out_dir)
 
         for z in range(3):
-            assert (out_dir / f"zoom={z}" / "part_000.parquet").exists()
+            assert (out_dir / f"zoom={z}" / "part_000.mu.parquet").exists()
 
     def test_deprime_idempotent(self, tmp_path):
         """Calling deprime_parquet on already-deprimed directory returns 0."""
@@ -1349,7 +1349,7 @@ class TestParquetFileSplitting:
         assert fids_big == fids_split
 
     def test_single_part_when_under_threshold(self, tmp_path):
-        """Small data produces a single part_000.parquet per zoom."""
+        """Small data produces a single part_000.mu.parquet per zoom."""
         features = [
             _make_tin_feature(
                 [0.1, 0.2, 0.3, 0.4, 0.5, 0.6],
@@ -1364,7 +1364,7 @@ class TestParquetFileSplitting:
         for z in range(2):
             parts = sorted((out_dir / f"zoom={z}").glob("part_*.parquet"))
             assert len(parts) == 1
-            assert parts[0].name == "part_000.parquet"
+            assert parts[0].name == "part_000.mu.parquet"
 
 
 # ---------------------------------------------------------------------------

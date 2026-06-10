@@ -1501,7 +1501,8 @@ fn write_parquet_native(
 
             if rows.is_empty() { return Ok(()); }
 
-            let file_path = zoom_dir.join(format!("part_{:03}.parquet", part_idx));
+            // muDM tile-geometry parquet (custom schema, NOT GeoParquet) — see mudm-data .mu.parquet convention
+            let file_path = zoom_dir.join(format!("part_{:03}.mu.parquet", part_idx));
             let file = std::fs::File::create(&file_path)
                 .map_err(|e| format!("create {}: {}", file_path.display(), e))?;
             let mut pq_writer = ArrowWriter::try_new(file, schema_ref.clone(), Some(props.clone()))

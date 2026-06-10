@@ -38,6 +38,9 @@ class ObjConverter:
                 values are dicts of properties.
             glob (str): Glob pattern for OBJ files. Default: "*.obj".
             generate_parquet (bool): Also generate Parquet. Default: True.
+            compression (str): GLB tile compression — "meshopt" (default),
+                "draco", or "none". meshopt shrinks tiles ~4-5x on disk/wire and
+                is the format the bundled 3D viewer expects (EXT_meshopt_compression).
         """
         from mudm_tools._rs import StreamingTileGenerator
 
@@ -52,6 +55,11 @@ class ObjConverter:
         tags_map = config.get("tags", {})
         glob_pattern = config.get("glob", "*.obj")
         do_parquet = config.get("generate_parquet", True)
+        compression = config.get("compression", "meshopt")
+        # LOD mesh simplification (per-zoom QEM decimation). Default on. Set False for small
+        # datasets where decimation facets smooth surfaces (e.g. HRA anatomy) and the size
+        # savings aren't needed — tiles stay full-detail at every zoom.
+        simplify = config.get("simplify", True)
 
         t_start = time.time()
 
@@ -91,6 +99,7 @@ class ObjConverter:
             [str(f) for f in obj_files],
             bounds,
             all_tags,
+            simplify=simplify,
         )
         t_ingest = time.time() - t0
         print(f"{len(fids)} features ({t_ingest:.1f}s)", flush=True)
@@ -99,9 +108,9 @@ class ObjConverter:
         print("Encoding 3D Tiles...", end=" ", flush=True)
         t0 = time.time()
         tiles_dir = out_dir / "3dtiles"
-        gen.generate_3dtiles(str(tiles_dir), bounds)
+        gen.generate_3dtiles(str(tiles_dir), bounds, compression=compression)
         t_tiles = time.time() - t0
-        print(f"done ({t_tiles:.1f}s)", flush=True)
+        print(f"done ({t_tiles:.1f}s, compression={compression})", flush=True)
 
         # Generate Parquet
         t_parquet = 0.0

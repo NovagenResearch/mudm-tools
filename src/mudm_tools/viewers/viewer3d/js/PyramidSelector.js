@@ -29,9 +29,19 @@ export class PyramidSelector {
 
         this._render();
 
-        // Return the first pyramid as default
-        this.currentId = this.pyramids[0].id;
-        return this.pyramids[0];
+        // Honor ?pyramid=<id> as the initial selection (catalogue deep-link). Setting currentId
+        // here — before any 'change' can fire — makes the deep-link shim's later select+change a
+        // harmless no-op (same id), so we never load the default and then race a switch onto it.
+        // When deep-linked the pyramid is fixed by the URL, so hide the dropdown (selection is the
+        // linking page's job). No/unknown ?pyramid= → first pyramid, dropdown stays (browse mode).
+        const wantedId = new URLSearchParams(location.search).get('pyramid');
+        const wanted = wantedId ? this.pyramids.find(p => p.id === wantedId) : null;
+        const initial = wanted || this.pyramids[0];
+        this.currentId = initial.id;
+        const select = this.container.querySelector('select');
+        if (select) select.value = initial.id;
+        if (wanted) this.container.style.display = 'none';
+        return initial;
     }
 
     _render() {

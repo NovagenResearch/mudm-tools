@@ -59,6 +59,13 @@ def main():
         default=None,
         help="Override max zoom level",
     )
+    convert_parser.add_argument(
+        "--compression",
+        choices=["meshopt", "draco", "none"],
+        default="meshopt",
+        help="3D GLB tile compression (obj format). Default: meshopt "
+        "(~4-5x smaller, EXT_meshopt_compression — what the 3D viewer expects).",
+    )
 
     # list-formats command
     subparsers.add_parser("list-formats", help="List available converter formats")
@@ -84,6 +91,7 @@ def main():
             config["temp_dir"] = args.temp_dir
         if args.max_zoom is not None:
             config["max_zoom"] = args.max_zoom
+        config.setdefault("compression", args.compression)
 
         result = convert(args.format, args.input, args.output, config)
         print(f"\nResult: {json.dumps(result, indent=2, default=str)}")

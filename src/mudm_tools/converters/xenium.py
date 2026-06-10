@@ -34,6 +34,25 @@ import numpy as np
 from . import register
 
 
+def _find_morphology_image(data_dir: Path) -> Path | None:
+    """Locate the DAPI morphology image inside a Xenium output bundle.
+
+    Handles the layouts 10x has shipped across XOA versions:
+      * ``morphology_focus/ch0000_dapi.ome.tif`` — named single-channel DAPI (e.g. XOA 4.0)
+      * ``morphology_focus/morphology_focus_0000.ome.tif`` — numbered per-channel files
+        (XOA 2.0/3.0); channel 0 is DAPI by Xenium convention
+      * ``morphology_focus.ome.tif`` — single-file morphology image
+
+    Returns the first existing candidate, or ``None`` if no DAPI image is present.
+    """
+    candidates = [
+        data_dir / "morphology_focus" / "ch0000_dapi.ome.tif",
+        data_dir / "morphology_focus" / "morphology_focus_0000.ome.tif",
+        data_dir / "morphology_focus.ome.tif",
+    ]
+    return next((p for p in candidates if p.exists()), None)
+
+
 @register("xenium")
 class XeniumConverter:
     """Convert 10x Genomics Xenium data to muDM tiled format."""
@@ -306,11 +325,7 @@ class XeniumConverter:
         import tifffile
         from PIL import Image
 
-        morph_candidates = [
-            data_dir / "morphology_focus" / "ch0000_dapi.ome.tif",
-            data_dir / "morphology_focus.ome.tif",
-        ]
-        morph_path = next((p for p in morph_candidates if p.exists()), None)
+        morph_path = _find_morphology_image(data_dir)
 
         raster_dir = out_dir / "raster"
         if morph_path is None:

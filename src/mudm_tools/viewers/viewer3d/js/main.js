@@ -16,9 +16,11 @@ import { AxisGizmo } from './AxisGizmo.js';
 
 // --- Scene setup ---
 const canvas = document.getElementById('canvas');
-const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, preserveDrawingBuffer: true });
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, preserveDrawingBuffer: false });
 // NOTE: Do NOT use setPixelRatio — causes rendering offset on macOS Retina.
 // DPR is handled manually in onResize() instead.
+// preserveDrawingBuffer:false — takeScreenshot() forces a fresh renderer.render()
+// before reading the canvas, so the back buffer never needs to be retained.
 renderer.outputColorSpace = THREE.SRGBColorSpace;
 
 const scene = new THREE.Scene();
@@ -66,19 +68,17 @@ infoPanel.slicePanel = slicePlanePanel;
 // --- Overview Panel ---
 const overviewPanel = new OverviewPanel({
     onSelectionChange: (worldCenter, ring) => {
-        // Only apply spatial filter when overview is actually enabled
-        const toggle = document.getElementById('overview-toggle');
-        if (toggle && toggle.checked) {
-            tileManager.setSpatialFilter(worldCenter, ring);
-            // Recenter main camera on clicked position
-            const offset = camera.position.clone().sub(controls.target);
-            controls.target.copy(worldCenter);
-            camera.position.copy(worldCenter).add(offset);
-            controls.update();
-        }
+        // Overview is always on — clicking it focuses the main view (spatial
+        // filter) on the clicked region and recenters the camera there.
+        tileManager.setSpatialFilter(worldCenter, ring);
+        const offset = camera.position.clone().sub(controls.target);
+        controls.target.copy(worldCenter);
+        camera.position.copy(worldCenter).add(offset);
+        controls.update();
     },
 });
 overviewPanel.initDOM();
+overviewPanel.enabled = true;   // overview is always on (no toggle)
 
 // --- Feature Selector ---
 const selectorContainer = document.getElementById('feature-selector');
@@ -466,6 +466,7 @@ function _setHover(featureName) {
     } else {
         canvas.style.cursor = '';
     }
+    requestRender();   // hover emissive changed → repaint (render-on-demand)
 }
 
 function _setFeatureEmissive(name, color) {
@@ -501,32 +502,12 @@ gpuSlider.addEventListener('input', () => {
     tileManager.maxGpuMB = mb;
 });
 
-// --- LOD Controls ---
-const lodRadios = document.querySelectorAll('input[name="lod-mode"]');
+// --- Zoom level (always a manually-selected level; no dynamic LOD) ---
 const zoomSlider = document.getElementById('zoom-slider');
 const zoomLabel = document.getElementById('zoom-label');
 const zoomDistEl = document.getElementById('zoom-distribution');
+tileManager.lodMode = 'forced';
 
-for (const radio of lodRadios) {
-    radio.addEventListener('change', () => {
-        if (!radio.checked) return;  // ignore the unchecked radio's event
-        tileManager.lodMode = radio.value;
-        zoomSlider.disabled = (radio.value === 'dynamic');
-        if (radio.value === 'forced') {
-            tileManager.forcedZoom = parseInt(zoomSlider.value);
-        }
-        console.log(`[LOD] mode=${radio.value} forcedZoom=${tileManager.forcedZoom}`);
-
-        // Update overview zoom reference
-        if (radio.value === 'forced') {
-            overviewPanel.currentZoom = tileManager.forcedZoom;
-        } else {
-            overviewPanel.currentZoom = tileManager.maxZoom;
-        }
-        syncOverviewRingMax();
-        overviewPanel._updateOverlays();
-    });
-}
 zoomSlider.addEventListener('input', () => {
     const z = parseInt(zoomSlider.value);
     zoomLabel.textContent = z;
@@ -537,27 +518,20 @@ zoomSlider.addEventListener('input', () => {
     overviewPanel._fireSelectionChange();
 });
 
-// --- Overview Controls ---
-const overviewToggle = document.getElementById('overview-toggle');
-const overviewOptions = document.getElementById('overview-options');
-const overviewContainer = document.getElementById('overview-container');
+// --- Opacity (main-view neuron transparency) ---
+const opacitySlider = document.getElementById('opacity-slider');
+const opacityLabel = document.getElementById('opacity-label');
+opacitySlider.addEventListener('input', () => {
+    const pct = parseInt(opacitySlider.value);
+    opacityLabel.textContent = pct + '%';
+    tileManager.setOpacity(pct / 100);
+    requestRender();
+});
+
+// --- Overview Controls (overview is always on; selector lives above the panels) ---
 const overviewRingSlider = document.getElementById('overview-ring-slider');
 const overviewRingLabel = document.getElementById('overview-ring-label');
 const overviewAxesRadios = document.querySelectorAll('input[name="overview-axes"]');
-
-overviewToggle.addEventListener('change', () => {
-    overviewPanel.enabled = overviewToggle.checked;
-    overviewOptions.style.display = overviewToggle.checked ? '' : 'none';
-    overviewContainer.style.display = overviewToggle.checked ? '' : 'none';
-
-    if (!overviewToggle.checked) {
-        tileManager.setSpatialFilter(null, 0);
-    } else {
-        overviewPanel._fireSelectionChange();
-    }
-
-    onResize();
-});
 
 for (const radio of overviewAxesRadios) {
     radio.addEventListener('change', () => {
@@ -578,7 +552,9 @@ function onResize() {
     const overviewWidth = overviewPanel.enabled ? 350 : 0;
     const w = window.innerWidth - sidebarWidth - overviewWidth;
     const h = window.innerHeight;
-    const dpr = window.devicePixelRatio || 1;
+    // Cap effective DPR at 1.5 — on a 2x/3x Retina display this cuts fragment
+    // work up to ~4x with negligible visual loss for solid-colored meshes.
+    const dpr = Math.min(window.devicePixelRatio || 1, 1.5);
     camera.aspect = w / h;
     camera.updateProjectionMatrix();
 
@@ -656,29 +632,60 @@ window.addEventListener('keydown', (e) => {
     }
 });
 
-// --- Render loop ---
+// --- Render loop (render-on-demand) ---
+// Idle frames are skipped entirely: the heavy work (tileManager.update +
+// renderer.render + the two overview panels + gizmo) only runs when something
+// actually changed. A 9k–23k-mesh scene that sat at a busy-looping 60fps now
+// costs ~0 when nothing is happening. needsRender is raised by:
+//   • OrbitControls 'change' (orbit / zoom / pan), and damping settles via
+//     controls.update()'s return value;
+//   • any sidebar interaction (sliders, selects, checkboxes, buttons, feature
+//     toggles) via cheap capture-phase document listeners;
+//   • hover-highlight changes (_setHover) and window resize;
+//   • tiles still streaming in (tileManager._pendingLoads) or a just-completed
+//     async load/unload (tileManager._dirty).
 let animating = false;
+let needsRender = true;
+function requestRender() { needsRender = true; }
+controls.addEventListener('change', requestRender);
+window.addEventListener('resize', requestRender);
+// Catch-all for sidebar UI + overview interactions + keyboard shortcuts —
+// these mutate the scene/overview without moving the main camera. Capture phase
+// + a plain boolean flip → negligible cost. ('wheel' covers the overview's own
+// zoom; 'keydown' covers reset/select-all/focus/clear shortcuts.)
+document.addEventListener('input', requestRender, true);
+document.addEventListener('change', requestRender, true);
+document.addEventListener('click', requestRender, true);
+document.addEventListener('wheel', requestRender, true);
+document.addEventListener('keydown', requestRender, true);
+
 function animate() {
     requestAnimationFrame(animate);
-    controls.update();
+    const moved = controls.update();   // true while inertial damping is settling
+    const busy = tileManager._pendingLoads > 0 || tileManager._dirty;
+    if (!(needsRender || moved || busy)) return;   // idle → skip the whole frame
+    needsRender = false;
+    tileManager._dirty = false;
+
     tileManager.update(camera);
     renderer.render(scene, camera);
 
-    // Render overview panels
-    overviewPanel.render();
+    // Render overview panels (skip when the panel is collapsed/disabled —
+    // it would otherwise cost two extra full-scene renders per frame)
+    if (overviewPanel.enabled) overviewPanel.render();
 
     // Update scale bar and axis gizmo
     scaleBar.update(camera, controls);
     axisGizmo.render(renderer, camera);
 
-    // Stats + FPS
+    // Stats + FPS (counted over rendered frames only)
     frameCount++;
     const now = performance.now();
     if (now - lastTime >= 1000) {
         fps = Math.round(frameCount * 1000 / (now - lastTime));
         frameCount = 0;
         lastTime = now;
-        statFPS.textContent = fps;
+        statFPS.textContent = `${fps} · ${renderer.info.render.calls} draws`;
     }
     statLoaded.textContent = tileManager.loadedCount;
     statVisible.textContent = tileManager.visibleCount;
@@ -699,10 +706,17 @@ function resetCamera() {
     box.getSize(size);
     const maxDim = Math.max(size.x, size.y, size.z);
 
-    // Adapt clipping planes to dataset scale
+    // Adapt clipping planes + zoom limits to dataset scale. Coordinates range from
+    // nanometers (EM/connectome) to meters (anatomy); a fixed minDistance would clamp
+    // zoom-in on small-coordinate datasets (e.g. a ~1.8-unit HRA body vs the old minDistance 10).
     camera.near = maxDim * 0.0001;
     camera.far = maxDim * 10;
     camera.updateProjectionMatrix();
+    controls.minDistance = maxDim * 0.0005;
+
+    // Scale bar reads real-world units from tilejson3d (meters_per_unit); defaults to nm (EM).
+    scaleBar.setMetersPerUnit(tileManager.metersPerUnit ?? 1e-9);
+    overviewPanel.metersPerUnit = tileManager.metersPerUnit ?? 1e-9;  // overview scale bar too
 
     camera.position.set(
         center.x + maxDim * 0.6,
@@ -756,7 +770,7 @@ async function loadPyramid(pyramid) {
     // Update overview panel
     overviewPanel.setFeatureIndex(tileManager.featureIndex);
     overviewPanel.setBounds(tileManager.root.box3, tileManager.maxZoom, baseUrl);
-    overviewPanel.loadTiles();
+    overviewPanel.loadTiles().then(requestRender);   // repaint once z0 tiles arrive (render-on-demand)
     syncOverviewRingMax();
     overviewPanel.setSelectedFeatures(featureSelector.selected);
 
@@ -804,7 +818,7 @@ async function init() {
         // Update overview panel
         overviewPanel.setFeatureIndex(tileManager.featureIndex);
         overviewPanel.setBounds(tileManager.root.box3, tileManager.maxZoom, baseUrl);
-        overviewPanel.loadTiles();
+        overviewPanel.loadTiles().then(requestRender);   // repaint once z0 tiles arrive (render-on-demand)
         syncOverviewRingMax();
 
         // Populate color-by dropdown

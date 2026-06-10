@@ -50,6 +50,10 @@ class GeoJsonConverter:
         min_zoom = config.get("min_zoom", 0)
         bounds = config.get("bounds")
         layer_name = config.get("layer_name", "features")
+        # Polygon simplification (Douglas-Peucker at coarse zooms) is great for large shapes but COLLAPSES
+        # small features (e.g. ~20px segmented cells) into slivers. Let callers disable it for cell/nucleus
+        # datasets. Default True preserves prior behavior.
+        simplify = config.get("simplify", True)
 
         t_start = time.time()
 
@@ -89,7 +93,7 @@ class GeoJsonConverter:
         print("Encoding PBF...", end=" ", flush=True)
         t0 = time.time()
         mvt_dir = out_dir / "vectors"
-        generate_pbf(gen, str(mvt_dir), bounds, simplify=True, layer_name=layer_name)
+        generate_pbf(gen, str(mvt_dir), bounds, simplify=simplify, layer_name=layer_name)
         t_pbf = time.time() - t0
         print(f"done ({t_pbf:.1f}s)", flush=True)
 
