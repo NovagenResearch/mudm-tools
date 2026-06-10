@@ -344,20 +344,11 @@ def tile_meshopt(mesh_dir: Path, meta_lookup: dict[str, dict], output_dir: Path,
         print(f"  Parquet: {n_rows:,} rows in {_fmt_time(time.perf_counter() - t0)} "
               f"({_fmt_bytes(pq_size)})")
 
-    # Neuroglancer last — the multilod resolver can be memory-heavy at large
-    # feature counts, so run it after the durable outputs are already on disk.
-    if emit_neuroglancer:
-        ng_dir = output_dir / "neuroglancer"
-        if ng_dir.exists():
-            shutil.rmtree(ng_dir)
-        print("Emitting Neuroglancer precomputed multilod...")
-        t0 = time.perf_counter()
-        gen.generate_neuroglancer_multilod(str(ng_dir), bounds)
-        print(f"  Neuroglancer in {_fmt_time(time.perf_counter() - t0)} "
-              f"({_fmt_bytes(_dir_size(ng_dir))})")
-
-    del gen
-
+    # Index FIRST — build_index reads the 3D-Tiles dir (not the generator), so it
+    # is independent of the memory-heavy Neuroglancer step below. Writing the
+    # index here (before NG) guarantees an NG OOM/crash can never leave an
+    # un-indexed, unloadable pyramid (the GLBs are useless to the viewer without
+    # features.json / tilejson3d.json / the pyramids.json entry).
     output_size = _dir_size(tiles3d_dir)
     print(f"Output: {tiles3d_dir} ({_fmt_bytes(output_size)})")
 
@@ -388,6 +379,28 @@ def tile_meshopt(mesh_dir: Path, meta_lookup: dict[str, dict], output_dir: Path,
     manifest["pyramids"] = [p for p in manifest["pyramids"] if p.get("id") != pyramid_id] + [entry]
     pyramids_path.write_text(json.dumps(manifest, indent=2))
     print(f"Updated {pyramids_path} (entry: {pyramid_id}, {n_features} features, {n_tiles} tiles)")
+
+    # Neuroglancer LAST — the multilod resolver can be memory-heavy at large
+    # feature counts, so it runs after the durable outputs AND the index are on
+    # disk. Any failure is logged + swallowed so it can never orphan the pyramid;
+    # a partial neuroglancer/ dir is removed on failure.
+    if emit_neuroglancer:
+        ng_dir = output_dir / "neuroglancer"
+        if ng_dir.exists():
+            shutil.rmtree(ng_dir)
+        print("Emitting Neuroglancer precomputed multilod...")
+        t0 = time.perf_counter()
+        try:
+            gen.generate_neuroglancer_multilod(str(ng_dir), bounds)
+            print(f"  Neuroglancer in {_fmt_time(time.perf_counter() - t0)} "
+                  f"({_fmt_bytes(_dir_size(ng_dir))})")
+        except Exception as e:  # noqa: BLE001 — NG is optional; never fail the run
+            print(f"  WARNING: Neuroglancer emit failed ({e}); pyramid is "
+                  f"complete without it.", file=sys.stderr)
+            if ng_dir.exists():
+                shutil.rmtree(ng_dir, ignore_errors=True)
+
+    del gen
 
 
 # ---------------------------------------------------------------------------
