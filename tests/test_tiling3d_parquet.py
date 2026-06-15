@@ -796,6 +796,99 @@ class TestParquetPartitioned:
 
         assert _canon(read_parquet(out_serial)) == _canon(read_parquet(out_overlap))
 
+    def test_native_partitioned_coalesces_across_chunks(self, tmp_path):
+        """Wiring RotatingWriterRs (de-fragmentation fix): with many byte-chunks
+        (max_batch_bytes=1 -> one chunk per shard) and a large max_file_bytes, parts
+        must COALESCE across chunks (<=1 part/zoom), not emit a fresh per-zoom part
+        PER chunk (the 28.5k-fragment root cause). Content must equal the single-chunk
+        (unsplit) reference. Pre-fix: parts ~= #chunks (RED); post-fix: ~1/zoom."""
+        import random
+
+        from mudm_tools._rs import StreamingTileGenerator
+
+        # `add_obj_files` writes ONE .mjf shard per input file; with max_batch_bytes=1
+        # that is one byte-chunk per shard. 24 single-triangle meshes -> 24 chunks, all
+        # contributing rows to the same zoom dirs -> PRE-fix ~24 parts/zoom; POST-fix 1.
+        obj_dir = tmp_path / "objs"
+        obj_dir.mkdir()
+        rng = random.Random(1)
+        paths = []
+        for i in range(24):
+            cx, cy, cz = (rng.uniform(5.0, 15.0) for _ in range(3))
+            p = obj_dir / f"m_{i:03d}.obj"
+            p.write_text(
+                f"v {cx} {cy} {cz}\nv {cx + 1.0} {cy} {cz}\n"
+                f"v {cx + 0.5} {cy + 1.0} {cz + 0.5}\nf 1 2 3\n"
+            )
+            paths.append(str(p))
+        paths.sort()
+        bounds = (0.0, 0.0, 0.0, 100.0, 100.0, 100.0)
+        tags = [{"name": f"m{i}"} for i in range(len(paths))]
+
+        def _gen(out, max_batch_bytes, max_file_bytes):
+            g = StreamingTileGenerator(min_zoom=0, max_zoom=3, base_cells=100)
+            g.add_obj_files(paths, bounds, tags, 0)
+            return g.generate_parquet_native_partitioned(
+                str(out), bounds, "zstd", 3, max_batch_bytes, max_file_bytes, False,
+            )
+
+        out_many = tmp_path / "manychunks"          # 1-byte budget -> one chunk per shard
+        n_many = _gen(out_many, 1, 500_000_000)      # large file budget -> coalesce
+        out_ref = tmp_path / "ref"                   # single chunk, no split (reference)
+        n_ref = _gen(out_ref, 10**18, 10**18)
+        assert n_many == n_ref > 0
+
+        for z in range(4):
+            zdir = out_many / f"zoom={z}"
+            if not zdir.exists():
+                continue
+            parts = sorted(zdir.glob("part_*.parquet"))
+            assert len(parts) <= 1, f"zoom {z}: {len(parts)} parts — not coalesced across chunks"
+
+        def _canon2(rows):
+            return sorted(
+                (r["zoom"], r["tile_x"], r["tile_y"], r["tile_d"], r["feature_id"],
+                 r["geom_type"], r["positions"].tobytes(), r["indices"].tobytes())
+                for r in rows
+            )
+        assert _canon2(read_parquet(out_many)) == _canon2(read_parquet(out_ref))
+
+    def test_native_partitioned_bounds_row_group_by_bytes(self, tmp_path, monkeypatch):
+        """Bounded-memory fix: the in-memory parquet row group is flushed by a BYTE
+        target (MUDM_PARQUET_ROW_GROUP_BYTES), not ONLY by the ~1M-row default — so a
+        large-binary zoom cannot buffer GBs before a flush. With a tiny target, a
+        single part must hold >1 row group. Pre-fix (row-count-only flush): exactly
+        1 row group per part regardless of byte size."""
+        import pyarrow.parquet as pq
+
+        def _run(out, mbb=10**18, mfb=10**18):  # 1 chunk + no file rotation -> isolate row-group flush
+            gen, _ = _build_generator_with_features(
+                [_make_dense_tin_feature(300)], min_zoom=0, max_zoom=2)
+            return gen.generate_parquet_native_partitioned(
+                str(out), WORLD_BOUNDS, "zstd", 3, mbb, mfb, False)
+
+        # Reference: default target -> ~1 row group/part (no byte flush).
+        out_ref = tmp_path / "ref"
+        n_ref = _run(out_ref)
+        # Tiny target -> the byte flush fires repeatedly.
+        monkeypatch.setenv("MUDM_PARQUET_ROW_GROUP_BYTES", "512")
+        out = tmp_path / "rg"
+        n = _run(out)
+        assert n == n_ref > 0
+
+        max_rg = max((pq.ParquetFile(p).metadata.num_row_groups for p in out.rglob("*.parquet")), default=0)
+        assert max_rg > 1, f"max row groups per part = {max_rg}; byte-target flush not applied"
+
+        # Content must be IDENTICAL while flushing (row groups are within-file; the
+        # flush must not drop/duplicate/reorder rows the reader returns).
+        def _c(rows):
+            return sorted(
+                (r["zoom"], r["tile_x"], r["tile_y"], r["tile_d"], r["feature_id"],
+                 r["geom_type"], r["positions"].tobytes(), r["indices"].tobytes())
+                for r in rows
+            )
+        assert _c(read_parquet(out)) == _c(read_parquet(out_ref))
+
 
 # ---------------------------------------------------------------------------
 # Streaming API low-level tests

@@ -101,7 +101,10 @@ class GeoJsonConverter:
         print("Encoding Parquet...", end=" ", flush=True)
         t0 = time.time()
         pq_dir = out_dir / "features.parquet"
-        pq_rows = gen.generate_parquet_native(str(pq_dir), bounds, simplify=True)
+        # G1 (streaming_review.md §G): bounded path (was unbounded
+        # generate_parquet_native, which read the whole corpus into RAM). Peak
+        # scales with max_batch_bytes (default 2 GB), not corpus size.
+        pq_rows = gen.generate_parquet_native_partitioned(str(pq_dir), bounds, simplify=True)
         t_pq = time.time() - t0
         print(f"{pq_rows:,} rows ({t_pq:.1f}s)", flush=True)
 
@@ -115,16 +118,46 @@ class GeoJsonConverter:
         }
 
     def _compute_bounds(self, files):
-        xmin, ymin = float("inf"), float("inf")
-        xmax, ymax = float("-inf"), float("-inf")
+        # PY-3 (streaming_review.md §G): this previously called a `pass`-only
+        # helper, so auto-bounds ALWAYS fell through to the (0,0,1,1) fallback —
+        # every feature then projected into a degenerate unit square. Accumulate
+        # the real extent by walking the (arbitrarily nested) coordinate arrays.
+        acc = [float("inf"), float("inf"), float("-inf"), float("-inf")]  # xmin,ymin,xmax,ymax
         for f in files:
             fc = json.loads(f.read_text())
             for feat in fc.get("features", []):
-                coords = feat.get("geometry", {}).get("coordinates", [])
-                self._update_bounds_from_coords(coords)
-        # Fallback
+                self._update_bounds_from_geometry(feat.get("geometry") or {}, acc)
+        xmin, ymin, xmax, ymax = acc
         return (xmin, ymin, xmax, ymax) if xmin != float("inf") else (0, 0, 1, 1)
 
-    def _update_bounds_from_coords(self, coords):
-        # Recursive coordinate extraction — simplified
-        pass
+    def _update_bounds_from_geometry(self, geom, acc):
+        """Expand acc over a GeoJSON geometry. A GeometryCollection stores its
+        members under `geometries` (not `coordinates`), so dispatch on type and
+        recurse; every other geometry walks its `coordinates`."""
+        if not isinstance(geom, dict):
+            return
+        if geom.get("type") == "GeometryCollection":
+            for sub in geom.get("geometries", []) or []:
+                self._update_bounds_from_geometry(sub, acc)
+        else:
+            self._update_bounds_from_coords(geom.get("coordinates", []), acc)
+
+    def _update_bounds_from_coords(self, coords, acc):
+        """Recursively expand acc=[xmin,ymin,xmax,ymax] over a GeoJSON
+        coordinate array of arbitrary nesting (Point→…→MultiPolygon)."""
+        if not isinstance(coords, (list, tuple)) or not coords:
+            return
+        # A position is [x, y, ...] with numeric leads; anything else recurses.
+        if isinstance(coords[0], (int, float)) and len(coords) >= 2:
+            x, y = coords[0], coords[1]
+            if x < acc[0]:
+                acc[0] = x
+            if y < acc[1]:
+                acc[1] = y
+            if x > acc[2]:
+                acc[2] = x
+            if y > acc[3]:
+                acc[3] = y
+            return
+        for c in coords:
+            self._update_bounds_from_coords(c, acc)

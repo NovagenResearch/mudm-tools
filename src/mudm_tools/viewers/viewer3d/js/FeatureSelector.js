@@ -1,9 +1,19 @@
 /**
- * Feature selector sidebar — searchable, filterable checkbox list.
+ * Feature selector sidebar — searchable, filterable, VIRTUALIZED checkbox list.
  *
  * Loads features.json and renders a filterable list. Fires a callback
  * whenever the selection changes with the set of selected feature names.
+ *
+ * Scales to 100k+ features: the list is windowed — only the rows in the
+ * scroll viewport (plus a small overscan) exist in the DOM at any time, so
+ * DOM node count is O(viewport), not O(features). Search/filter run over an
+ * in-memory model and re-render only the window. A single delegated change
+ * listener on the list container handles all checkboxes (no per-row listeners).
  */
+
+const ROW_H = 26;          // px; fixed row height (enforced inline) so windowing math is exact
+const OVERSCAN = 6;        // extra rows rendered above/below the viewport to hide scroll seams
+const SEARCH_DEBOUNCE_MS = 150;
 
 export class FeatureSelector {
     /**
@@ -15,8 +25,17 @@ export class FeatureSelector {
         this.onSelectionChange = onSelectionChange;
         this.features = {};          // name → {color, acronym, ccf_id, tiles, ...}
         this.selected = new Set();
-        this.checkboxes = new Map();  // name → checkbox element
-        this._allItems = [];         // all list item elements
+
+        // Virtualized-list model
+        this._model = [];            // [{name, color, lower, props}] sorted by name
+        this._filtered = [];         // subset of _model passing search + filter (entries)
+        this._listEl = null;         // scroll viewport (.feature-list)
+        this._sizer = null;          // tall inner spacer; rows are absolutely positioned inside
+        this._scrollRaf = 0;         // rAF handle coalescing scroll-driven re-renders
+        this._searchTimer = 0;       // debounce handle for search input
+        this._filterTimer = 0;       // debounce handle for numeric filter inputs
+        this._swatchColors = null;   // optional name→color override (color-by mode)
+
         this._searchQuery = '';
         // Filter state
         this._filterAttr = '';       // current filter attribute key
@@ -27,9 +46,19 @@ export class FeatureSelector {
         this._idFields = new Set();  // fields to exclude (from features.json id_fields)
     }
 
-    async init(featuresUrl, idFields = []) {
-        const resp = await fetch(featuresUrl);
-        const data = await resp.json();
+    /**
+     * @param {string|object} featuresSource - a URL to fetch features.json from,
+     *   OR an already-parsed features document (shared with TileManager to avoid
+     *   fetching + parsing the same multi-hundred-MB payload twice).
+     */
+    async init(featuresSource, idFields = []) {
+        let data;
+        if (typeof featuresSource === 'string') {
+            const resp = await fetch(featuresSource);
+            data = await resp.json();
+        } else {
+            data = featuresSource;
+        }
         // Use idFields parameter if provided, fall back to features.json metadata
         if (idFields.length > 0) {
             this._idFields = new Set(idFields);
@@ -49,28 +78,41 @@ export class FeatureSelector {
             this.features = data.features;
         }
         this.selected.clear();
-        this.checkboxes.clear();
-        this._allItems = [];
+        this._swatchColors = null;
         this._searchQuery = '';
         this._filterAttr = '';
         this._filterType = '';
         this._filterValues.clear();
         this._filterMin = null;
         this._filterMax = null;
+        this._buildModel();
         this._render();
+    }
+
+    /** Build the sorted in-memory model once; rendering is derived from it. */
+    _buildModel() {
+        const names = Object.keys(this.features).sort();
+        this._model = names.map(name => {
+            const feat = this.features[name];
+            return { name, color: feat?.color || '#888', lower: name.toLowerCase(), props: feat };
+        });
+        this._filtered = this._model;
     }
 
     _render() {
         this.container.innerHTML = '';
 
-        // Search input
+        // Search input (debounced — drives filtering off the in-memory model)
         const search = document.createElement('input');
         search.type = 'text';
         search.placeholder = 'Search features...';
         search.className = 'feature-search';
         search.addEventListener('input', () => {
-            this._searchQuery = search.value;
-            this._applyFilters();
+            clearTimeout(this._searchTimer);
+            this._searchTimer = setTimeout(() => {
+                this._searchQuery = search.value;
+                this._applyFilters();
+            }, SEARCH_DEBOUNCE_MS);
         });
         this.container.appendChild(search);
 
@@ -84,7 +126,7 @@ export class FeatureSelector {
         const count = document.createElement('span');
         count.className = 'feature-count';
         count.id = 'feature-count';
-        count.textContent = `0 / ${Object.keys(this.features).length}`;
+        count.textContent = `0 / ${this._model.length}`;
         toolbar.appendChild(count);
 
         const selectAllBtn = document.createElement('button');
@@ -101,41 +143,106 @@ export class FeatureSelector {
 
         this.container.appendChild(toolbar);
 
-        // List
+        // Virtualized list: a scrolling viewport containing a tall sizer; only the
+        // rows in view (plus overscan) are materialized as absolutely-positioned
+        // children of the sizer.
         const list = document.createElement('div');
         list.className = 'feature-list';
+        const sizer = document.createElement('div');
+        sizer.className = 'feature-list-sizer';
+        sizer.style.position = 'relative';
+        sizer.style.width = '100%';
+        list.appendChild(sizer);
+        this._listEl = list;
+        this._sizer = sizer;
 
-        const names = Object.keys(this.features).sort();
-        for (const name of names) {
-            const feat = this.features[name];
-            const item = document.createElement('label');
-            item.className = 'feature-item';
-            item.dataset.name = name.toLowerCase();
-
-            const cb = document.createElement('input');
-            cb.type = 'checkbox';
-            cb.addEventListener('change', () => this._toggle(name, cb.checked));
-            this.checkboxes.set(name, cb);
-
-            const swatch = document.createElement('span');
-            swatch.className = 'feature-swatch';
-            swatch.style.backgroundColor = feat.color || '#888';
-
-            const label = document.createElement('span');
-            label.className = 'feature-name';
-            label.textContent = name;
-            const tileCount = typeof feat.tiles === 'object'
-                ? Object.values(feat.tiles).reduce((s, a) => s + a.length, 0) : 0;
-            label.title = `${feat.acronym || ''} (${tileCount} tiles)`;
-
-            item.appendChild(cb);
-            item.appendChild(swatch);
-            item.appendChild(label);
-            list.appendChild(item);
-            this._allItems.push(item);
+        // One delegated change listener for ALL checkboxes (rows are recycled).
+        list.addEventListener('change', (e) => {
+            const cb = e.target;
+            if (!cb || cb.type !== 'checkbox') return;
+            const item = cb.closest('.feature-item');
+            if (item) this._toggle(item.dataset.name, cb.checked);
+        });
+        // Re-window on scroll (coalesced to one render per animation frame).
+        list.addEventListener('scroll', () => {
+            if (this._scrollRaf) return;
+            this._scrollRaf = requestAnimationFrame(() => {
+                this._scrollRaf = 0;
+                this._renderWindow();
+            });
+        });
+        // Re-window when the sidebar resizes (viewport row count changes).
+        if (typeof ResizeObserver !== 'undefined') {
+            this._resizeObserver?.disconnect();
+            this._resizeObserver = new ResizeObserver(() => this._renderWindow());
+            this._resizeObserver.observe(list);
         }
 
         this.container.appendChild(list);
+
+        this._applyFilters();
+    }
+
+    /** Build one row element for a model entry, positioned at the given top offset. */
+    _makeRow(entry, topPx) {
+        const item = document.createElement('label');
+        item.className = 'feature-item';
+        item.dataset.name = entry.name;
+        item.style.position = 'absolute';
+        item.style.top = topPx + 'px';
+        item.style.left = '0';
+        item.style.right = '0';
+        item.style.height = ROW_H + 'px';
+        item.style.boxSizing = 'border-box';
+
+        const cb = document.createElement('input');
+        cb.type = 'checkbox';
+        cb.checked = this.selected.has(entry.name);
+
+        const swatch = document.createElement('span');
+        swatch.className = 'feature-swatch';
+        swatch.style.backgroundColor = this._swatchColor(entry);
+
+        const label = document.createElement('span');
+        label.className = 'feature-name';
+        label.textContent = entry.name;
+        const tiles = entry.props?.tiles;
+        const tileCount = typeof tiles === 'object' && tiles
+            ? Object.values(tiles).reduce((s, a) => s + a.length, 0) : 0;
+        label.title = `${entry.props?.acronym || ''} (${tileCount} tiles)`;
+
+        item.appendChild(cb);
+        item.appendChild(swatch);
+        item.appendChild(label);
+        return item;
+    }
+
+    /** Effective swatch color for an entry (honors color-by override if set). */
+    _swatchColor(entry) {
+        if (this._swatchColors && this._swatchColors.has(entry.name)) {
+            return this._swatchColors.get(entry.name);
+        }
+        return entry.color;
+    }
+
+    /** Render only the rows currently in the scroll viewport (+ overscan). */
+    _renderWindow() {
+        const list = this._listEl;
+        if (!list || !this._sizer) return;
+        const total = this._filtered.length;
+        const viewH = list.clientHeight || 400;
+        const scrollTop = list.scrollTop;
+
+        let start = Math.floor(scrollTop / ROW_H) - OVERSCAN;
+        if (start < 0) start = 0;
+        const visible = Math.ceil(viewH / ROW_H) + OVERSCAN * 2;
+        const end = Math.min(total, start + visible);
+
+        const frag = document.createDocumentFragment();
+        for (let i = start; i < end; i++) {
+            frag.appendChild(this._makeRow(this._filtered[i], i * ROW_H));
+        }
+        this._sizer.replaceChildren(frag);
     }
 
     // --- Filter logic ---
@@ -329,19 +436,24 @@ export class FeatureSelector {
         };
 
         const minLabel = document.createElement('span');
-        minLabel.textContent = '\u2265'; // ≥
+        minLabel.textContent = '≥'; // ≥
         minLabel.className = 'filter-numeric-label';
         const minInput = makeInput(String(min));
 
         const maxLabel = document.createElement('span');
-        maxLabel.textContent = '\u2264'; // ≤
+        maxLabel.textContent = '≤'; // ≤
         maxLabel.className = 'filter-numeric-label';
         const maxInput = makeInput(String(max));
 
         const update = () => {
-            this._filterMin = minInput.value !== '' ? parseFloat(minInput.value) : null;
-            this._filterMax = maxInput.value !== '' ? parseFloat(maxInput.value) : null;
-            this._applyFilters();
+            // Debounced: numeric inputs fire on every keystroke; each _applyFilters
+            // is an O(features) scan, so coalesce rapid typing.
+            clearTimeout(this._filterTimer);
+            this._filterTimer = setTimeout(() => {
+                this._filterMin = minInput.value !== '' ? parseFloat(minInput.value) : null;
+                this._filterMax = maxInput.value !== '' ? parseFloat(maxInput.value) : null;
+                this._applyFilters();
+            }, SEARCH_DEBOUNCE_MS);
         };
         minInput.addEventListener('input', update);
         maxInput.addEventListener('input', update);
@@ -353,25 +465,34 @@ export class FeatureSelector {
 
         const rangeHint = document.createElement('div');
         rangeHint.className = 'filter-range-hint';
-        rangeHint.textContent = `Range: ${min.toLocaleString()} \u2013 ${max.toLocaleString()}`;
+        rangeHint.textContent = `Range: ${min.toLocaleString()} – ${max.toLocaleString()}`;
 
         container.appendChild(row);
         container.appendChild(rangeHint);
     }
 
     /**
-     * Apply search + attribute filter to feature list visibility.
+     * Recompute the filtered set (search + attribute filter) from the model and
+     * re-render the visible window. O(features) over strings — no DOM touched
+     * except the ~viewport rows produced by _renderWindow().
      */
     _applyFilters() {
         const q = this._searchQuery.toLowerCase().trim();
-        for (const item of this._allItems) {
-            const name = item.querySelector('.feature-name')?.textContent || '';
-            // Search filter
-            const matchesSearch = !q || name.toLowerCase().includes(q);
-            // Attribute filter
-            const matchesFilter = this._matchesFilter(name);
-            item.style.display = (matchesSearch && matchesFilter) ? '' : 'none';
+        const hasFilter = !!this._filterAttr;
+        if (!q && !hasFilter) {
+            this._filtered = this._model;
+        } else {
+            const out = [];
+            for (const entry of this._model) {
+                if (q && !entry.lower.includes(q)) continue;
+                if (hasFilter && !this._matchesFilter(entry.name)) continue;
+                out.push(entry);
+            }
+            this._filtered = out;
         }
+        if (this._sizer) this._sizer.style.height = (this._filtered.length * ROW_H) + 'px';
+        if (this._listEl) this._listEl.scrollTop = 0;
+        this._renderWindow();
     }
 
     _matchesFilter(name) {
@@ -408,33 +529,26 @@ export class FeatureSelector {
         this.onSelectionChange(this.selected);
     }
 
+    /** Select every feature currently passing search + filter (the "visible" set). */
     _selectAllVisible() {
-        for (const item of this._allItems) {
-            if (item.style.display !== 'none') {
-                const name = item.querySelector('.feature-name').textContent;
-                const cb = this.checkboxes.get(name);
-                if (cb && !cb.checked) {
-                    cb.checked = true;
-                    this.selected.add(name);
-                }
-            }
+        for (const entry of this._filtered) {
+            this.selected.add(entry.name);
         }
         this._updateCount();
+        this._renderWindow();   // refresh checkbox state of on-screen rows
         this.onSelectionChange(this.selected);
     }
 
     _clearAll() {
-        for (const [name, cb] of this.checkboxes) {
-            cb.checked = false;
-            this.selected.delete(name);
-        }
+        this.selected.clear();
         this._updateCount();
+        this._renderWindow();
         this.onSelectionChange(this.selected);
     }
 
     _updateCount() {
         const el = document.getElementById('feature-count');
-        if (el) el.textContent = `${this.selected.size} / ${Object.keys(this.features).length}`;
+        if (el) el.textContent = `${this.selected.size} / ${this._model.length}`;
     }
 
     /**
@@ -442,17 +556,7 @@ export class FeatureSelector {
      * @param {Map<string, string>|null} nameColorMap - feature name → hex color
      */
     updateSwatchColors(nameColorMap) {
-        for (const item of this._allItems) {
-            const swatch = item.querySelector('.feature-swatch');
-            if (!swatch) continue;
-            const name = item.querySelector('.feature-name')?.textContent;
-            if (!name) continue;
-            if (nameColorMap && nameColorMap.has(name)) {
-                swatch.style.backgroundColor = nameColorMap.get(name);
-            } else {
-                const feat = this.features[name];
-                swatch.style.backgroundColor = feat?.color || '#888';
-            }
-        }
+        this._swatchColors = nameColorMap || null;
+        this._renderWindow();   // only the visible rows need recoloring
     }
 }

@@ -193,7 +193,10 @@ class XeniumConverter:
             print("  Encoding Parquet...", end=" ", flush=True)
             t0 = time.time()
             pq_tmp = Path(tempfile.mkdtemp(dir=temp_dir, prefix=f"pq_{layer_name}_"))
-            pq_rows = gen.generate_parquet_native(str(pq_tmp), tile_bounds, simplify=True)
+            # G1 (streaming_review.md §G): bounded path (was unbounded
+            # generate_parquet_native). Peak scales with max_batch_bytes
+            # (default 2 GB), not the transcript/cell corpus size.
+            pq_rows = gen.generate_parquet_native_partitioned(str(pq_tmp), tile_bounds, simplify=True)
             t_pq = time.time() - t0
             print(f"{pq_rows:,} rows ({t_pq:.1f}s)", flush=True)
 

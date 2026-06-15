@@ -115,14 +115,19 @@ class ObjConverter:
         # Generate Parquet
         t_parquet = 0.0
         if do_parquet:
+            # G1 (streaming_review.md §G): route through the bounded,
+            # memory-ceiling-aware partitioned path. The previous call to the
+            # unbounded gen.generate_parquet_native loaded the WHOLE decoded
+            # corpus into RAM — the real OOM exposure for large OBJ corpora. The
+            # wrapper derives max_batch_bytes from the configured ceiling; output
+            # rows are content-identical (only part-file numbering differs).
+            # `simplify` was already applied at ingest (add_obj_files above).
+            from mudm_tools.tiling3d.parquet_writer import generate_parquet
+
             print("Encoding Parquet...", end=" ", flush=True)
             t0 = time.time()
             pq_dir = out_dir / "features.parquet"
-            pq_rows = gen.generate_parquet_native(
-                str(pq_dir),
-                bounds,
-                simplify=True,
-            )
+            pq_rows = generate_parquet(gen, str(pq_dir), bounds, partitioned=True)
             t_parquet = time.time() - t0
             print(f"{pq_rows:,} rows ({t_parquet:.1f}s)", flush=True)
 

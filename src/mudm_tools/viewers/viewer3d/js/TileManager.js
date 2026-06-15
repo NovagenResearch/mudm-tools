@@ -20,6 +20,7 @@ const DEFAULT_GPU_MB = 1024;
 const SSE_THRESHOLD = 300;
 const HYSTERESIS_FRAMES = 10;  // ~0.17s at 60fps
 const STALE_FRAMES = 120;      // ~2s for stale cleanup
+const SELECTION_WARN_THRESHOLD = 5000;  // warn above this many selected w/o spatial filter
 
 /** Load states for tiles. */
 const UNLOADED = 0, LOADING = 1, LOADED = 2, FAILED = 3;
@@ -66,8 +67,14 @@ export class TileManager {
         /** Real-world meters per world unit (for the scale bar); nm by default (EM datasets). */
         this.metersPerUnit = 1e-9;
 
-        /** URI → TileNode for all nodes in the hierarchy. */
+        /** URI → TileNode for all nodes in the hierarchy. Indexed under multiple
+         * keys per node (full uri, bare id, canonical z/x/y/d), so NEVER iterate
+         * .values() for counting — use _allNodes (deduplicated) instead. */
         this.nodeByUri = new Map();
+        /** Deduplicated set of every TileNode (one entry per node) for iteration
+         * and byte/loaded-count stats. Avoids the 2-3x over-count that iterating
+         * nodeByUri.values() would cause. */
+        this._allNodes = new Set();
 
         /** Currently selected feature names. */
         this.selectedFeatures = new Set();
@@ -91,6 +98,12 @@ export class TileManager {
 
         // Tiles protected from eviction (active + transition target)
         this._protectedUris = new Set();
+        // Estimated resident bytes of the protected set this frame (admission control).
+        this._protectedBytes = 0;
+        // Running-average decoded GPU bytes per tile, used to budget not-yet-loaded
+        // tiles before they are fetched. Seeded at 2 MB; self-corrects as tiles load.
+        this._avgTileBytes = 2 * 1024 * 1024;
+        this._avgSamples = 0;
 
         // Traversal state
         this.root = null;
@@ -117,7 +130,12 @@ export class TileManager {
         this._colorPalette = new Map();  // attribute value → '#rrggbb'
     }
 
-    async init() {
+    /**
+     * @param {object|null} featuresData - already-parsed features.json document.
+     *   When provided, it is reused instead of re-fetching/re-parsing (the same
+     *   payload is also consumed by FeatureSelector — see main.js loadPyramid).
+     */
+    async init(featuresData = null) {
         const tilesetResp = await fetch(this.baseUrl + 'tileset.json');
         const tileset = await tilesetResp.json();
         this.root = new TileNode(tileset.root, 0, null);
@@ -138,8 +156,11 @@ export class TileManager {
             // tilejson3d.json not available — fall back to features.json metadata
         }
 
-        const featResp = await fetch(this.baseUrl + 'features.json');
-        const data = await featResp.json();
+        let data = featuresData;
+        if (!data) {
+            const featResp = await fetch(this.baseUrl + 'features.json');
+            data = await featResp.json();
+        }
         // Fall back to features.json for maxZoom and idFields if tilejson3d not loaded
         if (!this.idFields || this.idFields.size === 0) {
             const collProps = data.properties ?? {};
@@ -177,10 +198,11 @@ export class TileManager {
     /**
      * Switch to a different pyramid. Unloads everything and re-inits.
      * @param {string} newBaseUrl - new base URL for tiles (e.g. '/tiles/2020-11-26/3dtiles/')
+     * @param {object|null} featuresData - already-parsed features.json to reuse (optional)
      */
-    async switchPyramid(newBaseUrl) {
+    async switchPyramid(newBaseUrl, featuresData = null) {
         // Unload all tiles
-        for (const node of this.nodeByUri.values()) {
+        for (const node of this._allNodes) {
             if (node.loadState === LOADED) {
                 this._unloadNode(node);
             }
@@ -188,6 +210,7 @@ export class TileManager {
 
         // Clear all state
         this.nodeByUri.clear();
+        this._allNodes.clear();
         this.root = null;
         this.featureIndex = {};
         this.selectedFeatures = new Set();
@@ -203,11 +226,12 @@ export class TileManager {
 
         // Set new URL and re-init
         this.baseUrl = newBaseUrl.endsWith('/') ? newBaseUrl : newBaseUrl + '/';
-        await this.init();
+        await this.init(featuresData);
     }
 
     _indexNodes(node) {
         if (node.uri) {
+            this._allNodes.add(node);
             this.nodeByUri.set(node.uri, node);
             // Also index by bare tile ID (without extension) for new format
             const bareId = node.uri.replace(/\.[^.]+$/, '');
@@ -256,7 +280,7 @@ export class TileManager {
     setOpacity(o) {
         this._opacity = o;
         const transparent = o < 1;
-        for (const node of this.nodeByUri.values()) {
+        for (const node of this._allNodes) {
             node.object3D?.traverse(c => {
                 if (!c.isMesh || !c.material) return;
                 c.material.transparent = transparent;
@@ -360,7 +384,7 @@ export class TileManager {
      * Recolor all loaded meshes based on current color-by setting.
      */
     _recolorAll() {
-        for (const node of this.nodeByUri.values()) {
+        for (const node of this._allNodes) {
             if (node.loadState !== LOADED) continue;
             for (const [name, meshes] of Object.entries(node.meshByFeature)) {
                 const color = this._getFeatureColor(name);
@@ -405,7 +429,7 @@ export class TileManager {
         const fov = camera.fov * Math.PI / 180;
 
         // Phase 0: hide all loaded tiles + meshes
-        for (const node of this.nodeByUri.values()) {
+        for (const node of this._allNodes) {
             if (!node.object3D) continue;
             node.object3D.visible = false;
             for (const meshes of Object.values(node.meshByFeature)) {
@@ -415,7 +439,33 @@ export class TileManager {
 
         this.visibleCount = 0;
         const zoomCounts = {};
-        this._protectedUris = new Set();
+        this._protectedUris.clear();
+        this._protectedBytes = 0;
+        const maxBytes = this.maxGpuMB * 1024 * 1024;
+
+        // Step 8: rebuild the load queue from scratch each frame so it only ever
+        // holds THIS frame's still-wanted tiles — no unbounded/stale backlog, and
+        // it re-prioritizes naturally as the camera/selection change. Tiles that
+        // were merely QUEUED (not yet in-flight) revert to UNLOADED so this frame
+        // can re-decide whether they are still wanted; in-flight loads (counted in
+        // _pendingLoads, already removed from the queue) are untouched.
+        for (const node of this._loadQueue) {
+            if (node.loadState === LOADING) node.loadState = UNLOADED;
+        }
+        this._loadQueue.length = 0;
+
+        // Step 6: at very large selections with no spatial filter, warn. Admission
+        // control below still bounds GPU memory, but a spatial filter loads faster
+        // and more focused. Throttled so it does not spam the console.
+        if (!this._spatialFilter &&
+            this.selectedFeatures.size > SELECTION_WARN_THRESHOLD &&
+            this._frameNumber % 180 === 1) {
+            console.warn(
+                `[TileManager] ${this.selectedFeatures.size} features selected with no ` +
+                `spatial filter. GPU residency is capped at ${this.maxGpuMB} MB (nearest ` +
+                `tiles win); enable a spatial filter for faster, more focused loading.`
+            );
+        }
 
         // Phase 1: per-feature zoom decision + tile display
         for (const name of this.selectedFeatures) {
@@ -438,21 +488,59 @@ export class TileManager {
             }
 
             // Find best available zoom for this feature
-            const desiredZoom = this._bestAvailableZoom(feat, committedZoom);
+            let desiredZoom = this._bestAvailableZoom(feat, committedZoom);
             if (desiredZoom === null) continue;
 
-            // Protect tiles at desired zoom from eviction.
-            // When spatial filter is active, don't protect coarser fallback
-            // zooms — they cover the entire dataset and defeat the filter.
-            this._protectTiles(feat, desiredZoom);
+            // Step 7: admission control. Estimate the cost of this feature's
+            // in-frustum tiles at the desired zoom. If admitting them would exceed
+            // the GPU budget, downgrade to the coarsest available zoom (far fewer
+            // tiles); if even that will not fit, admit nothing new this frame so
+            // resident memory stays bounded (already-loaded tiles still show but
+            // remain evictable). This is what stops the zoomed-out + everything-
+            // selected case from streaming toward an OOM.
+            let desiredUris = this._frustumFilter(feat.tiles[String(desiredZoom)] || []);
+            let cost = this._newCost(desiredUris);
+            let admit = true;
+            if (this._protectedBytes + cost > maxBytes) {
+                const coarsest = this._coarsestZoom(feat);
+                if (coarsest !== null && coarsest !== desiredZoom) {
+                    const coarseUris = this._frustumFilter(feat.tiles[String(coarsest)] || []);
+                    const coarseCost = this._newCost(coarseUris);
+                    if (coarseUris.length && this._protectedBytes + coarseCost <= maxBytes) {
+                        desiredZoom = coarsest;
+                        desiredUris = coarseUris;
+                        cost = coarseCost;
+                    } else {
+                        admit = false;
+                    }
+                } else {
+                    admit = false;
+                }
+            }
+
+            if (!admit) {
+                // Over budget: do not protect or enqueue new tiles for this feature.
+                // Keep showing whatever is already loaded so it does not vanish, but
+                // leave it evictable so the budget can be honored.
+                this._showAnyLoadedZoom(feat, name, state);
+                const dz = state.activeZoom ?? desiredZoom;
+                zoomCounts[dz] = (zoomCounts[dz] || 0) + 1;
+                continue;
+            }
+
+            // Protect the admitted (in-frustum, budgeted) tiles from eviction,
+            // billing each unique tile to the budget exactly once.
+            for (const uri of desiredUris) {
+                if (!this._protectedUris.has(uri)) {
+                    this._protectedUris.add(uri);
+                    this._protectedBytes += this._estBytesOne(uri);
+                }
+            }
+            // When a spatial filter is active, also protect the active-zoom fallback
+            // we may still be showing during a transition.
             if (!this._spatialFilter || state.activeZoom >= desiredZoom) {
                 this._protectTiles(feat, state.activeZoom);
             }
-
-            // Get in-frustum tiles at desired zoom
-            const desiredUris = this._frustumFilter(
-                feat.tiles[String(desiredZoom)] || [],
-            );
 
             // Are all in-frustum tiles at desired zoom loaded?
             const allLoaded = desiredUris.length > 0 && desiredUris.every(uri => {
@@ -673,6 +761,35 @@ export class TileManager {
         return best;
     }
 
+    /** Estimated resident GPU bytes for ONE tile (real size if loaded, else the
+     * running average). */
+    _estBytesOne(uri) {
+        const node = this.nodeByUri.get(uri);
+        return (node && node.loadState === LOADED && node.gpuBytes > 0)
+            ? node.gpuBytes : this._avgTileBytes;
+    }
+
+    /** Cost (estimated bytes) of admitting these URIs, counting only tiles NOT
+     * already protected this frame. A single tile holds many features' meshes, so
+     * a shared tile must be billed to the budget once, not once per feature. */
+    _newCost(uris) {
+        let bytes = 0;
+        for (const uri of uris) {
+            if (!this._protectedUris.has(uri)) bytes += this._estBytesOne(uri);
+        }
+        return bytes;
+    }
+
+    /** Coarsest (numerically smallest) zoom level available for a feature. */
+    _coarsestZoom(feat) {
+        let min = null;
+        for (const z of Object.keys(feat.tiles)) {
+            const n = Number(z);
+            if (min === null || n < min) min = n;
+        }
+        return min;
+    }
+
     // ----- Tile loading -------------------------------------------------------
 
     _enqueueLoad(node) {
@@ -748,6 +865,11 @@ export class TileManager {
             this.scene.add(group);
             node.object3D = group;
             node.loadState = LOADED;
+            // Maintain a running average tile size for admission-control estimates.
+            if (node.gpuBytes > 0) {
+                this._avgSamples++;
+                this._avgTileBytes += (node.gpuBytes - this._avgTileBytes) / this._avgSamples;
+            }
             // Give newly loaded tiles a recent timestamp so they survive
             // stale eviction long enough for transition to complete.
             node.lastUsedFrame = this._frameNumber;
@@ -777,7 +899,7 @@ export class TileManager {
         // Pass 0: when spatial filter is active, immediately unload tiles
         // outside the selection to free GPU memory for large datasets.
         if (this._spatialFilter) {
-            for (const node of this.nodeByUri.values()) {
+            for (const node of this._allNodes) {
                 if (node.loadState !== LOADED) continue;
                 if (this._protectedUris.has(node.uri)) continue;
                 if (!this._isTileInSelection(node.uri)) {
@@ -787,7 +909,7 @@ export class TileManager {
         }
 
         // Pass 1: unload stale tiles NOT protected by active transitions
-        for (const node of this.nodeByUri.values()) {
+        for (const node of this._allNodes) {
             if (node.loadState !== LOADED) continue;
             // Never evict tiles needed for active display or pending transition
             if (this._protectedUris.has(node.uri)) continue;
@@ -799,7 +921,7 @@ export class TileManager {
         // Pass 2: LRU evict if over GPU budget (still respects protection)
         let total = 0;
         const loaded = [];
-        for (const node of this.nodeByUri.values()) {
+        for (const node of this._allNodes) {
             if (node.loadState === LOADED) {
                 total += node.gpuBytes;
                 loaded.push(node);
@@ -808,11 +930,13 @@ export class TileManager {
         const maxBytes = this.maxGpuMB * 1024 * 1024;
         if (total <= maxBytes) return;
 
+        // Evict UNPROTECTED tiles (LRU first) until under budget. Admission control
+        // guarantees the protected set already fits the budget, so anything
+        // unprotected is expendable — even if it was shown this frame (a non-admitted
+        // feature's leftover tiles). The old `lastUsedFrame < frameNumber` guard made
+        // shown-but-unprotected tiles un-evictable, which defeated the budget.
         loaded
-            .filter(n =>
-                n.lastUsedFrame < this._frameNumber &&
-                !this._protectedUris.has(n.uri)
-            )
+            .filter(n => !this._protectedUris.has(n.uri))
             .sort((a, b) => a.lastUsedFrame - b.lastUsedFrame)
             .forEach(node => {
                 if (total <= maxBytes) return;
@@ -840,7 +964,7 @@ export class TileManager {
 
     _recalcStats() {
         let total = 0, count = 0;
-        for (const node of this.nodeByUri.values()) {
+        for (const node of this._allNodes) {
             if (node.loadState === LOADED) { total += node.gpuBytes; count++; }
         }
         this.loadedCount = count;

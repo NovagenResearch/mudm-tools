@@ -2158,10 +2158,13 @@ fn read_group_simplify_encode(
         };
 
     // K==1 fast path: the whole corpus fits one partition — read + group +
-    // encode directly, with NO spill write/read pass.
+    // encode directly, with NO spill write/read pass. Reads in PARALLEL (L1,
+    // streaming_review.md — this most-common path was the only serial read):
+    // same multiset as the serial read, and `_encode_grouped_fragments`
+    // canonicalizes within-tile order, so the GLB bytes are unchanged.
     if k == 1 {
-        let mut reader = Fragment3DReader::open_dir(frag_dir)?;
-        let groups = reader.read_all_grouped()?;
+        let groups = Fragment3DReader::from_paths(all_paths)
+            .read_all_grouped_parallel(io_threads, true)?;
         let (count, keys) = encode_groups(groups)?;
         eprintln!("[encode] done: {} tiles (single partition, no spill)", count);
         return Ok((count, keys));
@@ -2781,16 +2784,25 @@ fn native_writer_props(
 /// cumulative uncompressed-binary bytes would exceed `max_file_bytes`. State
 /// persists across shard chunks, so one part file may span multiple chunks.
 ///
-/// NOTE: superseded by `run_native_partitioned`'s per-zoom part-splitting (which
-/// fans ZSTD across cores). Retained for a possible single-writer-per-zoom mode.
-#[allow(dead_code)]
+/// Wired into `run_native_partitioned` as the per-zoom CROSS-CHUNK accumulator:
+/// one open writer per zoom, so part files span byte-chunks and rotate only when
+/// cumulative bytes exceed `max_file_bytes`. This is the de-fragmentation fix —
+/// it replaces the old per-chunk grain-64 split (`consume_chunk`) that emitted a
+/// fresh part set for every chunk (yielding tens of thousands of tiny parts).
 struct RotatingWriterRs {
     dir: std::path::PathBuf,
     schema: std::sync::Arc<arrow::datatypes::Schema>,
     props: std::sync::Arc<parquet::file::properties::WriterProperties>,
     max_file_bytes: u64,
+    /// Byte target for the IN-MEMORY row group; the writer flushes the current
+    /// row group once it reaches this, bounding resident RAM (the parquet
+    /// ArrowWriter otherwise only auto-flushes by ROW COUNT, default ~1M).
+    row_group_target: u64,
     idx: u32,
     cum_bytes: u64,
+    /// Uncompressed-binary bytes buffered in the CURRENT (un-flushed) row group,
+    /// persisted across chunk writes so cross-chunk accumulation stays bounded.
+    rg_bytes: u64,
     writer: Option<parquet::arrow::ArrowWriter<std::fs::File>>,
 }
 
@@ -2801,7 +2813,17 @@ impl RotatingWriterRs {
         props: std::sync::Arc<parquet::file::properties::WriterProperties>,
         max_file_bytes: u64,
     ) -> Self {
-        Self { dir, schema, props, max_file_bytes, idx: 0, cum_bytes: 0, writer: None }
+        // Row-group byte target: bounds in-memory buffering (128 MB default;
+        // env-overridable for tuning/tests).
+        let row_group_target = std::env::var("MUDM_PARQUET_ROW_GROUP_BYTES")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(128 * 1024 * 1024);
+        Self {
+            dir, schema, props, max_file_bytes, row_group_target,
+            idx: 0, cum_bytes: 0, rg_bytes: 0, writer: None,
+        }
     }
 
     /// Write one zoom's rows for one chunk, rotating first if the current part
@@ -2829,6 +2851,7 @@ impl RotatingWriterRs {
             }
             self.idx += 1;
             self.cum_bytes = 0;
+            self.rg_bytes = 0; // new file -> fresh row group
         }
         if self.writer.is_none() {
             std::fs::create_dir_all(&self.dir)
@@ -2846,25 +2869,41 @@ impl RotatingWriterRs {
             self.writer = Some(w);
         }
 
-        // Split into sub-batches under the 1.5 GB Arrow LargeBinary offset guard.
+        // Bound the IN-MEMORY row group by BYTES. The parquet ArrowWriter only
+        // auto-flushes a row group by ROW COUNT (default ~1,048,576); for large-
+        // binary mesh rows that buffers GBs before any flush, and file rotation
+        // only fires BETWEEN write() calls — so without this a single chunk's
+        // zoom rows could buffer multi-GB per open writer (the finest-zoom OOM
+        // class). `rg_bytes` persists across chunk writes, so we flush the row
+        // group once cumulative bytes reach `target` (also keeping each
+        // RecordBatch under the 1.5 GB LargeBinary offset guard). Deterministic:
+        // the single ordered consumer feeds a fixed row sequence -> fixed flush
+        // boundaries -> thread-count-independent part bytes.
         const SUB_LIMIT: u64 = 1_500_000_000;
-        let w = self.writer.as_mut().unwrap();
-        let mut start = 0usize;
-        let mut acc = 0u64;
-        for i in 0..rows.len() {
-            let rb = (rows[i].positions.len() + rows[i].indices.len()) as u64;
-            if acc > 0 && acc + rb > SUB_LIMIT {
-                let batch = build_batch_no_zoom(&rows[start..i], tags)?;
-                w.write(&batch).map_err(|e| format!("write: {}", e))?;
-                start = i;
-                acc = 0;
+        let target = self.row_group_target.min(SUB_LIMIT).max(1);
+        let mut rg = self.rg_bytes;
+        {
+            let w = self.writer.as_mut().unwrap();
+            let mut start = 0usize;
+            for i in 0..rows.len() {
+                let rb = (rows[i].positions.len() + rows[i].indices.len()) as u64;
+                if rg > 0 && rg + rb > target {
+                    if start < i {
+                        let batch = build_batch_no_zoom(&rows[start..i], tags)?;
+                        w.write(&batch).map_err(|e| format!("write: {}", e))?;
+                        start = i;
+                    }
+                    w.flush().map_err(|e| format!("flush row group: {}", e))?;
+                    rg = 0;
+                }
+                rg += rb;
             }
-            acc += rb;
+            if start < rows.len() {
+                let batch = build_batch_no_zoom(&rows[start..], tags)?;
+                w.write(&batch).map_err(|e| format!("write: {}", e))?;
+            }
         }
-        if start < rows.len() {
-            let batch = build_batch_no_zoom(&rows[start..], tags)?;
-            w.write(&batch).map_err(|e| format!("write: {}", e))?;
-        }
+        self.rg_bytes = rg;
         self.cum_bytes += batch_bytes;
         Ok(())
     }
@@ -2874,6 +2913,20 @@ impl RotatingWriterRs {
             w.close().map_err(|e| format!("close: {}", e))?;
         }
         Ok(())
+    }
+}
+
+impl Drop for RotatingWriterRs {
+    /// Best-effort finalize so a mid-run error (which skips the explicit close
+    /// loop in `run_native_partitioned`) cannot leave a footerless / unreadable
+    /// part file on disk. The parquet footer is written ONLY by ArrowWriter::close
+    /// — without this, a dropped-while-open writer yields a corrupt file. Errors
+    /// during unwind are unrecoverable, so they're swallowed; the normal path
+    /// still calls close() explicitly to surface real write errors.
+    fn drop(&mut self) {
+        if let Some(w) = self.writer.take() {
+            let _ = w.close();
+        }
     }
 }
 
@@ -2897,6 +2950,11 @@ fn read_chunk_sorted(
         .map_err(|e| e.to_string())?
         .into_iter()
         .collect();
+    // H1a (streaming_review.md): canonicalize the TILE order too. The map
+    // iterates in ahash order, which is seeded per-instance — random per run —
+    // and parquet row order is tile order × within-tile order, so sorting only
+    // within tiles left the emitted row order nondeterministic run-to-run.
+    tiles.sort_by_key(|(k, _)| *k);
     for (_k, v) in tiles.iter_mut() {
         v.sort_by(crate::fragment::frag_cmp);
     }
@@ -2904,11 +2962,18 @@ fn read_chunk_sorted(
 }
 
 /// Transform one chunk's tiles -> rows, partition by zoom, and write each zoom's
-/// rows as ~cores parallel part files (parallel ZSTD). Mutates `part_counter`
+/// rows as parallel part files (parallel ZSTD). Mutates `part_counter`
 /// (deterministic, single-caller) and returns the chunk's row count. The
 /// `into_par_iter()` write uses the CURRENT rayon pool (the dedicated consumer
-/// pool when overlapping). Byte-identical to the sequential write path.
+/// pool when overlapping). Byte-identical to the sequential write path: the
+/// part SPLITTING uses a fixed grain (H1b) and the input `tiles` arrive fully
+/// canonicalized (H1a), so neither thread count nor branch affects the bytes.
+///
+/// SUPERSEDED by `consume_chunk_rotating` (cross-chunk de-fragmentation): this
+/// per-chunk split emitted a fresh part set for every byte-chunk (the tens-of-
+/// thousands-of-tiny-parts root cause). Retained for reference / the grain logic.
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
 fn consume_chunk(
     tiles: &[((u32, u32, u32, u32), Vec<Fragment3D>)],
     out: &std::path::Path,
@@ -2938,7 +3003,17 @@ fn consume_chunk(
         .map(|r| (r.positions.len() + r.indices.len()) as u64)
         .sum::<u64>()
         .max(1);
-    let cores = rayon::current_num_threads().max(1) as u64;
+    // H1b (streaming_review.md): part-splitting must be CONTENT-deterministic.
+    // This previously used rayon::current_num_threads(), which differs between
+    // the overlap branch (the (cores − read_k)-wide consumer pool) and the
+    // serial branch (the global pool), and varies with RAYON_NUM_THREADS — so
+    // part boundaries/numbering changed with the thread count whenever the
+    // parallelism term was binding (zoom bytes ≥ 16 MB × cores). A fixed
+    // splitting grain keeps the file layout identical everywhere; the parallel
+    // write below still uses however many threads actually exist (scheduling
+    // is free — the SLICING is what must be stable).
+    const PART_SPLIT_GRAIN: u64 = 64;
+    let grain = PART_SPLIT_GRAIN;
     let mut zoom_vecs: Vec<(u32, Vec<ParquetRow>)> = by_zoom.into_iter().collect();
     zoom_vecs.sort_by_key(|(z, _)| *z);
 
@@ -2952,7 +3027,7 @@ fn consume_chunk(
             .map(|r| (r.positions.len() + r.indices.len()) as u64)
             .sum();
         const MIN_PART_BYTES: u64 = 16 * 1024 * 1024;
-        let by_parallel = (cores * zbytes + total_bytes - 1) / total_bytes;
+        let by_parallel = (grain * zbytes + total_bytes - 1) / total_bytes;
         let by_size = (zbytes + max_file_bytes.max(1) - 1) / max_file_bytes.max(1);
         let cap_minsize = (zbytes / MIN_PART_BYTES).max(1);
         let n_parts = by_parallel
@@ -2996,6 +3071,64 @@ fn consume_chunk(
     let mut chunk_total = 0u64;
     for r in results {
         chunk_total += r?;
+    }
+    Ok(chunk_total)
+}
+
+/// Transform one chunk's tiles -> rows, partition by zoom, and APPEND each zoom's
+/// rows to its PERSISTENT `RotatingWriterRs` in `writers` (one open writer per
+/// zoom, kept across all chunks). Part files therefore span chunks and rotate
+/// only when a zoom's cumulative bytes exceed `max_file_bytes` — this is the
+/// de-fragmentation fix (replaces `consume_chunk`'s fresh per-chunk part set).
+///
+/// Determinism: the single ORDERED consumer feeds chunks in fixed order and
+/// `tiles` arrive canonicalized (H1a), so each per-zoom writer sees a stable row
+/// sequence -> stable part bytes, independent of thread count (the H1b property,
+/// now via accumulation rather than a fixed grain). Bounded memory: peak resident
+/// is the current chunk plus one in-flight row group (bounded by `row_group_target`,
+/// 128 MB default, of source bytes) per open zoom writer — independent of chunk count.
+#[allow(clippy::too_many_arguments)]
+fn consume_chunk_rotating(
+    tiles: &[((u32, u32, u32, u32), Vec<Fragment3D>)],
+    out: &std::path::Path,
+    schema: &std::sync::Arc<arrow::datatypes::Schema>,
+    props: &std::sync::Arc<parquet::file::properties::WriterProperties>,
+    tags: &HashMap<u32, Vec<(String, TagValue)>>,
+    world_bounds: (f64, f64, f64, f64, f64, f64),
+    max_zoom: u32,
+    base_cells: u32,
+    max_file_bytes: u64,
+    writers: &mut std::collections::HashMap<u32, RotatingWriterRs>,
+) -> Result<u64, String> {
+    use std::collections::HashMap as StdHashMap;
+
+    let rows = collect_parquet_rows(tiles, &world_bounds, max_zoom, base_cells);
+    if rows.is_empty() {
+        return Ok(0);
+    }
+    let mut by_zoom: StdHashMap<u32, Vec<ParquetRow>> = StdHashMap::new();
+    for r in rows {
+        by_zoom.entry(r.zoom as u32).or_default().push(r);
+    }
+    // Deterministic zoom order (mirrors consume_chunk's canonical ordering).
+    let mut zoom_vecs: Vec<(u32, Vec<ParquetRow>)> = by_zoom.into_iter().collect();
+    zoom_vecs.sort_by_key(|(z, _)| *z);
+
+    let mut chunk_total = 0u64;
+    for (z, zrows) in &zoom_vecs {
+        if zrows.is_empty() {
+            continue;
+        }
+        let w = writers.entry(*z).or_insert_with(|| {
+            RotatingWriterRs::new(
+                out.join(format!("zoom={}", z)),
+                schema.clone(),
+                props.clone(),
+                max_file_bytes,
+            )
+        });
+        w.write(zrows, tags)?;
+        chunk_total += zrows.len() as u64;
     }
     Ok(chunk_total)
 }
@@ -3051,7 +3184,14 @@ fn run_native_partitioned(
         // DEDICATED (cores-K)-wide pool to avoid oversubscription with the read
         // pool; build_global is NOT used (other call sites need the full pool).
         let cores = rayon::current_num_threads().max(1);
-        let read_k = if io_threads == 0 { 12 } else { io_threads.min(16) };
+        // M4 (streaming_review.md): never starve the consumer on small hosts.
+        // Readers block on I/O + zstd; the consumer runs the QEM-heavy
+        // transform (the actual bottleneck). The old `min(16)`-only sizing
+        // left a 1-wide consumer on ≤16-core machines (read_k = cores, cpw = 1)
+        // — slower than MUDM_NO_OVERLAP=1. Cap readers at a quarter of the
+        // pool (≥1) so the consumer always keeps the majority share.
+        let base = if io_threads == 0 { 12 } else { io_threads };
+        let read_k = base.min(16).min((cores / 4).max(1));
         let cpw = cores.saturating_sub(read_k).max(1);
         let consumer_pool = rayon::ThreadPoolBuilder::new()
             .num_threads(cpw)
@@ -3080,16 +3220,25 @@ fn run_native_partitioned(
             // Consumer on the dedicated pool. `move` takes rx by value (Receiver
             // is !Sync) plus the Copy references; all captures are Send.
             let consumed: Result<u64, String> = consumer_pool.install(move || {
-                let mut pc: StdHashMap<u32, u32> = StdHashMap::new();
+                // Persistent per-zoom writers accumulate ACROSS chunks (the
+                // de-fragmentation fix). The single ordered consumer keeps the
+                // fed-row sequence stable -> deterministic part bytes.
+                let mut writers: StdHashMap<u32, RotatingWriterRs> = StdHashMap::new();
                 let mut t: u64 = 0;
                 let mut expected = 0usize;
                 for (got, tiles) in rx {
-                    debug_assert_eq!(got, expected, "consumer received chunks out of order");
+                    // Structurally unviolable (single producer, FIFO channel),
+                    // but it guards write ORDER (and thus part bytes) and costs
+                    // one comparison per chunk — keep it hard (S3).
+                    assert_eq!(got, expected, "consumer received chunks out of order");
                     expected += 1;
-                    t += consume_chunk(
+                    t += consume_chunk_rotating(
                         &tiles, out, schema_ref, props_ref, tags, world_bounds,
-                        max_zoom, base_cells, max_file_bytes, &mut pc,
+                        max_zoom, base_cells, max_file_bytes, &mut writers,
                     )?;
+                }
+                for (_z, w) in writers.iter_mut() {
+                    w.close()?;
                 }
                 Ok(t)
             });
@@ -3098,14 +3247,17 @@ fn run_native_partitioned(
             Ok(t)
         })?
     } else {
-        let mut part_counter: StdHashMap<u32, u32> = StdHashMap::new();
+        let mut writers: StdHashMap<u32, RotatingWriterRs> = StdHashMap::new();
         let mut t: u64 = 0;
         for chunk in chunks {
             let tiles = read_chunk_sorted(chunk, io_threads)?;
-            t += consume_chunk(
+            t += consume_chunk_rotating(
                 &tiles, out, &schema, &props, tags, world_bounds, max_zoom,
-                base_cells, max_file_bytes, &mut part_counter,
+                base_cells, max_file_bytes, &mut writers,
             )?;
+        }
+        for (_z, w) in writers.iter_mut() {
+            w.close()?;
         }
         t
     };
@@ -3313,8 +3465,11 @@ fn detect_max_memory_bytes(explicit: usize) -> usize {
 /// Detect the default I/O concurrency for the parallel read path.
 ///
 /// Honors the `MUDM_IO_THREADS` env override (an explicit `1` selects the
-/// serial fallback); otherwise uses `available_parallelism()`, falling back to
-/// 8 when the platform can't report it.
+/// serial fallback; the override is taken as-is — an explicit user choice);
+/// otherwise uses `available_parallelism()` capped at 16 (L5,
+/// streaming_review.md: shard reads hit the measured I/O + zstd-decode knee
+/// well before nproc on many-core hosts; the old uncapped default built an
+/// nproc-wide scoped read pool).
 fn detect_io_threads() -> usize {
     if let Ok(v) = std::env::var("MUDM_IO_THREADS") {
         if let Ok(n) = v.parse::<usize>() {
@@ -3322,7 +3477,7 @@ fn detect_io_threads() -> usize {
         }
     }
     std::thread::available_parallelism()
-        .map(|n| n.get())
+        .map(|n| n.get().min(16))
         .unwrap_or(8)
 }
 
@@ -3541,12 +3696,19 @@ impl StreamingTileGenerator {
     /// under ONE `py.allow_threads` (GIL-free, no Python dict bridge, no
     /// `_dict_to_record_batch`, no Python-side rotation). Bounded memory via the
     /// byte-budget shard cursor + persistent per-zoom rotating writers. Output is
-    /// `{output_dir}/zoom=N/part_NNN.parquet`, byte-identical (modulo within-tile
-    /// row order) to the pyarrow partitioned path. `overlap_read` runs the
-    /// producer/consumer read∥transform pipeline (default ON; measured ~23%
-    /// faster cold on oden, byte-identical) — pass `False` or set
-    /// `MUDM_NO_OVERLAP=1` to fall back to the strictly-sequential path.
-    #[pyo3(signature = (output_dir, world_bounds, compression="zstd", compression_level=3, max_batch_bytes=2_000_000_000, max_file_bytes=500_000_000, overlap_read=true))]
+    /// `{output_dir}/zoom=N/part_NNN.parquet`. Determinism: tile order and part
+    /// splitting are canonicalized (H1a/H1b, streaming_review.md), so output is
+    /// byte-identical run-to-run, across thread counts, and between the overlap
+    /// and sequential branches. `overlap_read` runs the producer/consumer
+    /// read∥transform pipeline (default ON; measured ~23% faster cold on oden) —
+    /// pass `False` or set `MUDM_NO_OVERLAP=1` for the strictly-sequential path.
+    ///
+    /// `max_batch_bytes = 0` (the default) auto-derives the chunk budget from
+    /// the configured memory ceiling (M3): ceiling × 0.8 × 0.4 ÷ the number of
+    /// chunk-sized buffers the pipeline can hold at once ((2 + cap) in flight
+    /// when overlapping, plus the consumer's row copy). An explicit value is
+    /// used as-is (the old fixed default was 2 GB).
+    #[pyo3(signature = (output_dir, world_bounds, compression="zstd", compression_level=3, max_batch_bytes=0, max_file_bytes=500_000_000, overlap_read=true))]
     fn generate_parquet_native_partitioned(
         &mut self,
         py: Python<'_>,
@@ -3570,6 +3732,21 @@ impl StreamingTileGenerator {
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(1)
             .max(1);
+        // M3 (streaming_review.md): this path previously ignored the configured
+        // memory ceiling entirely (fixed 2 GB chunks; MUDM_MAX_MEMORY_GB had no
+        // effect here), and the overlap pipeline holds up to (2 + cap) chunks
+        // resident (consumer's + channel + producer's in-progress) plus the
+        // consumer's ParquetRow copy. 0 = auto: divide the headroom-adjusted
+        // ceiling (the same 0.8 × 0.4 convention as the other emit paths) by
+        // that buffer count. Floor at 64 MB so tiny ceilings still make progress
+        // (single-shard chunks remain the irreducible floor).
+        let max_batch_bytes = if max_batch_bytes > 0 {
+            max_batch_bytes
+        } else {
+            let buffers = if overlap { 3 + channel_cap } else { 2 };
+            ((self.max_memory_bytes as f64 * 0.8 * 0.4) as usize / buffers)
+                .max(64 * 1024 * 1024)
+        };
         self._init_parquet_stream()?;
         let shard_paths = std::mem::take(&mut self.shard_paths_snapshot);
         let max_zoom = self.max_zoom;
@@ -5429,6 +5606,14 @@ impl StreamingTileGenerator {
             let mut seen_fids: std::collections::BTreeSet<u32> =
                 std::collections::BTreeSet::new();
             let mut segment_count: u32 = 0;
+            // M1 (streaming_review.md): per-shard errors are deduped by message
+            // ACROSS bucket passes instead of being recorded only on bucket 0.
+            // The old `b == 0` gate assumed every pass sees the identical error
+            // set; a TRANSIENT failure on bucket b > 0 (NFS hiccup, fd limit)
+            // was silently swallowed while that bucket's share of the shard's
+            // features went missing — silent data loss with a clean error log.
+            let mut reported_shard_errors: std::collections::BTreeSet<String> =
+                std::collections::BTreeSet::new();
 
             for b in 0..k {
                 let reader = Fragment3DReader::from_paths(shard_paths.clone());
@@ -5469,25 +5654,27 @@ impl StreamingTileGenerator {
                     .sum();
                 observe_ng_resident_bytes(bucket_resident);
 
-                // Fold per-shard parse errors into the ErrorCollector ONCE.
-                // Every bucket reads the identical shard set, so the error set is
-                // identical each pass; report only on bucket 0 to avoid k-fold
-                // double-reporting.
-                if b == 0 {
-                    for msg in &errs {
-                        // Split "<path>: <detail>" back into item / message.
-                        let (item, detail) = match msg.split_once(": ") {
-                            Some((p, d)) => (p, d),
-                            None => (msg.as_str(), msg.as_str()),
-                        };
-                        collector_ref.record_failure(
-                            "neuroglancer",
-                            Severity::NonFatal,
-                            item,
-                            "parse",
-                            detail,
-                        );
+                // Fold per-shard parse errors into the ErrorCollector, deduped
+                // by message across bucket passes: a PERSISTENT corrupt shard is
+                // reported exactly once (its message repeats every pass), while
+                // a TRANSIENT failure unique to a later pass still surfaces
+                // instead of being dropped by the old `b == 0` gate (M1).
+                for msg in &errs {
+                    if !reported_shard_errors.insert(msg.clone()) {
+                        continue; // already reported on an earlier pass
                     }
+                    // Split "<path>: <detail>" back into item / message.
+                    let (item, detail) = match msg.split_once(": ") {
+                        Some((p, d)) => (p, d),
+                        None => (msg.as_str(), msg.as_str()),
+                    };
+                    collector_ref.record_failure(
+                        "neuroglancer",
+                        Severity::NonFatal,
+                        item,
+                        "parse",
+                        detail,
+                    );
                 }
 
                 // WS-B: `bucket_map` is ALREADY restricted to this bucket's
@@ -6013,8 +6200,15 @@ fn write_parquet_native_3d(
     ]);
     let schema_ref = std::sync::Arc::new(schema);
 
+    // PY-1 (streaming_review.md §G): parquet-rs `ZSTD(Default)` is level 1; the
+    // partitioned path (`native_writer_props`) and the Python writers both use
+    // level 3. This legacy 3D path — the one the OBJ/geojson/xenium converters
+    // actually call — silently shipped weaker level-1 compression. Match level 3.
     let comp = match compression {
-        "zstd" => Compression::ZSTD(Default::default()),
+        "zstd" => Compression::ZSTD(
+            parquet::basic::ZstdLevel::try_new(3)
+                .map_err(|e| format!("zstd level: {}", e))?,
+        ),
         "lz4" => Compression::LZ4_RAW,
         "snappy" => Compression::SNAPPY,
         _ => Compression::UNCOMPRESSED,
@@ -6040,8 +6234,20 @@ fn write_parquet_native_3d(
         let zoom_dir = out_path.join(format!("zoom={}", zoom));
         std::fs::create_dir_all(&zoom_dir).map_err(|e| format!("mkdir: {}", e))?;
 
-        // Split tiles into chunks -> each chunk collects rows + writes its own part file in parallel
-        let n_parts = rayon::current_num_threads().max(1);
+        // PY-2 / H1 (streaming_review.md §G): this legacy path — the one the
+        // converters actually use — had the SAME nondeterminism the partitioned
+        // path was fixed for. (1) `zoom_tiles` arrives in ahash iteration order
+        // (the `read_all_grouped().into_iter()` in `generate_parquet_native`),
+        // so part boundaries and row order varied run-to-run; sort by tile key.
+        // (2) `n_parts = current_num_threads()` made the file count/numbering
+        // thread-dependent; use a FIXED grain so output is identical across
+        // hosts (the par_iter below still parallelizes over whatever pool
+        // exists — scheduling is free; the SLICING must be stable).
+        let mut zoom_tiles: Vec<&((u32, u32, u32, u32), Vec<Fragment3D>)> =
+            zoom_tiles.clone();
+        zoom_tiles.sort_by_key(|entry| entry.0);
+        const PART_GRAIN: usize = 64;
+        let n_parts = PART_GRAIN.min(zoom_tiles.len()).max(1);
         let chunk_size = (zoom_tiles.len() + n_parts - 1) / n_parts;
 
         let chunks: Vec<(usize, &[&((u32, u32, u32, u32), Vec<Fragment3D>)])> =
@@ -6049,10 +6255,16 @@ fn write_parquet_native_3d(
         chunks.par_iter().try_for_each(|(part_idx, tile_chunk)| -> Result<(), String> {
             let part_idx = *part_idx;
             // Collect rows for this chunk of tiles
-            let tiles_owned: Vec<((u32, u32, u32, u32), Vec<Fragment3D>)> = tile_chunk
+            let mut tiles_owned: Vec<((u32, u32, u32, u32), Vec<Fragment3D>)> = tile_chunk
                 .iter()
                 .map(|&entry| entry.clone())
                 .collect();
+            // H1a: canonicalize within-tile fragment order (mirrors the
+            // partitioned path's `read_chunk_sorted`), so row order matches
+            // regardless of which reader produced the groups.
+            for (_k, frags) in tiles_owned.iter_mut() {
+                frags.sort_by(crate::fragment::frag_cmp);
+            }
             let rows = collect_parquet_rows(&tiles_owned, world_bounds, max_zoom, base_cells);
             drop(tiles_owned);
 
@@ -6185,6 +6397,41 @@ fn scan_bounds_parallel(paths: &[String]) -> Result<(f64, f64, f64, f64, f64, f6
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rotating_writer_drop_finalizes_open_part() {
+        // Fix-2 regression guard: a RotatingWriterRs dropped WITHOUT close() (the
+        // mid-run-error path) must still leave a COMPLETE, readable parquet (footer
+        // written by the Drop impl) — not a footerless/corrupt file.
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+        use std::collections::HashMap;
+
+        let dir = std::env::temp_dir().join(format!("rwdrop_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let tags: HashMap<u32, Vec<(String, TagValue)>> = HashMap::new();
+        let schema = build_batch_no_zoom(&[], &tags).unwrap().schema();
+        let props = std::sync::Arc::new(native_writer_props("zstd", 3).unwrap());
+        let rows = vec![
+            ParquetRow { zoom: 0, tile_x: 0, tile_y: 0, tile_d: 0, feature_id: 7,
+                         geom_type: 5, positions: vec![1u8; 48], indices: vec![0u8; 12] },
+            ParquetRow { zoom: 0, tile_x: 1, tile_y: 0, tile_d: 0, feature_id: 8,
+                         geom_type: 5, positions: vec![2u8; 48], indices: vec![0u8; 12] },
+        ];
+        {
+            let mut w = RotatingWriterRs::new(dir.clone(), schema, props, 10_000_000_000);
+            w.write(&rows, &tags).unwrap();
+            // intentionally NO close() — exercise the Drop finalizer
+        }
+        let file = std::fs::File::open(dir.join("part_000.mu.parquet")).expect("no part file");
+        let n: usize = ParquetRecordBatchReaderBuilder::try_new(file)
+            .expect("footerless/corrupt parquet — Drop did not finalize the writer")
+            .build()
+            .unwrap()
+            .map(|b| b.unwrap().num_rows())
+            .sum();
+        assert_eq!(n, 2, "expected 2 rows in the Drop-finalized part");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn test_clip_surface_basic() {

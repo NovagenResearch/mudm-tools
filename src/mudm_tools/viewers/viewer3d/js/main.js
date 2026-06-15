@@ -761,9 +761,12 @@ async function loadPyramid(pyramid) {
     const baseUrl = `/tiles/${pyramid.id}/`;
     const featuresUrl = `/tiles/${pyramid.id}/features.json`;
 
-    await tileManager.switchPyramid(baseUrl);
+    // Fetch + parse features.json ONCE and share it with both consumers
+    // (the payload can be hundreds of MB at 100k+ features).
+    const featuresData = await (await fetch(featuresUrl)).json();
+    await tileManager.switchPyramid(baseUrl, featuresData);
     const idFieldsArr = tileManager.idFields ? [...tileManager.idFields] : [];
-    await featureSelector.init(featuresUrl, idFieldsArr);
+    await featureSelector.init(featuresData, idFieldsArr);
     syncZoomSlider();
     resetCamera();
 
@@ -801,15 +804,18 @@ async function init() {
             // Use the first pyramid from manifest
             baseUrl = `/tiles/${defaultPyramid.id}/`;
             tileManager = new TileManager(scene, baseUrl);
-            await tileManager.init();
+            // Fetch + parse features.json ONCE and share it with both consumers.
+            const featuresData = await (await fetch(`/tiles/${defaultPyramid.id}/features.json`)).json();
+            await tileManager.init(featuresData);
             const idFieldsArr = tileManager.idFields ? [...tileManager.idFields] : [];
-            await featureSelector.init(`/tiles/${defaultPyramid.id}/features.json`, idFieldsArr);
+            await featureSelector.init(featuresData, idFieldsArr);
         } else {
             // Fallback: no manifest, try legacy single-pyramid path
             baseUrl = '/tiles/';
             tileManager = new TileManager(scene, baseUrl);
-            await tileManager.init();
-            await featureSelector.init('/tiles/features.json');
+            const featuresData = await (await fetch('/tiles/features.json')).json();
+            await tileManager.init(featuresData);
+            await featureSelector.init(featuresData);
         }
 
         syncZoomSlider();
