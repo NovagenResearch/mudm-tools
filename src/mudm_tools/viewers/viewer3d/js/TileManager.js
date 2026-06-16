@@ -22,6 +22,15 @@ const HYSTERESIS_FRAMES = 10;  // ~0.17s at 60fps
 const STALE_FRAMES = 120;      // ~2s for stale cleanup
 const SELECTION_WARN_THRESHOLD = 5000;  // warn above this many selected w/o spatial filter
 
+const _batchColor = new THREE.Color();        // scratch for setColorAt
+const _white = new THREE.Color(0xffffff);     // scratch brighten-target for hover highlight
+const _hl = new THREE.Color();                // scratch for hover highlight
+const MAX_DRAW_OBJECTS_DEFAULT = 40000;       // default rendered-instance ceiling (tunable via slider)
+const MAX_INSTANCES_PER_BATCH = 50000;        // refuse batching a single tile larger than this (z0 guard)
+const MAX_BATCH_BYTES = 256 * 1024 * 1024;    // and refuse if its combined vertex+index buffer exceeds this
+                                              // — a BatchedMesh pre-allocates one contiguous buffer, so an
+                                              // oversized coarse tile would throw "Array buffer allocation failed".
+
 /** Load states for tiles. */
 const UNLOADED = 0, LOADING = 1, LOADED = 2, FAILED = 3;
 
@@ -40,6 +49,10 @@ class TileNode {
         this.loadState = UNLOADED;
         this.object3D = null;
         this.meshByFeature = {};   // featureName → [Mesh, ...]
+        // --- BatchedMesh path (triangle features) ---
+        this.batched = [];            // [THREE.BatchedMesh] — usually 1 per tile
+        this.instanceByFeature = {};  // featureName -> [{ batch, id }]  (>=1; regions can split)
+        this.instanceCount = 0;       // total admitted draw-objects in this tile (for the budget)
         this.gpuBytes = 0;
         this.lastUsedFrame = 0;
     }
@@ -124,6 +137,22 @@ export class TileManager {
 
         // Spatial filter (set by overview panel)
         this._spatialFilter = null;  // { center: THREE.Vector3, ring: number } or null
+
+        // --- Per-frame hot-path caches (decouple update() cost from selection size) ---
+        // Parsed tile coords per URI (a URI->{z,x,y,d} mapping never changes).
+        this._coordCache = new Map();
+        // Spatial-filter center tile {cx,cy,cd} per zoom; rebuilt when the filter moves.
+        this._selCenterByZoom = [];
+        // Pre-culled list of selected features that actually have a tile inside the
+        // current spatial box at their display zoom — the only features that can
+        // render under a filter. null = "no filter, iterate every selected feature".
+        // Recomputed only when the selection / filter / forced zoom changes, NOT per
+        // frame, so the per-frame loop is O(features-in-box) not O(features-selected).
+        this._activeFeatures = null;
+        this._activeDirty = true;
+        this._activeForcedZoom = -1;
+        this._filterToken = 0;        // bumped on every setSpatialFilter (incl. moves)
+        this._activeFilterToken = -1;
 
         // Color-by-attribute state
         this.colorByAttribute = null;    // attribute key (e.g. 'cell_type') or null
@@ -223,6 +252,12 @@ export class TileManager {
         this._geoErrorByZoom = [];
         this.colorByAttribute = null;
         this._colorPalette = new Map();
+        // Hot-path caches keyed by the old pyramid's URIs/features — drop them.
+        this._coordCache.clear();
+        this._selCenterByZoom = [];
+        this._activeFeatures = null;
+        this._activeDirty = true;
+        this._filterToken++;
 
         // Set new URL and re-init
         this.baseUrl = newBaseUrl.endsWith('/') ? newBaseUrl : newBaseUrl + '/';
@@ -265,6 +300,7 @@ export class TileManager {
      */
     setSelectedFeatures(selectedNames) {
         this.selectedFeatures = new Set(selectedNames);
+        this._activeDirty = true;   // selection changed → re-cull active features
         // Clean up state for deselected features
         for (const name of this._featureState.keys()) {
             if (!this.selectedFeatures.has(name)) {
@@ -281,13 +317,12 @@ export class TileManager {
         this._opacity = o;
         const transparent = o < 1;
         for (const node of this._allNodes) {
-            node.object3D?.traverse(c => {
-                if (!c.isMesh || !c.material) return;
-                c.material.transparent = transparent;
-                c.material.opacity = o;
-                c.material.depthWrite = !transparent;
-                c.material.needsUpdate = true;
-            });
+            for (const batch of node.batched) {
+                const m = batch.material;
+                m.transparent = transparent; m.opacity = o; m.depthWrite = !transparent; m.needsUpdate = true;
+            }
+            node.object3D?.traverse(c => { if (c.isMesh && c.material) {
+                c.material.transparent = transparent; c.material.opacity = o; c.material.depthWrite = !transparent; c.material.needsUpdate = true; } });
         }
         this._dirty = true;
     }
@@ -302,6 +337,12 @@ export class TileManager {
         const wasActive = !!this._spatialFilter;
         this._spatialFilter = worldCenter ? { center: worldCenter, ring } : null;
         const isActive = !!this._spatialFilter;
+
+        // The box moved (or toggled): invalidate the per-zoom center cache and the
+        // pre-culled active-feature list so both are rebuilt against the new box.
+        this._selCenterByZoom = [];
+        this._filterToken++;
+        this._activeDirty = true;
 
         // When switching filter on/off, reset per-feature LOD state so
         // stale activeZoom values from the previous mode don't persist.
@@ -324,29 +365,51 @@ export class TileManager {
         return { z: +match[1], x: +match[2], y: +match[3], d: +match[4] };
     }
 
+    /** Parse + memoize tile coords for a URI (a URI's z/x/y/d never change), so the
+     * per-frame selection/eviction loops don't re-run the regex each call. */
+    _coords(uri) {
+        let c = this._coordCache.get(uri);
+        if (c === undefined) {
+            c = this._parseTileUri(uri);
+            this._coordCache.set(uri, c);
+        }
+        return c;
+    }
+
+    /** Spatial-filter center tile {cx,cy,cd} at a zoom level, cached per filter move
+     * (the crosshair is fixed within a frame, so this is computed at most once per
+     * zoom per box rather than once per tile per frame). */
+    _selCenterAtZoom(z) {
+        let c = this._selCenterByZoom[z];
+        if (c) return c;
+        const bounds = this.root.box3;
+        const min = bounds.min;
+        const sx = bounds.max.x - min.x, sy = bounds.max.y - min.y, sz = bounds.max.z - min.z;
+        const n = Math.pow(2, z);
+        const center = this._spatialFilter.center;
+        c = {
+            cx: Math.min(Math.floor((center.x - min.x) / sx * n), n - 1),
+            cy: Math.min(Math.floor((center.y - min.y) / sy * n), n - 1),
+            cd: Math.min(Math.floor((center.z - min.z) / sz * n), n - 1),
+        };
+        this._selCenterByZoom[z] = c;
+        return c;
+    }
+
     /**
      * Check if a tile URI is within the spatial selection cube.
      * Converts the world-space crosshair to tile coordinates at the tile's zoom level.
      */
     _isTileInSelection(uri) {
         if (!this._spatialFilter || !this.root?.box3) return true;
-        const tile = this._parseTileUri(uri);
+        const tile = this._coords(uri);
         if (!tile) return true;
 
-        const bounds = this.root.box3;
-        const min = bounds.min;
-        const range = new THREE.Vector3();
-        bounds.getSize(range);
-        const n = Math.pow(2, tile.z);
-
-        const cx = Math.min(Math.floor((this._spatialFilter.center.x - min.x) / range.x * n), n - 1);
-        const cy = Math.min(Math.floor((this._spatialFilter.center.y - min.y) / range.y * n), n - 1);
-        const cd = Math.min(Math.floor((this._spatialFilter.center.z - min.z) / range.z * n), n - 1);
-
+        const c = this._selCenterAtZoom(tile.z);
         const r = this._spatialFilter.ring;
-        return Math.abs(tile.x - cx) <= r
-            && Math.abs(tile.y - cy) <= r
-            && Math.abs(tile.d - cd) <= r;
+        return Math.abs(tile.x - c.cx) <= r
+            && Math.abs(tile.y - c.cy) <= r
+            && Math.abs(tile.d - c.cd) <= r;
     }
 
     /**
@@ -386,16 +449,42 @@ export class TileManager {
     _recolorAll() {
         for (const node of this._allNodes) {
             if (node.loadState !== LOADED) continue;
-            for (const [name, meshes] of Object.entries(node.meshByFeature)) {
+            for (const [name, insts] of Object.entries(node.instanceByFeature)) {
                 const color = this._getFeatureColor(name);
                 if (!color) continue;
-                for (const mesh of meshes) {
-                    if (mesh.material) {
-                        mesh.material.color.set(color);
-                    }
+                for (const { batch, id } of insts) {
+                    batch.setColorAt(id, _batchColor.set(color));
+                    batch.baseColorByInstance.set(id, color);
                 }
             }
+            // legacy meshes
+            for (const [name, meshes] of Object.entries(node.meshByFeature)) {
+                const color = this._getFeatureColor(name);
+                if (color) for (const m of meshes) m.material?.color.set(color);
+            }
         }
+        this._dirty = true;
+    }
+
+    /**
+     * Hover highlight for a feature: brighten its batched instance colors (on) or
+     * restore them from baseColorByInstance (off). Legacy line/point meshes fall back
+     * to material.emissive. Called by the viewer's hover handler.
+     */
+    setFeatureHighlight(name, on) {
+        for (const node of this._allNodes) {
+            const insts = node.instanceByFeature[name];
+            if (insts) {
+                for (const { batch, id } of insts) {
+                    const base = batch.baseColorByInstance.get(id) || '#cccccc';
+                    if (on) batch.setColorAt(id, _hl.set(base).lerp(_white, 0.5));
+                    else    batch.setColorAt(id, _batchColor.set(base));
+                }
+            }
+            const meshes = node.meshByFeature[name];
+            if (meshes) for (const m of meshes) m.material?.emissive?.set(on ? 0x333333 : 0x000000);
+        }
+        this._dirty = true;
     }
 
     _getFeatureState(name) {
@@ -407,6 +496,52 @@ export class TileManager {
             });
         }
         return this._featureState.get(name);
+    }
+
+    /**
+     * Rebuild the pre-culled list of selected features that can actually render
+     * under the current spatial filter — i.e. those with at least one tile inside
+     * the selection box at their display zoom. Excluded features produce no visible
+     * geometry (the per-frame loop's frustum/box filter would empty them anyway), so
+     * skipping them per frame is the difference between O(features-selected) and
+     * O(features-in-box) work — the fix for ~1 FPS at 139k selected.
+     *
+     * Only meaningful with a spatial filter in forced-zoom mode (the focused
+     * workflow). Without a filter, any selected feature may be visible anywhere, so
+     * we fall back to iterating the full selection (null = "use selectedFeatures").
+     *
+     * Soundness: a feature's display tile is at `dz = bestAvailableZoom(forcedZoom)`,
+     * and the per-zoom box shrinks as zoom increases, so a finer box ⊆ the dz box —
+     * testing dz alone correctly admits the finer-fallback path too. The one path it
+     * does NOT mirror is the over-budget `_showAnyLoadedZoom` coarse fallback (coarser
+     * box is larger): under GPU pressure a boundary feature that would have shown a
+     * coarse tile bleeding outside the box is now skipped. That aligns with the
+     * filter's stated intent (don't show content outside the selection) and only
+     * occurs when already over budget, so it is an acceptable, beneficial divergence.
+     */
+    _recomputeActiveFeatures() {
+        this._activeForcedZoom = this.forcedZoom;
+        this._activeFilterToken = this._filterToken;
+        this._activeDirty = false;
+
+        if (!this._spatialFilter || this.lodMode !== 'forced') {
+            this._activeFeatures = null;
+            return;
+        }
+
+        const active = [];
+        for (const name of this.selectedFeatures) {
+            const feat = this.featureIndex[name];
+            if (!feat) continue;
+            const dz = this._bestAvailableZoom(feat, this.forcedZoom);
+            if (dz === null) continue;
+            const uris = feat.tiles[String(dz)];
+            if (!uris) continue;
+            for (let i = 0; i < uris.length; i++) {
+                if (this._isTileInSelection(uris[i])) { active.push(name); break; }
+            }
+        }
+        this._activeFeatures = active;
     }
 
     // ----- Per-frame update ---------------------------------------------------
@@ -430,11 +565,15 @@ export class TileManager {
 
         // Phase 0: hide all loaded tiles + meshes
         for (const node of this._allNodes) {
-            if (!node.object3D) continue;
-            node.object3D.visible = false;
-            for (const meshes of Object.values(node.meshByFeature)) {
-                for (const mesh of meshes) mesh.visible = false;
+            for (const batch of node.batched) {
+                batch.visible = false;
+                const n = batch.instanceCount;       // BatchedMesh.instanceCount = # instances
+                for (let i = 0; i < n; i++) batch.setVisibleAt(i, false);
             }
+            if (!node.object3D) continue;            // legacy line/point path
+            node.object3D.visible = false;
+            for (const meshes of Object.values(node.meshByFeature))
+                for (const mesh of meshes) mesh.visible = false;
         }
 
         this.visibleCount = 0;
@@ -467,8 +606,18 @@ export class TileManager {
             );
         }
 
-        // Phase 1: per-feature zoom decision + tile display
-        for (const name of this.selectedFeatures) {
+        // Phase 1: per-feature zoom decision + tile display. Iterate only the
+        // features that can actually render under the current spatial filter — the
+        // pre-culled list is recomputed lazily here whenever the selection, the
+        // filter box, or the forced zoom changed (never per frame), so this loop is
+        // O(features-in-box) instead of O(features-selected).
+        if (this._activeDirty
+            || this.forcedZoom !== this._activeForcedZoom
+            || this._filterToken !== this._activeFilterToken) {
+            this._recomputeActiveFeatures();
+        }
+        const featureList = this._activeFeatures || this.selectedFeatures;
+        for (const name of featureList) {
             const feat = this.featureIndex[name];
             if (!feat) continue;
 
@@ -650,17 +799,17 @@ export class TileManager {
      */
     _showTileFeature(uri, featureName) {
         const node = this.nodeByUri.get(uri);
-        if (!node || node.loadState !== LOADED || !node.object3D) return;
-
+        if (!node || node.loadState !== LOADED) return;
         node.lastUsedFrame = this._frameNumber;
-        node.object3D.visible = true;
-
+        const insts = node.instanceByFeature[featureName];
+        if (insts) {
+            for (const { batch, id } of insts) { batch.visible = true; batch.setVisibleAt(id, true); this.visibleCount++; }
+        }
+        // legacy line/point meshes for this feature
         const meshes = node.meshByFeature[featureName];
-        if (meshes) {
-            for (const mesh of meshes) {
-                mesh.visible = true;
-                this.visibleCount++;
-            }
+        if (meshes && node.object3D) {
+            node.object3D.visible = true;
+            for (const mesh of meshes) { mesh.visible = true; this.visibleCount++; }
         }
     }
 
@@ -668,9 +817,10 @@ export class TileManager {
      * Fallback: find any loaded zoom for a feature and show it.
      */
     _showAnyLoadedZoom(feat, name, state) {
-        // Prefer higher zoom levels (more detail)
-        const zooms = Object.keys(feat.tiles).map(Number).sort((a, b) => b - a);
-        for (const z of zooms) {
+        // Prefer higher zoom levels (more detail): cached keys are ascending, walk down.
+        const zk = this._zoomKeysOf(feat);
+        for (let i = zk.length - 1; i >= 0; i--) {
+            const z = zk[i];
             const uris = this._frustumFilter(feat.tiles[String(z)] || []);
             const loadedUris = uris.filter(uri => {
                 const node = this.nodeByUri.get(uri);
@@ -742,16 +892,29 @@ export class TileManager {
         return state.activeZoom !== null ? state.activeZoom : state.targetZoom;
     }
 
+    /** Numeric tile-zoom levels available for a feature, ascending, cached on the
+     * feature (feat.tiles is built once and never mutated). Avoids the per-call
+     * Object.keys(...).map(Number) allocation in the per-frame hot loop. */
+    _zoomKeysOf(feat) {
+        let zk = feat._zoomKeys;
+        if (!zk) {
+            zk = Object.keys(feat.tiles).map(Number).sort((a, b) => a - b);
+            feat._zoomKeys = zk;
+        }
+        return zk;
+    }
+
     /**
      * Find the closest available zoom level for a feature.
      */
     _bestAvailableZoom(feat, targetZoom) {
-        const available = Object.keys(feat.tiles).map(Number);
+        const available = this._zoomKeysOf(feat);
         if (available.length === 0) return null;
 
         let best = available[0];
         let bestDiff = Math.abs(best - targetZoom);
-        for (const z of available) {
+        for (let i = 1; i < available.length; i++) {
+            const z = available[i];
             const diff = Math.abs(z - targetZoom);
             if (diff < bestDiff || (diff === bestDiff && z > best)) {
                 best = z;
@@ -782,12 +945,8 @@ export class TileManager {
 
     /** Coarsest (numerically smallest) zoom level available for a feature. */
     _coarsestZoom(feat) {
-        let min = null;
-        for (const z of Object.keys(feat.tiles)) {
-            const n = Number(z);
-            if (min === null || n < min) min = n;
-        }
-        return min;
+        const zk = this._zoomKeysOf(feat);   // ascending → first is coarsest
+        return zk.length ? zk[0] : null;
     }
 
     // ----- Tile loading -------------------------------------------------------
@@ -812,58 +971,11 @@ export class TileManager {
             const gltf = await this.loader.loadAsync(this.baseUrl + node.uri);
             const group = gltf.scene;
 
-            // Index meshes by feature name + apply colors
-            let meshCount = 0, namedCount = 0;
-            group.traverse(child => {
-                if (!child.isMesh) return;
-                child.visible = false; // hide all meshes by default
-                // Neuron meshes never move — freeze the local matrix so three.js
-                // skips the per-frame world-matrix recompute across thousands of
-                // static objects. (Transforms are already baked by the loader.)
-                child.matrixAutoUpdate = false;
-                child.updateMatrix();
-                meshCount++;
-                const props = this._findProps(child);
-                if (!props) return;
-                const rawName = props.name;
-                const name = (rawName && !/^feature_\d+$/.test(rawName) ? rawName : null)
-                    || props.acronym || props.instance
-                    || (props.body_id != null ? String(props.body_id) : '');
-                if (!name) return;
-                namedCount++;
-
-                if (!node.meshByFeature[name]) node.meshByFeature[name] = [];
-                node.meshByFeature[name].push(child);
-                child.userData._featureName = name;
-
-                // Color: use palette if color-by is active, otherwise original.
-                // Also apply the current global opacity (clone so it's per-mesh).
-                const color = this._getFeatureColor(name) || props.color;
-                if (color || this._opacity < 1) {
-                    child.material = child.material.clone();
-                    if (color) child.material.color.set(color);
-                    if (this._opacity < 1) {
-                        child.material.transparent = true;
-                        child.material.opacity = this._opacity;
-                        child.material.depthWrite = false;
-                    }
-                }
-
-                // GPU accounting
-                if (child.geometry) {
-                    for (const attr of Object.values(child.geometry.attributes)) {
-                        node.gpuBytes += attr.array.byteLength;
-                    }
-                    if (child.geometry.index) {
-                        node.gpuBytes += child.geometry.index.array.byteLength;
-                    }
-                }
-            });
-
-            console.log(`[debug] ${node.uri}: ${meshCount} meshes, ${namedCount} named, features: [${Object.keys(node.meshByFeature).slice(0,3).join(', ')}${Object.keys(node.meshByFeature).length > 3 ? '...' : ''}]`);
-            group.visible = false;
-            this.scene.add(group);
-            node.object3D = group;
+            this._buildBatchedTile(node, group);
+            // Legacy line/point meshes (if any) still live in the group; add it only if it
+            // has renderable legacy children. BatchedMeshes were added to the scene directly.
+            const hasLegacy = Object.keys(node.meshByFeature).length > 0;
+            if (hasLegacy) { group.visible = false; this.scene.add(group); node.object3D = group; }
             node.loadState = LOADED;
             // Maintain a running average tile size for admission-control estimates.
             if (node.gpuBytes > 0) {
@@ -891,6 +1003,105 @@ export class TileManager {
             cur = cur.parent;
         }
         return null;
+    }
+
+    /** Resolve a feature's logical name from its GLB node userData (extras). */
+    _resolveFeatureName(props) {
+        if (!props) return '';
+        const rawName = props.name;
+        return (rawName && !/^feature_\d+$/.test(rawName) ? rawName : null)
+            || props.acronym || props.instance
+            || (props.body_id != null ? String(props.body_id) : '');
+    }
+
+    /** One shared material for a batch, cloned from a representative loaded mesh
+     * material so lighting/appearance matches the current per-mesh look. Per-feature
+     * color is applied per-instance via setColorAt, not on the material. */
+    _makeBatchMaterial(sampleMaterial) {
+        const m = sampleMaterial ? sampleMaterial.clone() : new THREE.MeshStandardMaterial();
+        m.color.set('#ffffff');           // white base; instance color multiplies in
+        m.vertexColors = false;           // BatchedMesh injects per-instance color itself
+        if (this._opacity < 1) { m.transparent = true; m.opacity = this._opacity; m.depthWrite = false; }
+        return m;
+    }
+
+    /**
+     * Build the renderable objects for a freshly loaded tile group: triangle
+     * features become a single THREE.BatchedMesh (one draw call per tile);
+     * line/point features fall back to the legacy per-mesh meshByFeature path.
+     */
+    _buildBatchedTile(node, group) {
+        const triFeats = [];          // {name, geometry, color, props}
+        let sampleMat = null;
+        group.traverse(child => {
+            const isTri = child.isMesh && !child.isLine && !child.isPoints;
+            const props = this._findProps(child);
+            const name = this._resolveFeatureName(props);
+            if (!name) return;
+            if (!isTri) {             // line/point feature -> legacy per-mesh path
+                child.matrixAutoUpdate = false; child.updateMatrix(); child.visible = false;
+                (node.meshByFeature[name] ??= []).push(child);
+                child.userData._featureName = name;
+                return;
+            }
+            if (!sampleMat) sampleMat = child.material;
+            triFeats.push({ name, geometry: child.geometry, props,
+                            color: this._getFeatureColor(name) || props.color });
+        });
+
+        if (triFeats.length === 0) return;   // pure line/point tile: legacy path already populated
+
+        // Size the batch from the decoded geometries (loader has already decoded them).
+        let vtot = 0, itot = 0;
+        for (const f of triFeats) {
+            vtot += f.geometry.attributes.position.count;
+            itot += f.geometry.index ? f.geometry.index.count : 0;
+        }
+
+        // Oversized-tile guard: a BatchedMesh pre-allocates one contiguous vertex+index
+        // buffer, so a coarse mega-tile (e.g. the z0 tile holding ~all features) would
+        // throw "Array buffer allocation failed". Refuse to batch it — it is never the
+        // intended resident working set (the object/byte budgets keep finer in-frustum
+        // tiles instead, and the overview poster is the see-everything view). The tile
+        // loads but renders nothing rather than crashing.
+        const estBytes = vtot * 12 + itot * 4;   // position(3×f32) + index(u32)
+        if (triFeats.length > MAX_INSTANCES_PER_BATCH || estBytes > MAX_BATCH_BYTES) {
+            console.warn(
+                `[TileManager] not batching oversized tile ${node.uri}: ${triFeats.length} ` +
+                `features, ~${(estBytes / 1048576).toFixed(0)} MB buffer (over cap). Tile will ` +
+                `not render — rely on finer in-frustum tiles / the overview.`
+            );
+            return;
+        }
+
+        const batch = new THREE.BatchedMesh(triFeats.length, vtot, itot, this._makeBatchMaterial(sampleMat));
+        // Tile-level frustum cull already runs (_frustumFilter); per-instance cull + sort are
+        // O(n) CPU per frame and become the bottleneck at this scale (three.js #28776).
+        batch.perObjectFrustumCulled = false;
+        batch.sortObjects = false;
+        batch.frustumCulled = false;          // we manage tile visibility ourselves
+        batch.featureByInstance = new Map();  // id -> name
+        batch.propsByInstance = new Map();    // id -> props (for InfoPanel)
+        batch.baseColorByInstance = new Map();// id -> '#rrggbb' (for hover restore)
+        batch.userData._tileNode = node;
+
+        for (const f of triFeats) {
+            const gid = batch.addGeometry(f.geometry);
+            const iid = batch.addInstance(gid);   // identity matrix (geometry is absolute-coords)
+            const hex = f.color || '#cccccc';
+            batch.setColorAt(iid, _batchColor.set(hex));
+            batch.setVisibleAt(iid, false);       // hidden until selected
+            (node.instanceByFeature[f.name] ??= []).push({ batch, id: iid });
+            batch.featureByInstance.set(iid, f.name);
+            batch.propsByInstance.set(iid, f.props);
+            batch.baseColorByInstance.set(iid, hex);
+            node.gpuBytes += f.geometry.attributes.position.array.byteLength
+                + (f.geometry.index ? f.geometry.index.array.byteLength : 0);
+        }
+        node.instanceCount += triFeats.length;
+        batch.visible = false;
+        this.scene.add(batch);
+        node.batched.push(batch);
     }
 
     // ----- Eviction -----------------------------------------------------------
@@ -946,6 +1157,13 @@ export class TileManager {
     }
 
     _unloadNode(node) {
+        for (const batch of node.batched) {
+            batch.dispose();             // frees the batch's shared buffers
+            this.scene.remove(batch);
+        }
+        node.batched = [];
+        node.instanceByFeature = {};
+        node.instanceCount = 0;
         if (node.object3D) {
             node.object3D.traverse(c => {
                 if (c.isMesh) {

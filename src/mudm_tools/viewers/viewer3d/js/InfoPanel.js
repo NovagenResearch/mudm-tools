@@ -51,15 +51,13 @@ export class InfoPanel {
         this.raycaster.setFromCamera(this.mouse, this.camera);
         const intersects = this.raycaster.intersectObjects(this.scene.children, true);
 
-        // Find first VISIBLE intersection with userData
+        // Find first intersection that resolves to a feature.
         for (const hit of intersects) {
-            // Skip invisible meshes (non-selected features still in scene)
-            if (!hit.object.visible) continue;
             // Skip the slice plane helper mesh
             if (hit.object.userData?._isSliceHelper) continue;
             // Skip hits behind the clip plane (clipped geometry)
             if (this.slicePanel?.enabled && this.slicePanel.clipPlane.distanceToPoint(hit.point) < 0) continue;
-            const props = this._findProperties(hit.object);
+            const props = this._propsForHit(hit);
             if (props) {
                 this._showPanel(props);
                 return;
@@ -68,6 +66,20 @@ export class InfoPanel {
 
         // Clicked empty space
         this.panel.style.display = 'none';
+    }
+
+    /**
+     * Resolve a raycast hit to feature properties. BatchedMesh hits carry the instance
+     * id in hit.batchId (and raycast only reports visible instances); legacy line/point
+     * meshes walk the parent chain for userData.
+     */
+    _propsForHit(hit) {
+        const obj = hit.object;
+        if (obj.isBatchedMesh && hit.batchId != null && obj.propsByInstance) {
+            return obj.propsByInstance.get(hit.batchId) || null;
+        }
+        if (!obj.visible) return null;
+        return this._findProperties(obj);
     }
 
     /**
@@ -88,13 +100,22 @@ export class InfoPanel {
         this.title.textContent = props.name || props.acronym || 'Unknown';
         this.tableBody.innerHTML = '';
 
-        for (const [key, label] of DISPLAY_FIELDS) {
+        // No whitelist — display ALL metadata. DISPLAY_FIELDS is used only to give
+        // known fields friendly labels and a preferred order; every other field is
+        // shown too, with a humanized label. Object/array values (e.g. the internal
+        // `tiles` list) are skipped since they aren't scalar metadata.
+        const LABELS = Object.fromEntries(DISPLAY_FIELDS);
+        const humanize = k => k.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+        const order = DISPLAY_FIELDS.map(([k]) => k).filter(k => k in props);
+        for (const k of Object.keys(props)) if (!order.includes(k)) order.push(k);
+
+        for (const key of order) {
             const val = props[key];
-            if (val === undefined || val === null) continue;
+            if (val === undefined || val === null || typeof val === 'object') continue;
 
             const tr = document.createElement('tr');
             const tdLabel = document.createElement('td');
-            tdLabel.textContent = label;
+            tdLabel.textContent = LABELS[key] || humanize(key);
             const tdVal = document.createElement('td');
 
             if (key === 'color') {

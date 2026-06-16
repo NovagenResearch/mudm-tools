@@ -442,10 +442,19 @@ export class OverviewPanel {
     }
 
     /**
-     * Fire the selection change callback with current crosshair + ring.
+     * Fire the selection change callback with the selection box's true 3D
+     * center + ring + the box itself.
+     *
+     * We pass the SELECTION-BOX center (not the raw crosshair): for a symmetric
+     * unclamped ring they coincide, but at the volume edge the box is clamped, so
+     * its center is the point that actually centers the orange box in the main
+     * view. The box is forwarded so the caller can reframe (fit + center) onto it
+     * instead of panning with a stale camera offset.
      */
     _fireSelectionChange() {
-        this.onSelectionChange(this.crosshairPos.clone(), this._ring);
+        const box = this._computeSelectionBox();
+        const center = box ? box.getCenter(new THREE.Vector3()) : this.crosshairPos.clone();
+        this.onSelectionChange(center, this._ring, box);
     }
 
     // ---------------------------------------------------------------

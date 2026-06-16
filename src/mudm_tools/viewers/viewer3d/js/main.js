@@ -67,14 +67,22 @@ infoPanel.slicePanel = slicePlanePanel;
 
 // --- Overview Panel ---
 const overviewPanel = new OverviewPanel({
-    onSelectionChange: (worldCenter, ring) => {
+    onSelectionChange: (worldCenter, ring, box) => {
         // Overview is always on — clicking it focuses the main view (spatial
-        // filter) on the clicked region and recenters the camera there.
+        // filter) on the clicked region and reframes the camera so the orange
+        // box's midpoint lands at the center of the view.
         tileManager.setSpatialFilter(worldCenter, ring);
-        const offset = camera.position.clone().sub(controls.target);
-        controls.target.copy(worldCenter);
-        camera.position.copy(worldCenter).add(offset);
-        controls.update();
+        if (box) {
+            // Fit + center on the selection box (same framing as frameZoomRegion).
+            // A pure pan that preserved the old oblique offset left the box
+            // visibly translated under the perspective camera.
+            frameBox(box);
+        } else {
+            const offset = camera.position.clone().sub(controls.target);
+            controls.target.copy(worldCenter);
+            camera.position.copy(worldCenter).add(offset);
+            controls.update();
+        }
     },
 });
 overviewPanel.initDOM();
@@ -428,10 +436,13 @@ function _updateHover(event) {
     const intersects = _hoverRaycaster.intersectObjects(scene.children, true);
 
     for (const hit of intersects) {
-        if (!hit.object.visible) continue;
         if (hit.object.userData?._isSliceHelper) continue;
         if (slicePlanePanel?.enabled && slicePlanePanel.clipPlane.distanceToPoint(hit.point) < 0) continue;
-        const name = _findFeatureName(hit.object);
+        // BatchedMesh raycast returns the hit instance in hit.batchId and only reports
+        // VISIBLE instances; legacy line/point meshes resolve via the parent userData.
+        const name = hit.object.isBatchedMesh
+            ? hit.object.featureByInstance?.get(hit.batchId)
+            : (hit.object.visible ? _findFeatureName(hit.object) : null);
         if (name) {
             _setHover(name);
             return;
@@ -452,34 +463,17 @@ function _findFeatureName(object) {
 function _setHover(featureName) {
     if (featureName === _hoveredFeature) return;
 
-    // Restore previous
-    if (_hoveredFeature) {
-        _setFeatureEmissive(_hoveredFeature, 0x000000);
-    }
-
+    // Restore previous + highlight new — TileManager owns the batches (per-instance
+    // color brighten/restore), so the highlight lives there now.
+    if (_hoveredFeature) tileManager.setFeatureHighlight(_hoveredFeature, false);
     _hoveredFeature = featureName;
-
-    // Highlight new
     if (_hoveredFeature) {
-        _setFeatureEmissive(_hoveredFeature, 0x333333);
+        tileManager.setFeatureHighlight(_hoveredFeature, true);
         canvas.style.cursor = 'pointer';
     } else {
         canvas.style.cursor = '';
     }
-    requestRender();   // hover emissive changed → repaint (render-on-demand)
-}
-
-function _setFeatureEmissive(name, color) {
-    for (const node of tileManager.nodeByUri.values()) {
-        if (!node.object3D) continue;
-        const meshes = node.meshByFeature[name];
-        if (!meshes) continue;
-        for (const mesh of meshes) {
-            if (mesh.material) {
-                mesh.material.emissive.set(color);
-            }
-        }
-    }
+    requestRender();   // hover highlight changed → repaint (render-on-demand)
 }
 
 // --- Stats ---
@@ -512,10 +506,14 @@ zoomSlider.addEventListener('input', () => {
     const z = parseInt(zoomSlider.value);
     zoomLabel.textContent = z;
     tileManager.forcedZoom = z;
+    // Zoom level = a centered spatial zoom into the orange box at the new zoom: sync the
+    // overview's zoom first, then focus the main view + spatial filter on that box so the
+    // loaded region stays centered (matches the overview-click + initial-load behavior).
     overviewPanel.currentZoom = z;
     syncOverviewRingMax();
     overviewPanel._updateOverlays();
-    overviewPanel._fireSelectionChange();
+    focusOverviewBox();
+    requestRender();
 });
 
 // --- Opacity (main-view neuron transparency) ---
@@ -697,6 +695,73 @@ function animate() {
 /**
  * Reset camera to frame the tileset bounding volume.
  */
+/**
+ * Frame the main camera so an arbitrary world-space box fills the view, centered.
+ * Uses the same fixed oblique angle as frameZoomRegion so overview clicks and the
+ * zoom slider agree. The box's center projects to screen-center after this.
+ */
+function frameBox(box) {
+    if (!box) return;
+    const center = new THREE.Vector3(); box.getCenter(center);
+    const size = new THREE.Vector3(); box.getSize(size);
+    const maxDim = Math.max(size.x, size.y, size.z) || 1;
+    camera.position.set(
+        center.x + maxDim * 0.6,
+        center.y - maxDim * 0.6,
+        center.z + maxDim * 0.5,
+    );
+    camera.lookAt(center);
+    controls.target.copy(center);
+    controls.update();
+}
+
+/**
+ * Frame the main camera on a CENTERED region sized to a zoom level: the region is
+ * the full volume scaled by 1/2^z (one octree tile's footprint at that zoom). So
+ * z0 frames the whole volume, and each finer level zooms into a centered detail.
+ */
+function frameZoomRegion(z) {
+    const box = tileManager.root?.box3;
+    if (!box) return;
+    const center = new THREE.Vector3(); box.getCenter(center);
+    const size = new THREE.Vector3(); box.getSize(size);
+    const maxDim = Math.max(size.x, size.y, size.z);
+    const ring = parseInt(overviewRingSlider.value) || 0;
+    // Region extent (incl. neighbor ring) as a fraction of the full volume — matches
+    // the overview's selection box: (2*ring+1) tiles at this zoom.
+    const f = (2 * ring + 1) / Math.pow(2, Math.max(0, z));
+    camera.position.set(
+        center.x + maxDim * 0.6 * f,
+        center.y - maxDim * 0.6 * f,
+        center.z + maxDim * 0.5 * f,
+    );
+    camera.lookAt(center);
+    controls.target.copy(center);
+    controls.update();
+}
+
+/**
+ * Focus the main view + spatial filter on the overview's CURRENT selection box (the
+ * orange box) so the loaded tiles land exactly at the center of the view. This is the
+ * single source of truth shared by initial load, the zoom slider, and overview clicks
+ * — framing the raw volume center instead would be off by up to half a tile (the
+ * crosshair snaps to a tile center, which for an even grid is offset from the volume
+ * center). Falls back to the raw volume center only if the overview box isn't ready.
+ */
+function focusOverviewBox() {
+    const ring = parseInt(overviewRingSlider.value) || 0;
+    const box = overviewPanel.bounds ? overviewPanel._computeSelectionBox() : null;
+    if (box) {
+        tileManager.setSpatialFilter(box.getCenter(new THREE.Vector3()), ring);
+        frameBox(box);
+    } else if (tileManager.root?.box3) {
+        const c = new THREE.Vector3();
+        tileManager.root.box3.getCenter(c);
+        tileManager.setSpatialFilter(c, ring);
+        frameZoomRegion(tileManager.forcedZoom);
+    }
+}
+
 function resetCamera() {
     if (!tileManager.root?.box3) return;
     const box = tileManager.root.box3;
@@ -718,14 +783,11 @@ function resetCamera() {
     scaleBar.setMetersPerUnit(tileManager.metersPerUnit ?? 1e-9);
     overviewPanel.metersPerUnit = tileManager.metersPerUnit ?? 1e-9;  // overview scale bar too
 
-    camera.position.set(
-        center.x + maxDim * 0.6,
-        center.y - maxDim * 0.6,
-        center.z + maxDim * 0.5,
-    );
-    camera.lookAt(center);
-    controls.target.copy(center);
-    controls.update();
+    // Constrain loading to EXACTLY the centered region the overview's orange box shows,
+    // and frame the camera on that box's center — from the very first frame, not just
+    // after the user touches a control. (Requires overviewPanel.setBounds() to have run
+    // first; loadPyramid/init order this before resetCamera.)
+    focusOverviewBox();
 
     slicePlanePanel.updateBounds(box);
 }
@@ -735,9 +797,13 @@ function resetCamera() {
  */
 function syncZoomSlider() {
     zoomSlider.max = tileManager.maxZoom;
-    zoomSlider.value = tileManager.maxZoom;
-    zoomLabel.textContent = tileManager.maxZoom;
-    tileManager.forcedZoom = tileManager.maxZoom;
+    // Default to a MID zoom (e.g. z2 for a 0-4 pyramid): open on a centered detail,
+    // not the whole volume at the finest level.
+    const mid = Math.round(tileManager.maxZoom / 2);
+    zoomSlider.value = mid;
+    zoomLabel.textContent = mid;
+    tileManager.forcedZoom = mid;
+    overviewPanel.currentZoom = mid;   // keep the overview selection box in sync
 }
 
 function syncOverviewRingMax() {
@@ -768,13 +834,13 @@ async function loadPyramid(pyramid) {
     const idFieldsArr = tileManager.idFields ? [...tileManager.idFields] : [];
     await featureSelector.init(featuresData, idFieldsArr);
     syncZoomSlider();
-    resetCamera();
-
-    // Update overview panel
+    // Set up the overview (bounds + crosshair snapped to the mid-zoom tile center) BEFORE
+    // framing, so resetCamera centers the main view on the overview's selection box.
     overviewPanel.setFeatureIndex(tileManager.featureIndex);
     overviewPanel.setBounds(tileManager.root.box3, tileManager.maxZoom, baseUrl);
-    overviewPanel.loadTiles().then(requestRender);   // repaint once z0 tiles arrive (render-on-demand)
     syncOverviewRingMax();
+    resetCamera();
+    overviewPanel.loadTiles().then(requestRender);   // repaint once z0 tiles arrive (render-on-demand)
     overviewPanel.setSelectedFeatures(featureSelector.selected);
 
     // Reset color-by state for new pyramid
@@ -818,14 +884,20 @@ async function init() {
             await featureSelector.init(featuresData);
         }
 
-        syncZoomSlider();
-        resetCamera();
+        // The GPU-budget slider is the single source of truth. Sync the freshly-created
+        // TileManager's maxGpuMB from it on load so the constructor default (1024) can no
+        // longer disagree with the value shown in the UI.
+        tileManager.maxGpuMB = parseInt(gpuSlider.value);
 
-        // Update overview panel
+        syncZoomSlider();
+        // Set up the overview (bounds + crosshair snapped to the mid-zoom tile center)
+        // BEFORE framing, so resetCamera centers the main view on the overview's
+        // selection box rather than the raw volume center.
         overviewPanel.setFeatureIndex(tileManager.featureIndex);
         overviewPanel.setBounds(tileManager.root.box3, tileManager.maxZoom, baseUrl);
-        overviewPanel.loadTiles().then(requestRender);   // repaint once z0 tiles arrive (render-on-demand)
         syncOverviewRingMax();
+        resetCamera();
+        overviewPanel.loadTiles().then(requestRender);   // repaint once z0 tiles arrive (render-on-demand)
 
         // Populate color-by dropdown
         populateColorByDropdown(tileManager.featureIndex, tileManager.idFields);
