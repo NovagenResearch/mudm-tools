@@ -38,9 +38,12 @@ class ObjConverter:
                 values are dicts of properties.
             glob (str): Glob pattern for OBJ files. Default: "*.obj".
             generate_parquet (bool): Also generate Parquet. Default: True.
-            compression (str): GLB tile compression — "meshopt" (default),
-                "draco", or "none". meshopt shrinks tiles ~4-5x on disk/wire and
-                is the format the bundled 3D viewer expects (EXT_meshopt_compression).
+            compression (str): GLB tile compression — "meshopt-q14" (default),
+                "meshopt", "meshopt-q16", "meshopt-q10", "draco", or "none". The
+                meshopt-q* variants u16-quantize positions via KHR_mesh_quantization
+                (~25% smaller wire than raw-f32 "meshopt", visually lossless for these
+                surfaces); all are decoded natively by the bundled 3D viewer
+                (EXT_meshopt_compression [+ KHR_mesh_quantization]).
         """
         from mudm_tools._rs import StreamingTileGenerator
 
@@ -55,7 +58,7 @@ class ObjConverter:
         tags_map = config.get("tags", {})
         glob_pattern = config.get("glob", "*.obj")
         do_parquet = config.get("generate_parquet", True)
-        compression = config.get("compression", "meshopt")
+        compression = config.get("compression", "meshopt-q14")
         # LOD mesh simplification (per-zoom QEM decimation). Default on. Set False for small
         # datasets where decimation facets smooth surfaces (e.g. HRA anatomy) and the size
         # savings aren't needed — tiles stay full-detail at every zoom.

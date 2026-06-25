@@ -69,6 +69,7 @@ def extract_features(glb_json: dict) -> list[dict]:
 
 
 def build_index(tiles_dir: Path, id_fields: list[str] | None = None,
+                unique_by: str | None = None,
                 ) -> tuple[dict, dict[int, int], int]:
     """Build feature index from all .glb files.
 
@@ -76,6 +77,12 @@ def build_index(tiles_dir: Path, id_fields: list[str] | None = None,
         tiles_dir: Path to the 3D tiles directory.
         id_fields: List of metadata keys that are identifiers (excluded from
             filter/color-by in the viewer). Passed through to build_tilejson().
+        unique_by: If set (e.g. "body_id"), group features by a UNIQUE key
+            synthesized as "{base_name} ({feat[unique_by]})" instead of by bare
+            name. Needed when the baked display name is NOT unique per feature
+            (e.g. hemibrain's neuPrint `instance` is shared across bodies, which
+            silently collapsed 25000 neurons → 12552). Mirrors flywire's baked
+            "{label} ({root_id})" convention, applied at index time (no re-tile).
 
     Returns:
         A tuple of (collection_dict, zoom_counts, max_zoom) where:
@@ -114,6 +121,11 @@ def build_index(tiles_dir: Path, id_fields: list[str] | None = None,
                     or str(feat.get("body_id", "")))
             if not name:
                 continue
+            # Force per-feature uniqueness when the baked name is shared across
+            # features (e.g. hemibrain's `instance`). Synthesize "{base} ({uid})".
+            if unique_by is not None and feat.get(unique_by) is not None:
+                uid = feat[unique_by]
+                name = name if str(uid) in name else f"{name} ({uid})"
 
             if name not in feature_map:
                 entry: dict = {

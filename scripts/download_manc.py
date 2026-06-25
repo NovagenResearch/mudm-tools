@@ -394,9 +394,9 @@ def tile_meshopt(
     gen.add_obj_files(path_strs, bounds, tags_list, ingest_threads=ingest_threads)
     print(f"Ingest: {_fmt_time(time.perf_counter() - t0)}")
 
-    print("Encoding 3D Tiles with meshopt...")
+    print("Encoding 3D Tiles with meshopt-q14...")
     t0 = time.perf_counter()
-    n_tiles = gen.generate_3dtiles(str(tiles3d_dir), bounds, compression="meshopt")
+    n_tiles = gen.generate_3dtiles(str(tiles3d_dir), bounds, compression="meshopt-q14")
     print(f"  {n_tiles} tiles in {_fmt_time(time.perf_counter() - t0)}")
     del gen
 

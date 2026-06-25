@@ -331,6 +331,11 @@ pub struct StreamingTileGenerator2D {
     buffer: f64,
     feature_count: u32,
     tags_registry: HashMap<u32, Vec<(String, TagValue)>>,
+    /// LOD gate: per-feature tag keys present only on tiles at zoom >= the
+    /// recorded value (keys absent here appear at all zooms). Lets heavy
+    /// per-feature tags (e.g. per-cell expression) ride the fine tiles without
+    /// bloating coarse ones, where features are sub-pixel anyway.
+    tag_min_zoom: HashMap<String, u32>,
     fragment_writer: Option<Fragment2DWriter>,
     frag_dir: PathBuf,
     shard_counter: std::sync::atomic::AtomicUsize,
@@ -374,12 +379,57 @@ impl StreamingTileGenerator2D {
             buffer,
             feature_count: 0,
             tags_registry: HashMap::new(),
+            tag_min_zoom: HashMap::new(),
             fragment_writer: Some(writer),
             frag_dir,
             shard_counter: std::sync::atomic::AtomicUsize::new(1),
             fragment_reader: None,
             parquet_stream_active: false,
         })
+    }
+
+    /// LOD gate (Path B): emit the tag `key` only on tiles at zoom >= `min_zoom`.
+    /// Used to keep heavy per-feature tags (e.g. per-cell `expression`) off the
+    /// coarse tiles, where features are sub-pixel. Tags without a gate appear at
+    /// all zooms.
+    fn set_tag_min_zoom(&mut self, key: String, min_zoom: u32) {
+        self.tag_min_zoom.insert(key, min_zoom);
+    }
+
+    /// Attach extra tags to already-ingested features by matching an existing
+    /// tag value (Path B): for every feature whose `id_key` tag equals a key in
+    /// `attrs`, append that entry's (tag_key, value) pairs. Lets a converter
+    /// join per-entity attributes (e.g. per-cell expression keyed by `cell_id`)
+    /// onto the muDM tag registry AFTER `add_parquet_polygons`, so the tags flow
+    /// natively into BOTH the PBF and the Parquet output (no sidecar). Returns
+    /// the number of features that received at least one extra tag.
+    fn attach_tags_by_id(
+        &mut self,
+        id_key: &str,
+        attrs: HashMap<String, Vec<(String, String)>>,
+    ) -> u32 {
+        let mut n: u32 = 0;
+        for tags in self.tags_registry.values_mut() {
+            // Read the id value first; the immutable borrow ends before we push.
+            let id_val = tags.iter().find_map(|(k, v)| {
+                if k == id_key {
+                    if let TagValue::Str(s) = v { Some(s.clone()) } else { None }
+                } else {
+                    None
+                }
+            });
+            if let Some(id) = id_val {
+                if let Some(extra) = attrs.get(&id) {
+                    if !extra.is_empty() {
+                        for (k, v) in extra {
+                            tags.push((k.clone(), TagValue::Str(v.clone())));
+                        }
+                        n += 1;
+                    }
+                }
+            }
+        }
+        n
     }
 
     /// Add a single 2D feature (already projected to [0,1]²).
@@ -1299,11 +1349,12 @@ impl StreamingTileGenerator2D {
         // Build the tag vectors for each feature outside of the parallel section
         // (tags_registry is not Send, so we need to snapshot it)
         let tags_snapshot: HashMap<u32, Vec<(String, TagValue)>> = tags_reg.clone();
+        let tmz_snapshot: HashMap<String, u32> = self.tag_min_zoom.clone();
 
         let tile_count = py.allow_threads(|| {
             generate_pbf_tiles(
                 &tiles, &out_dir, &world_bounds, max_zoom, extent,
-                simplify, &ln, &tags_snapshot,
+                simplify, &ln, &tags_snapshot, &tmz_snapshot,
             )
         }).map_err(|e| pyo3::exceptions::PyIOError::new_err(e))?;
 
@@ -1365,13 +1416,14 @@ impl StreamingTileGenerator2D {
         let tiles: Vec<((u32, u32, u32), Vec<Fragment2D>)> = groups.into_iter().collect();
         let max_zoom = self.max_zoom;
         let tags_snapshot: HashMap<u32, Vec<(String, TagValue)>> = self.tags_registry.clone();
+        let tmz_snapshot: HashMap<String, u32> = self.tag_min_zoom.clone();
         let out_dir = output_dir.to_string();
         let comp = compression.to_string();
 
         let total = py.allow_threads(|| {
             write_parquet_native(
                 &tiles, &out_dir, &world_bounds, max_zoom,
-                simplify, &tags_snapshot, &comp, &mut HashMap::new(),
+                simplify, &tags_snapshot, &comp, &mut HashMap::new(), &tmz_snapshot,
             )
         }).map_err(|e| pyo3::exceptions::PyIOError::new_err(e))?;
 
@@ -1410,6 +1462,7 @@ impl StreamingTileGenerator2D {
 
         let max_zoom = self.max_zoom;
         let tags_snapshot: HashMap<u32, Vec<(String, TagValue)>> = self.tags_registry.clone();
+        let tmz_snapshot: HashMap<String, u32> = self.tag_min_zoom.clone();
         let out_dir = output_dir.to_string();
         let comp = compression.to_string();
         let budget = max_batch_bytes.max(1);
@@ -1441,7 +1494,7 @@ impl StreamingTileGenerator2D {
                 let tiles: Vec<((u32, u32, u32), Vec<Fragment2D>)> = groups.into_iter().collect();
                 total += write_parquet_native(
                     &tiles, &out_dir, &world_bounds, max_zoom,
-                    simplify, &tags_snapshot, &comp, &mut part_base,
+                    simplify, &tags_snapshot, &comp, &mut part_base, &tmz_snapshot,
                 )?;
             }
             Ok(total)
@@ -1482,6 +1535,7 @@ impl StreamingTileGenerator2D {
         let max_zoom = self.max_zoom;
         let min_zoom = self.min_zoom;
         let tags_snapshot: HashMap<u32, Vec<(String, TagValue)>> = self.tags_registry.clone();
+        let tmz_snapshot: HashMap<String, u32> = self.tag_min_zoom.clone();
         let pbf_out = pbf_dir.to_string();
         let pq_out = parquet_dir.to_string();
         let ln = layer_name.to_string();
@@ -1492,11 +1546,11 @@ impl StreamingTileGenerator2D {
             rayon::join(
                 || generate_pbf_tiles(
                     &tiles, &pbf_out, &world_bounds, max_zoom, extent,
-                    simplify, &ln, &tags_snapshot,
+                    simplify, &ln, &tags_snapshot, &tmz_snapshot,
                 ),
                 || write_parquet_native(
                     &tiles, &pq_out, &world_bounds, max_zoom,
-                    simplify, &tags_snapshot, &comp, &mut HashMap::new(),
+                    simplify, &tags_snapshot, &comp, &mut HashMap::new(), &tmz_snapshot,
                 ),
             )
         });
@@ -1552,6 +1606,7 @@ fn write_parquet_native(
     // files colliding. The whole-corpus callers pass a fresh empty map (base 0
     // ⇒ byte-identical to before).
     part_base: &mut HashMap<u32, u32>,
+    tag_min_zoom: &HashMap<String, u32>,
 ) -> Result<u64, String> {
     use arrow::array::*;
     use arrow::datatypes::{DataType, Field, Schema};
@@ -1703,6 +1758,11 @@ fn write_parquet_native(
 
                 if let Some(tag_vec) = tags.get(&row.feature_id) {
                     for (k, v) in tag_vec {
+                        // LOD gate (Path B): skip tags whose tag_min_zoom exceeds
+                        // this zoom (e.g. per-cell expression on coarse tiles).
+                        if tag_min_zoom.get(k).map_or(false, |&mz| zoom < mz) {
+                            continue;
+                        }
                         map_builder.keys().append_value(k);
                         match v {
                             TagValue::Str(s) => map_builder.values().append_value(s),
@@ -1754,6 +1814,7 @@ fn generate_pbf_tiles(
     simplify: bool,
     layer_name: &str,
     tags_registry: &HashMap<u32, Vec<(String, TagValue)>>,
+    tag_min_zoom: &HashMap<String, u32>,
 ) -> Result<u32, String> {
     let tile_count = std::sync::atomic::AtomicU32::new(0);
 
@@ -1809,10 +1870,15 @@ fn generate_pbf_tiles(
                 continue;
             }
 
-            // Collect tags for this feature
-            let tags = tags_registry.get(&frag.feature_id)
+            // Collect tags for this feature. LOD gate (Path B): drop tags whose
+            // tag_min_zoom exceeds this tile's zoom (e.g. per-cell expression on
+            // coarse tiles), so heavy tags ride only the fine tiles.
+            let mut tags = tags_registry.get(&frag.feature_id)
                 .cloned()
                 .unwrap_or_default();
+            if !tag_min_zoom.is_empty() {
+                tags.retain(|(k, _)| tag_min_zoom.get(k).map_or(true, |&mz| tz >= mz));
+            }
 
             mvt_features.push(encoder_mvt::MvtFeature {
                 id: frag.feature_id as u64,

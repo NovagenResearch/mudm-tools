@@ -64,6 +64,13 @@ _SELECT = {
     "sm": ["sensory", "sensory_ascending", "sensory_descending", "motor"],
     # the visual system / optic lobe (columnar retinotopy + projection neurons).
     "optic": ["optic_lobe_intrinsic", "visual_projection", "visual_centrifugal"],
+    # the FULL connectome: every classified NEURON super_class (excludes glia,
+    # trachea, not_a_neuron, and unclassified None). ~146.8k neurons.
+    "all-neurons": ["descending", "ascending", "sensory", "sensory_ascending",
+                    "sensory_descending", "motor", "optic_lobe_intrinsic",
+                    "central_brain_intrinsic", "ventral_nerve_cord_intrinsic",
+                    "visual_projection", "visual_centrifugal", "visceral_circulatory",
+                    "ascending_visceral_circulatory"],
 }
 
 
@@ -300,9 +307,9 @@ def tile_meshopt(mesh_dir: Path, meta_lookup: dict[str, dict], output_dir: Path,
     gen.add_obj_files(path_strs, bounds, tags_list, ingest_threads=ingest_threads)
     print(f"Ingest: {_fmt_time(time.perf_counter() - t0)}")
 
-    print("Encoding 3D Tiles with meshopt...")
+    print("Encoding 3D Tiles with meshopt-q14...")
     t0 = time.perf_counter()
-    n_tiles = gen.generate_3dtiles(str(tiles3d_dir), bounds, compression="meshopt")
+    n_tiles = gen.generate_3dtiles(str(tiles3d_dir), bounds, compression="meshopt-q14")
     print(f"  {n_tiles} tiles in {_fmt_time(time.perf_counter() - t0)}")
     del gen
 

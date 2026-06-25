@@ -92,6 +92,16 @@ class XeniumConverter:
         id_column = config.get("id_column", "cell_id")
         skip_raster = config.get("skip_raster", False)
 
+        # Path B (expression_lod): per-cell expression as muDM feature properties
+        # on the cells layer — emitted to BOTH the PBF (MVT props) and the
+        # Parquet `tags`, zoom-banded so the heavy `expression` tag rides only
+        # the fine tiles. No sidecar. Default OFF → no behavior change.
+        expr_cfg = config.get("expression_lod", {}) or {}
+        expr_enabled = bool(expr_cfg.get("enabled", False))
+        expr_min_zoom = int(expr_cfg.get("expr_min_zoom", 3))
+        expr_topn = expr_cfg.get("topn")
+        expr_layer = expr_cfg.get("layer", "cells")
+
         timings: dict[str, float | dict[str, float]] = {}
         t_start = time.time()
 
@@ -180,6 +190,38 @@ class XeniumConverter:
             layer_counts[layer_name] = count
             t_ingest = time.time() - t0
             print(f"{count:,} features ({t_ingest:.1f}s)", flush=True)
+
+            # Path B: per-cell expression as muDM feature properties (tags) on
+            # the cells layer — attached AFTER ingest by matching the existing
+            # cell_id tag, so the counts flow natively into BOTH the PBF and the
+            # Parquet. `total_counts` (cheap scalar) rides all zooms as the
+            # overview signal; the heavy sparse `expression` map is gated to
+            # z >= expr_min_zoom. No sidecar; like CODEX `m_<marker>`.
+            if expr_enabled and geom_type != "point" and layer_name == expr_layer:
+                mtx_dir = data_dir / "cell_feature_matrix"
+                if mtx_dir.is_dir():
+                    print(
+                        f"  Attaching per-cell expression (total_counts all z, "
+                        f"expression z>={expr_min_zoom})...",
+                        end=" ",
+                        flush=True,
+                    )
+                    t0e = time.time()
+                    sparse = _load_cell_expression_sparse(mtx_dir, expr_topn)
+                    attrs = {
+                        cid: [("total_counts", tot), ("expression", ej)]
+                        for cid, (ej, tot) in sparse.items()
+                    }
+                    n_attached = gen.attach_tags_by_id(id_col, attrs)
+                    gen.set_tag_min_zoom("expression", expr_min_zoom)
+                    layer_fields[layer_name]["total_counts"] = "String"
+                    layer_fields[layer_name]["expression"] = "String"
+                    print(f"{n_attached:,} cells ({time.time() - t0e:.1f}s)", flush=True)
+                else:
+                    print(
+                        f"  expression_lod enabled but no {mtx_dir.name}/ found — skipping",
+                        flush=True,
+                    )
 
             # Encode PBF
             print("  Encoding PBF...", end=" ", flush=True)
@@ -297,6 +339,18 @@ class XeniumConverter:
             "vectors": {"path": "vectors/{z}/{x}/{y}.pbf", "layers": vector_layers},
             "parquet": {"path": "features.parquet", "partitioned": True},
         }
+        if expr_enabled:
+            # Hint the viewer: cells carry total_counts at all zooms (overview
+            # signal) + a sparse {gene:count} `expression` JSON from expr_min_zoom up.
+            metadata["expression_lod"] = {
+                "enabled": True,
+                "layer": expr_layer,
+                "expr_min_zoom": expr_min_zoom,
+                "fields": {
+                    "total_counts": "all zooms (per-cell total expression)",
+                    "expression": f"z>={expr_min_zoom} (sparse {{gene:count}} JSON)",
+                },
+            }
         (out_dir / "metadata.json").write_text(json.dumps(metadata, indent=2))
 
         # Write gene_list.json for the viewer gene filter
@@ -668,6 +722,66 @@ def _load_xenium_expression_mtx(
         col = m.getcol(col_idx).toarray().ravel().astype(np.int64)
         expression_by_cell[cell_id] = [int(v) for v in col]
     return expression_by_cell, gene_panel
+
+
+def _load_cell_expression_sparse(
+    matrix_dir: Path,
+    topn: int | None = None,
+) -> dict[str, tuple[str, str]]:
+    """Read a Xenium ``cell_feature_matrix/`` (MEX triplet) into the Path-B
+    muDM-property payload: per cell, a SPARSE non-zero ``{gene: count}`` map plus
+    a total count.
+
+    Reuses the scipy CSC read of :func:`_load_xenium_expression_mtx` (no new
+    dependency) but emits only non-zero genes — most genes are absent in any
+    given cell, so the dense vector is mostly wasted bytes.
+
+    Returns:
+        ``{cell_id (barcode str): (expression_json, total_counts_str)}`` where
+        ``expression_json`` is a compact ``{gene: count}`` JSON string of the
+        non-zero entries (top-``topn`` by count when ``topn`` is set) and
+        ``total_counts_str`` is the per-cell total over ALL genes.
+    """
+    import scipy.io as sio
+
+    mtx_path = matrix_dir / "matrix.mtx.gz"
+    bc_path = matrix_dir / "barcodes.tsv.gz"
+    feat_path = matrix_dir / "features.tsv.gz"
+    for p in (mtx_path, bc_path, feat_path):
+        if not p.exists():
+            raise FileNotFoundError(f"missing {p}")
+
+    with gzip.open(bc_path, "rt") as f:
+        barcodes = [line.strip() for line in f if line.strip()]
+    with gzip.open(feat_path, "rt") as f:
+        # 10x features.tsv.gz: id\tname\ttype
+        gene_panel = [line.split("\t")[1].strip() for line in f if line.strip()]
+
+    with gzip.open(mtx_path, "rb") as f:
+        m = sio.mmread(f).tocsc()  # (features × cells), efficient column slicing
+    if m.shape[0] == len(barcodes) and m.shape[1] == len(gene_panel):
+        m = m.T.tocsc()
+    if m.shape != (len(gene_panel), len(barcodes)):
+        raise ValueError(
+            f"matrix shape {m.shape} != ({len(gene_panel)} genes × {len(barcodes)} cells)"
+        )
+
+    indptr, indices, data = m.indptr, m.indices, m.data
+    out: dict[str, tuple[str, str]] = {}
+    for col, bc in enumerate(barcodes):
+        lo, hi = int(indptr[col]), int(indptr[col + 1])
+        if hi <= lo:
+            out[bc] = ("{}", "0")
+            continue
+        rows = indices[lo:hi]
+        vals = data[lo:hi].astype(np.int64)
+        total = int(vals.sum())
+        if topn is not None and len(rows) > topn:
+            keep = np.argsort(vals)[::-1][:topn]
+            rows, vals = rows[keep], vals[keep]
+        expr = {gene_panel[int(r)]: int(c) for r, c in zip(rows, vals)}
+        out[bc] = (json.dumps(expr, separators=(",", ":")), str(total))
+    return out
 
 
 def _load_xenium_clusters(

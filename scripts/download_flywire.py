@@ -271,9 +271,13 @@ def _build_tags(obj_path: Path, meta_lookup: dict[str, dict]) -> dict:
         if val:
             tags[key] = val
     # name MUST be unique per neuron (build_feature_index groups by name) — mirror
-    # MANC's "{instance} ({body_id})". cell_type alone is shared by many neurons.
-    _ct = tags.get("cell_type") or tags.get("hemibrain_type")
-    tags["name"] = f"{_ct} ({root_id})" if _ct else str(root_id)
+    # MANC's "{instance} ({body_id})", appending root_id since a class is shared by many.
+    # Many neurons (esp. optic lobe) have no cell_type, so fall back through progressively
+    # coarser annotations rather than degrading to a bare number in the viewer list.
+    _label = next((tags[k] for k in
+                   ("cell_type", "hemibrain_type", "cell_sub_class", "cell_class", "super_class")
+                   if tags.get(k)), None)
+    tags["name"] = f"{_label} ({root_id})" if _label else str(root_id)
     tags["color"] = _hash_color(root_id)
     return tags
 
@@ -284,7 +288,7 @@ def _build_tags(obj_path: Path, meta_lookup: dict[str, dict]) -> dict:
 
 def tile_meshopt(mesh_dir: Path, meta_lookup: dict[str, dict], output_dir: Path, *,
                  max_zoom: int = MAX_ZOOM, max_files: int | None = None,
-                 ingest_threads: int = 0,
+                 ingest_threads: int = 0, compression: str = "meshopt-q14",
                  emit_neuroglancer: bool = False, emit_parquet: bool = False,
                  label: str | None = None) -> None:
     import tempfile
@@ -324,9 +328,9 @@ def tile_meshopt(mesh_dir: Path, meta_lookup: dict[str, dict], output_dir: Path,
     gen.add_obj_files(path_strs, bounds, tags_list, ingest_threads=ingest_threads)
     print(f"Ingest: {_fmt_time(time.perf_counter() - t0)}")
 
-    print("Encoding 3D Tiles with meshopt...")
+    print(f"Encoding 3D Tiles with {compression}...")
     t0 = time.perf_counter()
-    n_tiles = gen.generate_3dtiles(str(tiles3d_dir), bounds, compression="meshopt")
+    n_tiles = gen.generate_3dtiles(str(tiles3d_dir), bounds, compression=compression)
     print(f"  {n_tiles} tiles in {_fmt_time(time.perf_counter() - t0)}")
 
     # Parquet first — it's streaming/bounded-memory, so it's safe even at huge scale.
@@ -425,6 +429,10 @@ def main() -> None:
     parser.add_argument("--lod", type=int, default=1,
                         help="Multires mesh LOD: 0=finest .. 3=coarsest (default: 1)")
     parser.add_argument("--max-zoom", type=int, default=MAX_ZOOM, help=f"Max zoom (default: {MAX_ZOOM})")
+    parser.add_argument("--compression", default="meshopt-q14",
+                        choices=["meshopt", "meshopt-q14", "meshopt-q16", "meshopt-q10", "draco"],
+                        help="GLB encoding (default: meshopt-q14 = u16-quantized positions via "
+                             "KHR_mesh_quantization, ~25%% smaller wire than raw-f32 'meshopt').")
     parser.add_argument("--workers", type=int, default=None, help="Download worker processes")
     parser.add_argument("--ingest-threads", type=int, default=0, help="Tile ingest threads (0=all)")
     parser.add_argument("--data-dir", type=Path, default=_DATA_DIR, help="Data directory")
@@ -467,7 +475,7 @@ def main() -> None:
                  if args.select == "all" else None)
         tile_meshopt(mesh_dir, meta_lookup, args.output,
                      max_zoom=args.max_zoom, max_files=cap,
-                     ingest_threads=args.ingest_threads,
+                     ingest_threads=args.ingest_threads, compression=args.compression,
                      emit_neuroglancer=args.neuroglancer, emit_parquet=args.parquet,
                      label=label)
 

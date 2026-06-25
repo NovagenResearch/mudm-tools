@@ -25,11 +25,20 @@ const SELECTION_WARN_THRESHOLD = 5000;  // warn above this many selected w/o spa
 const _batchColor = new THREE.Color();        // scratch for setColorAt
 const _white = new THREE.Color(0xffffff);     // scratch brighten-target for hover highlight
 const _hl = new THREE.Color();                // scratch for hover highlight
+const _bakeVec = new THREE.Vector3();         // scratch for baking node TRS into batch geometry
+const _IDENTITY4 = new THREE.Matrix4();       // reference identity for the fast-path check
+
+/** True if a Matrix4 is exactly identity (glTF emits exact 1.0/0.0 for untransformed nodes). */
+function _isIdentityMatrix(m) {
+    const e = m.elements, I = _IDENTITY4.elements;
+    for (let i = 0; i < 16; i++) if (e[i] !== I[i]) return false;
+    return true;
+}
 const MAX_DRAW_OBJECTS_DEFAULT = 40000;       // default rendered-instance ceiling (tunable via slider)
-const MAX_INSTANCES_PER_BATCH = 50000;        // refuse batching a single tile larger than this (z0 guard)
-const MAX_BATCH_BYTES = 256 * 1024 * 1024;    // and refuse if its combined vertex+index buffer exceeds this
-                                              // — a BatchedMesh pre-allocates one contiguous buffer, so an
-                                              // oversized coarse tile would throw "Array buffer allocation failed".
+// No per-tile size cap: the viewer batches whatever the browser can allocate and only
+// skips a tile if the BatchedMesh allocation itself throws (handled in _buildBatchedTile).
+// Resident GPU memory is bounded by the maxGpuMB evictor; coarse-tier sizing is the
+// pipeline's job (decimated LOD), not the viewer's.
 
 /** Load states for tiles. */
 const UNLOADED = 0, LOADING = 1, LOADED = 2, FAILED = 3;
@@ -1026,11 +1035,47 @@ export class TileManager {
     }
 
     /**
+     * Resolve a feature mesh to ABSOLUTE-coords Float32 geometry for the BatchedMesh,
+     * which renders every instance with an identity matrix.
+     *
+     * - Raw / `meshopt` tiles already store absolute f32 world positions on an identity
+     *   node → returned as-is (fast path, no copy).
+     * - `meshopt-q14` / `-q16` / `-q10` (KHR_mesh_quantization) store positions as u16
+     *   integers in `[0, 2^bits)` with the dequant on the node TRS → bake `matrixWorld`
+     *   into a fresh Float32 position buffer. Reading via getX/Y/Z respects the
+     *   attribute's normalization/interleaving, so it works regardless of how the
+     *   meshopt/quantization decode laid the data out. Index is preserved.
+     */
+    _batchGeometry(child) {
+        const g = child.geometry;
+        const pos = g.attributes.position;
+        const m = child.matrixWorld;
+        if (_isIdentityMatrix(m) && pos.array instanceof Float32Array && !pos.normalized) {
+            return g;   // already absolute f32 (raw / meshopt) — no work
+        }
+        const n = pos.count;
+        const arr = new Float32Array(n * 3);
+        for (let i = 0; i < n; i++) {
+            _bakeVec.set(pos.getX(i), pos.getY(i), pos.getZ(i)).applyMatrix4(m);
+            arr[i * 3] = _bakeVec.x; arr[i * 3 + 1] = _bakeVec.y; arr[i * 3 + 2] = _bakeVec.z;
+        }
+        const baked = new THREE.BufferGeometry();
+        baked.setAttribute('position', new THREE.BufferAttribute(arr, 3));
+        if (g.index) baked.setIndex(g.index.clone());
+        return baked;
+    }
+
+    /**
      * Build the renderable objects for a freshly loaded tile group: triangle
      * features become a single THREE.BatchedMesh (one draw call per tile);
      * line/point features fall back to the legacy per-mesh meshByFeature path.
      */
     _buildBatchedTile(node, group) {
+        // Refresh world matrices so _batchGeometry can read each feature's node TRS
+        // (KHR_mesh_quantization puts the position dequant there; GLTFLoader does not
+        // pre-bake it). No-op cost for raw/meshopt tiles (identity nodes).
+        group.updateMatrixWorld(true);
+
         const triFeats = [];          // {name, geometry, color, props}
         let sampleMat = null;
         group.traverse(child => {
@@ -1045,7 +1090,7 @@ export class TileManager {
                 return;
             }
             if (!sampleMat) sampleMat = child.material;
-            triFeats.push({ name, geometry: child.geometry, props,
+            triFeats.push({ name, geometry: this._batchGeometry(child), props,
                             color: this._getFeatureColor(name) || props.color });
         });
 
@@ -1058,46 +1103,56 @@ export class TileManager {
             itot += f.geometry.index ? f.geometry.index.count : 0;
         }
 
-        // Oversized-tile guard: a BatchedMesh pre-allocates one contiguous vertex+index
-        // buffer, so a coarse mega-tile (e.g. the z0 tile holding ~all features) would
-        // throw "Array buffer allocation failed". Refuse to batch it — it is never the
-        // intended resident working set (the object/byte budgets keep finer in-frustum
-        // tiles instead, and the overview poster is the see-everything view). The tile
-        // loads but renders nothing rather than crashing.
-        const estBytes = vtot * 12 + itot * 4;   // position(3×f32) + index(u32)
-        if (triFeats.length > MAX_INSTANCES_PER_BATCH || estBytes > MAX_BATCH_BYTES) {
+        // A BatchedMesh pre-allocates ONE contiguous vertex+index buffer. We do NOT cap
+        // tile size — the viewer renders whatever the browser can allocate (resident GPU
+        // memory is bounded by the maxGpuMB evictor, not a per-tile limit). The only
+        // unrecoverable case is a buffer too large to allocate at all (e.g. a multi-GB
+        // coarse mega-tile that should have been decimated in the pipeline): catch that,
+        // drop just this tile's batch, and keep the viewer alive rather than throwing.
+        // Per-node bookkeeping is committed only after the whole batch is built, so a
+        // failure partway through leaves no dangling instance refs on the node.
+        let batch;
+        const pendingInst = [];   // [{ name, ref:{batch,id} }] applied to node on success
+        let gpuBytesAdded = 0;
+        try {
+            batch = new THREE.BatchedMesh(triFeats.length, vtot, itot, this._makeBatchMaterial(sampleMat));
+            // Tile-level frustum cull already runs (_frustumFilter); per-instance cull + sort are
+            // O(n) CPU per frame and become the bottleneck at this scale (three.js #28776).
+            batch.perObjectFrustumCulled = false;
+            batch.sortObjects = false;
+            batch.frustumCulled = false;          // we manage tile visibility ourselves
+            batch.featureByInstance = new Map();  // id -> name
+            batch.propsByInstance = new Map();    // id -> props (for InfoPanel)
+            batch.baseColorByInstance = new Map();// id -> '#rrggbb' (for hover restore)
+            batch.userData._tileNode = node;
+
+            for (const f of triFeats) {
+                const gid = batch.addGeometry(f.geometry);
+                const iid = batch.addInstance(gid);   // identity matrix (geometry is absolute-coords)
+                const hex = f.color || '#cccccc';
+                batch.setColorAt(iid, _batchColor.set(hex));
+                batch.setVisibleAt(iid, false);       // hidden until selected
+                pendingInst.push({ name: f.name, ref: { batch, id: iid } });
+                batch.featureByInstance.set(iid, f.name);
+                batch.propsByInstance.set(iid, f.props);
+                batch.baseColorByInstance.set(iid, hex);
+                gpuBytesAdded += f.geometry.attributes.position.array.byteLength
+                    + (f.geometry.index ? f.geometry.index.array.byteLength : 0);
+            }
+        } catch (e) {
+            const estMB = ((vtot * 12 + itot * 4) / 1048576).toFixed(0);   // position(3×f32) + index(u32)
             console.warn(
-                `[TileManager] not batching oversized tile ${node.uri}: ${triFeats.length} ` +
-                `features, ~${(estBytes / 1048576).toFixed(0)} MB buffer (over cap). Tile will ` +
-                `not render — rely on finer in-frustum tiles / the overview.`
+                `[TileManager] could not allocate BatchedMesh for ${node.uri}: ${triFeats.length} ` +
+                `features, ~${estMB} MB buffer — skipping this tile (decimate coarse tiers in the ` +
+                `pipeline to avoid mega-tiles). ${e?.message || e}`
             );
+            if (batch) { try { batch.dispose(); } catch (_) { /* nothing uploaded yet */ } }
             return;
         }
 
-        const batch = new THREE.BatchedMesh(triFeats.length, vtot, itot, this._makeBatchMaterial(sampleMat));
-        // Tile-level frustum cull already runs (_frustumFilter); per-instance cull + sort are
-        // O(n) CPU per frame and become the bottleneck at this scale (three.js #28776).
-        batch.perObjectFrustumCulled = false;
-        batch.sortObjects = false;
-        batch.frustumCulled = false;          // we manage tile visibility ourselves
-        batch.featureByInstance = new Map();  // id -> name
-        batch.propsByInstance = new Map();    // id -> props (for InfoPanel)
-        batch.baseColorByInstance = new Map();// id -> '#rrggbb' (for hover restore)
-        batch.userData._tileNode = node;
-
-        for (const f of triFeats) {
-            const gid = batch.addGeometry(f.geometry);
-            const iid = batch.addInstance(gid);   // identity matrix (geometry is absolute-coords)
-            const hex = f.color || '#cccccc';
-            batch.setColorAt(iid, _batchColor.set(hex));
-            batch.setVisibleAt(iid, false);       // hidden until selected
-            (node.instanceByFeature[f.name] ??= []).push({ batch, id: iid });
-            batch.featureByInstance.set(iid, f.name);
-            batch.propsByInstance.set(iid, f.props);
-            batch.baseColorByInstance.set(iid, hex);
-            node.gpuBytes += f.geometry.attributes.position.array.byteLength
-                + (f.geometry.index ? f.geometry.index.array.byteLength : 0);
-        }
+        // Commit to the node only after the full batch built successfully.
+        for (const { name, ref } of pendingInst) (node.instanceByFeature[name] ??= []).push(ref);
+        node.gpuBytes += gpuBytesAdded;
         node.instanceCount += triFeats.length;
         batch.visible = false;
         this.scene.add(batch);

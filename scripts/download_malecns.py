@@ -62,6 +62,8 @@ _SELECT = {
     # the sexually-dimorphic / male courtship-&-reproduction circuit (the MaleCNS
     # paper's headline). 1267 male-specific + 747 sexually dimorphic ≈ 2014.
     "courtship": ("dimorphism", ["male-specific", "sexually dimorphic"]),
+    # the FULL connectome: every proofread Neuron (no super_class/dimorphism filter). ~166.7k.
+    "all": (None, None),
 }
 
 
@@ -106,10 +108,15 @@ def _dir_size(p: Path) -> int:
 def query_neuprint(token: str, select: str, max_neurons: int | None) -> list[dict]:
     import requests
     field, values = _SELECT[select]
-    val_list = ", ".join(f'"{s}"' for s in values)
+    if select == "all" or field is None:
+        where = "n.bodyId IS NOT NULL"
+        val_list = "(all)"
+    else:
+        val_list = ", ".join(f'"{s}"' for s in values)
+        where = f"n.{field} IN [{val_list}] AND n.bodyId IS NOT NULL"
     cypher = f"""
     MATCH (n :Neuron)
-    WHERE n.{field} IN [{val_list}] AND n.bodyId IS NOT NULL
+    WHERE {where}
     RETURN n.bodyId AS bodyId,
            n.type AS cellType,
            n.instance AS instance,
@@ -336,9 +343,9 @@ def tile_meshopt(mesh_dir: Path, meta_path: Path, output_dir: Path, *,
     gen.add_obj_files(path_strs, bounds, tags_list, ingest_threads=ingest_threads)
     print(f"Ingest: {_fmt_time(time.perf_counter() - t0)}")
 
-    print("Encoding 3D Tiles with meshopt...")
+    print("Encoding 3D Tiles with meshopt-q14...")
     t0 = time.perf_counter()
-    n_tiles = gen.generate_3dtiles(str(tiles3d_dir), bounds, compression="meshopt")
+    n_tiles = gen.generate_3dtiles(str(tiles3d_dir), bounds, compression="meshopt-q14")
     print(f"  {n_tiles} tiles in {_fmt_time(time.perf_counter() - t0)}")
     del gen
 
