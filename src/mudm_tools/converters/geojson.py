@@ -71,6 +71,43 @@ class GeoJsonConverter:
         if bounds is None:
             bounds = self._compute_bounds(geojson_files)
 
+        # Facet policy: when `config["facets"]` is present, high-card numeric
+        # per-cell attributes are pulled OUT of the vector tiles into a
+        # `cell_id`-keyed facet store. We strip those keys from every feature's
+        # properties BEFORE ingest (so they never enter the PBF/Parquet) and emit
+        # them separately after tiling. Geometry + the inline keys (cell_id,
+        # cell_type, non-faceted props) still tile normally.
+        facet_cfg = config.get("facets")
+        facet_keys: list[str] = []
+        cell_ids: list[str] = []
+        facet_attrs: dict[str, Any] = {}
+        policy = None
+        if facet_cfg:
+            from mudm_tools.facets import FacetPolicy, select_facet_keys
+
+            policy = FacetPolicy.from_config(facet_cfg)
+            features = self._load_features(geojson_files)
+            columns, cardinality = self._scan_properties(features)
+            facet_keys, _inline_keys = select_facet_keys(policy, columns, cardinality)
+            if facet_keys:
+                cell_ids, facet_attrs = self._collect_facet_attrs(
+                    features, facet_keys, policy.key
+                )
+                # Write a properties-stripped GeoJSON (facet keys removed) to feed
+                # the tiler. One combined file keeps the single-file ingest path.
+                stripped = {
+                    "type": "FeatureCollection",
+                    "features": self._strip_facet_keys(features, facet_keys),
+                }
+                fd, stripped_path = tempfile.mkstemp(
+                    suffix=".geojson", prefix="facet_stripped_", dir=temp_dir
+                )
+                Path(stripped_path).write_text(json.dumps(stripped))
+                import os
+
+                os.close(fd)
+                geojson_files = [Path(stripped_path)]
+
         gen = StreamingTileGenerator2D(
             min_zoom=min_zoom,
             max_zoom=max_zoom,
@@ -108,14 +145,104 @@ class GeoJsonConverter:
         t_pq = time.time() - t0
         print(f"{pq_rows:,} rows ({t_pq:.1f}s)", flush=True)
 
+        # Facet store: emit the cell_id-keyed Parquet + patch metadata.json. The
+        # faceted keys are already absent from the tiles (stripped pre-ingest).
+        facets_block = None
+        if policy is not None and facet_keys:
+            from mudm_tools.facets import emit_facet_store
+
+            print("Encoding facet store...", end=" ", flush=True)
+            t0 = time.time()
+            facets_block = emit_facet_store(
+                str(out_dir), cell_ids, facet_attrs, policy
+            )
+            print(f"{len(facet_keys)} field(s) ({time.time() - t0:.1f}s)", flush=True)
+
+            metadata = {
+                "name": Path(input_dir).stem,
+                "vectors": {"path": "vectors/{z}/{x}/{y}.pbf"},
+                "parquet": {"path": "features.parquet", "partitioned": True},
+                "facets": facets_block,
+            }
+            (out_dir / "metadata.json").write_text(json.dumps(metadata, indent=2))
+
         total_time = time.time() - t_start
         print(f"Done. Output: {out_dir} ({total_time:.0f}s)", flush=True)
 
-        return {
+        result = {
             "total_time": total_time,
             "feature_count": len(fids),
             "timings": {"ingest": t_ingest, "pbf": t_pbf, "parquet": t_pq},
         }
+        if facets_block is not None:
+            result["facets"] = facets_block
+        return result
+
+    def _load_features(self, files) -> list[dict]:
+        """Read all features from the input GeoJSON file(s), in file/feature order."""
+        feats: list[dict] = []
+        for f in files:
+            fc = json.loads(Path(f).read_text())
+            feats.extend(fc.get("features", []) or [])
+        return feats
+
+    def _scan_properties(self, features: list[dict]):
+        """Infer per-property numpy dtype + cardinality from feature properties.
+
+        Returns ``(columns, cardinality)`` where ``columns`` maps property name ->
+        ``numpy.dtype`` (inferred from the non-null sample values) and
+        ``cardinality`` maps property name -> distinct non-null value count.
+        """
+        import numpy as np
+
+        values: dict[str, list] = {}
+        distinct: dict[str, set] = {}
+        for feat in features:
+            props = feat.get("properties") or {}
+            for k, v in props.items():
+                if v is None:
+                    continue
+                values.setdefault(k, []).append(v)
+                distinct.setdefault(k, set()).add(v)
+        columns: dict[str, Any] = {}
+        for k, vals in values.items():
+            columns[k] = np.array(vals).dtype
+        cardinality = {k: len(s) for k, s in distinct.items()}
+        return columns, cardinality
+
+    def _collect_facet_attrs(self, features: list[dict], facet_keys: list[str], key: str):
+        """Build ``cell_id``-aligned arrays for the facet keys.
+
+        Returns ``(cell_ids, attributes)`` where ``cell_ids`` is one id per
+        feature (``properties[key]`` or the positional index as a fallback) and
+        ``attributes`` maps each facet key to a per-feature ``numpy`` array
+        (missing numeric values become NaN).
+        """
+        import numpy as np
+
+        cell_ids: list[str] = []
+        raw: dict[str, list] = {k: [] for k in facet_keys}
+        for i, feat in enumerate(features):
+            props = feat.get("properties") or {}
+            cid = props.get(key, i)
+            cell_ids.append(str(cid))
+            for k in facet_keys:
+                raw[k].append(props.get(k, None))
+        attributes: dict[str, Any] = {}
+        for k, vals in raw.items():
+            arr = np.array([np.nan if v is None else v for v in vals], dtype="float32")
+            attributes[k] = arr
+        return cell_ids, attributes
+
+    def _strip_facet_keys(self, features: list[dict], facet_keys: list[str]) -> list[dict]:
+        """Return features with the faceted property keys removed (geometry kept)."""
+        drop = set(facet_keys)
+        out = []
+        for feat in features:
+            props = feat.get("properties") or {}
+            new_props = {k: v for k, v in props.items() if k not in drop}
+            out.append({**feat, "properties": new_props})
+        return out
 
     def _compute_bounds(self, files):
         # PY-3 (streaming_review.md §G): this previously called a `pass`-only

@@ -102,6 +102,16 @@ class XeniumConverter:
         expr_topn = expr_cfg.get("topn")
         expr_layer = expr_cfg.get("layer", "cells")
 
+        # Facets (Phase 1): high-cardinality / multifaceted per-object metadata
+        # moves OUT of the tiles into a sibling, cell_id-keyed parquet store
+        # joined at view time. Tiles keep only cell_id + total_counts. This is
+        # an INDEPENDENT new path — the legacy expression_lod path is untouched.
+        # Default OFF → no behavior change.
+        facets_cfg = config.get("facets", {}) or {}
+        facets_enabled = bool(facets_cfg.get("enabled", False))
+        facets_layer = facets_cfg.get("layer", "cells")
+        facets_meta = None
+
         timings: dict[str, float | dict[str, float]] = {}
         t_start = time.time()
 
@@ -220,6 +230,35 @@ class XeniumConverter:
                 else:
                     print(
                         f"  expression_lod enabled but no {mtx_dir.name}/ found — skipping",
+                        flush=True,
+                    )
+
+            # Facets path: emit the joined facet store and attach ONLY the cheap
+            # total_counts scalar to the tiles (NO expression tag, NO min-zoom
+            # gate). Independent of expression_lod above.
+            if facets_enabled and geom_type != "point" and layer_name == facets_layer:
+                mtx_dir = data_dir / "cell_feature_matrix"
+                if mtx_dir.is_dir():
+                    print(
+                        "  Emitting facet store (expression.parquet + categorical.parquet)"
+                        + (" + expression.zarr" if facets_cfg.get("emit_zarr") else "")
+                        + "...",
+                        end=" ",
+                        flush=True,
+                    )
+                    t0f = time.time()
+                    result = _emit_facet_store(mtx_dir, out_dir, facets_cfg)
+                    attrs = {
+                        cid: [("total_counts", str(tot))]
+                        for cid, tot in result["total_counts"].items()
+                    }
+                    n_attached = gen.attach_tags_by_id(id_col, attrs)
+                    layer_fields[layer_name]["total_counts"] = "String"
+                    facets_meta = result["facets"]
+                    print(f"{n_attached:,} cells ({time.time() - t0f:.1f}s)", flush=True)
+                else:
+                    print(
+                        f"  facets enabled but no {mtx_dir.name}/ found — skipping",
                         flush=True,
                     )
 
@@ -351,6 +390,8 @@ class XeniumConverter:
                     "expression": f"z>={expr_min_zoom} (sparse {{gene:count}} JSON)",
                 },
             }
+        if facets_enabled and facets_meta is not None:
+            metadata["facets"] = facets_meta
         (out_dir / "metadata.json").write_text(json.dumps(metadata, indent=2))
 
         # Write gene_list.json for the viewer gene filter
@@ -782,6 +823,171 @@ def _load_cell_expression_sparse(
         expr = {gene_panel[int(r)]: int(c) for r, c in zip(rows, vals)}
         out[bc] = (json.dumps(expr, separators=(",", ":")), str(total))
     return out
+
+
+def _read_cell_feature_matrix(matrix_dir: Path):
+    """Read a Xenium ``cell_feature_matrix/`` MEX triplet ONCE.
+
+    Mirrors the read + shape-orientation guard in
+    :func:`_load_cell_expression_sparse`, returning the raw pieces so callers
+    (the facet store) can build several outputs from a single matrix read.
+
+    Returns:
+        ``(m, barcodes, gene_panel)`` where ``m`` is a scipy CSC matrix in
+        MatrixMarket convention (features × cells), ``barcodes`` is the list of
+        integer-string cell ids (matrix column order) and ``gene_panel`` is the
+        ordered list of gene names (matrix row order, from ``features.tsv.gz``).
+    """
+    import scipy.io as sio
+
+    mtx_path = matrix_dir / "matrix.mtx.gz"
+    bc_path = matrix_dir / "barcodes.tsv.gz"
+    feat_path = matrix_dir / "features.tsv.gz"
+    for p in (mtx_path, bc_path, feat_path):
+        if not p.exists():
+            raise FileNotFoundError(f"missing {p}")
+
+    with gzip.open(bc_path, "rt") as f:
+        barcodes = [line.strip() for line in f if line.strip()]
+    with gzip.open(feat_path, "rt") as f:
+        # 10x features.tsv.gz: id\tname\ttype
+        gene_panel = [line.split("\t")[1].strip() for line in f if line.strip()]
+
+    with gzip.open(mtx_path, "rb") as f:
+        m = sio.mmread(f).tocsc()  # (features × cells)
+    if m.shape[0] == len(barcodes) and m.shape[1] == len(gene_panel):
+        m = m.T.tocsc()
+    if m.shape != (len(gene_panel), len(barcodes)):
+        raise ValueError(
+            f"matrix shape {m.shape} != ({len(gene_panel)} genes × {len(barcodes)} cells)"
+        )
+    return m, barcodes, gene_panel
+
+
+def _emit_facet_store(matrix_dir: Path, out_dir: Path, cfg: dict[str, Any]) -> dict:
+    """Emit the joined facet store from a Xenium cell×gene matrix.
+
+    Reads the MEX triplet ONCE and writes, under ``<out_dir>/facets/``:
+
+      * ``expression.parquet`` — the numeric-vector facet in LONG form
+        (``cell_id:str, gene:str(sorted ASC), count:int32``), one row per
+        non-zero, zstd-compressed with 64k row groups. The plain-string,
+        gene-sorted layout lets a range-reader skip row groups via per-group
+        string min/max stats.
+      * ``categorical.parquet`` — a demo categorical facet
+        (``cell_id:str, expr_tier:dict<int8,str>``), one row per cell, the tier
+        derived from per-cell ``total_counts`` tertiles.
+      * ``expression.zarr`` (only when ``cfg['emit_zarr']``) — the SAME matrix
+        as a CSC Zarr store (Task 1b), lazily importing ``zarr``.
+
+    Returns ``{"facets": <metadata block>, "total_counts": {barcode: int}}``.
+    The caller attaches ONLY ``total_counts`` to the cells tiles and writes the
+    facets block into ``metadata.json``; ``expression`` never enters a tile.
+    """
+    import pyarrow as pa
+
+    m, barcodes, gene_panel = _read_cell_feature_matrix(matrix_dir)
+
+    # Per-cell total expression (cheap scalar, rides the tiles inline).
+    total = np.asarray(m.sum(axis=0)).ravel().astype(np.int64)
+
+    facets_dir = out_dir / "facets"
+    facets_dir.mkdir(parents=True, exist_ok=True)
+
+    # --- Long-form numeric-vector facet, sorted by gene NAME --------------
+    # Sort by the gene NAME (the queryable key), NOT the matrix row index: a panel's row order is not
+    # alphabetical, so index-sorting would leave the `gene` string column unsorted and defeat per-row-group
+    # min/max skipping for `WHERE gene=...`. Map each gene to its lexicographic rank (only ~hundreds of
+    # distinct genes) and stable-sort the non-zeros by that rank — fast, and groups each gene contiguously.
+    coo = m.tocoo()
+    genes_obj = np.asarray(gene_panel, dtype=object)
+    rank_of = {g: i for i, g in enumerate(sorted(set(gene_panel)))}
+    gene_rank_by_row = np.array([rank_of[g] for g in gene_panel], dtype=np.int64)
+    order = np.argsort(gene_rank_by_row[coo.row], kind="stable")
+    counts = coo.data[order].astype(np.int32)
+    gene_names = genes_obj[coo.row[order]]
+    cell_ids_long = np.asarray(barcodes, dtype=object)[coo.col[order]]
+
+    expr_table = pa.table(
+        {
+            "cell_id": pa.array([str(c) for c in cell_ids_long], pa.string()),
+            "gene": pa.array([str(g) for g in gene_names], pa.string()),
+            "count": pa.array(counts, pa.int32()),
+        }
+    )
+    # Delegate the parquet write + assets + metadata block to the shared,
+    # format-agnostic facet helper (long form). Snappy keeps per-row-group
+    # min/max stats intact so the gene-sorted row-group skipping still works
+    # and hyparquet/DuckDB read it identically; the codec is set on the policy.
+    from mudm_tools.facets import FacetPolicy, emit_facet_store
+
+    pol = FacetPolicy.from_config(
+        {"key": "cell_id", "layout": "long", "encoding": {"codec": "snappy"}}
+    )
+    facets_block = emit_facet_store(out_dir, None, {}, pol, long_table=expr_table)
+    facets_block["fieldenums"] = {"gene": list(gene_panel)}  # Xenium keeps the panel vocabulary
+
+    # --- Task 1b: optional Zarr CSC companion (lazy zarr import) ----------
+    if cfg.get("emit_zarr"):
+        _emit_facet_zarr(m, gene_panel, barcodes, facets_dir)
+        facets_block["assets"].append(
+            {
+                "role": "facets",
+                "href": "facets/expression.zarr",
+                "media_type": "application/zarr",
+                "facet": "gene",
+                "layout": "csc",
+                "key": "cell_id",
+            }
+        )
+
+    return {
+        "facets": facets_block,
+        "total_counts": {bc: int(total[i]) for i, bc in enumerate(barcodes)},
+    }
+
+
+def _emit_facet_zarr(m, gene_panel: list[str], barcodes: list[str], facets_dir: Path) -> None:
+    """Task 1b — write the cell×gene matrix as CSC Zarr (lazy ``zarr`` import).
+
+    Stores the matrix transposed to cells × genes so a single gene loads as one
+    CSC column slice (Vitessce-style: chunked many-cells-by-few-genes). ``var``
+    order == ``gene_panel`` (matrix-row order, == ``fieldenums.gene``) and the
+    obs index == ``cell_id`` (barcode order). Targets the zarr 3.x array API
+    (``create_array`` with native variable-length ``dtype=str``). Only imported
+    when ``emit_zarr`` is set, so the default path adds no dependency.
+    """
+    import zarr  # lazy: the default path must not import zarr
+
+    # cells × genes CSC (column = gene); chunk many cells by few genes.
+    cells_x_genes = m.T.tocsc()
+    n_cells, n_genes = int(cells_x_genes.shape[0]), int(cells_x_genes.shape[1])
+    nnz = max(1, int(cells_x_genes.nnz))
+
+    root = zarr.open_group(str(facets_dir / "expression.zarr"), mode="w")
+    root.attrs["shape"] = [n_cells, n_genes]
+    root.attrs["format"] = "csc"
+
+    def _write(group, name, arr, chunks=None):
+        a = group.create_array(
+            name,
+            shape=arr.shape,
+            dtype=arr.dtype,
+            chunks=chunks if chunks is not None else arr.shape,
+        )
+        a[:] = arr
+
+    _write(root, "data", cells_x_genes.data, chunks=(min(65536, nnz),))
+    _write(root, "indices", cells_x_genes.indices.astype(np.int64))
+    _write(root, "indptr", cells_x_genes.indptr.astype(np.int64))
+
+    var = root.create_group("var")
+    gene_arr = var.create_array("gene", shape=(n_genes,), dtype=str)
+    gene_arr[:] = np.asarray(gene_panel, dtype=object)
+
+    obs = root.create_group("obs")
+    cell_arr = obs.create_array("cell_id", shape=(n_cells,), dtype=str)
+    cell_arr[:] = np.asarray(barcodes, dtype=object)
 
 
 def _load_xenium_clusters(

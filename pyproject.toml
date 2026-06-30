@@ -40,6 +40,10 @@ dependencies = [
 
 [project.optional-dependencies]
 draco = ["DracoPy>=1.4"]
+# Optional Zarr CSC companion for the Xenium facet store (XeniumConverter facets emit_zarr=True). Lazily
+# imported in converters/xenium.py; the default facet store (parquet) needs no zarr. Enable with
+# `pip install mudm-tools[zarr]` or `uv run --with zarr`.
+zarr = ["zarr>=3.0"]
 # Xenium spatial-transcriptomics converter (scripts/xenium_to_tiles.py +
 # converters/xenium.py). Optional: install with `pip install mudm-tools[xenium]`
 # or run tests with `uv run --extra xenium pytest`.
@@ -106,6 +110,7 @@ follow_imports = "skip"
 
 [dependency-groups]
 dev = [
+    "mapbox-vector-tile>=2.2.0",
     "maturin>=1.13.1",
     "pytest>=9.0.3",
 ]

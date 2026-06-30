@@ -144,13 +144,20 @@ function setupVectorLayer(datasetId, imageBounds, maxZoom) {
         };
     }
 
+    // Tile-request floor: don't fetch vector tiles below the EARLIEST layer's declared min_zoom.
+    // Keeps full-fidelity geometry (no simplification) but stops the viewer brute-force-loading the
+    // heavy low-zoom tiles of huge datasets (e.g. MERSCOPE's ~5.5 gigapixel image → 11-21 MB z2 cell
+    // tiles); the raster is the overview there and full-detail cells load on zoom-in. Default 0 (=
+    // unchanged) for the common case where a layer is visible from z0.
+    const gridMinZoom = Math.min(...metadata.vectors.layers.map((l) => l.min_zoom || 0));
+
     vectorGridLayer = L.vectorGrid.protobuf(
         `${BASE_URL}/tiles2d/${datasetId}/${metadata.vectors.path}`,
         {
             vectorTileLayerStyles: styles,
             interactive: true,
             maxZoom: maxZoom,
-            minZoom: 0,
+            minZoom: gridMinZoom,
             bounds: imageBounds,
             // Every feature needs an ID for restyleAll() to work.
             // Polygons use layer_type + cell_id (cross-tile highlight).
