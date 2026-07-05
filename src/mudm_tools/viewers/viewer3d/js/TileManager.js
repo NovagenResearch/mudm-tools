@@ -180,9 +180,12 @@ export class TileManager {
         this._indexNodes(this.root);
         this._precomputeGeoErrors();
 
-        // Load tilejson3d.json for pyramid metadata (optional)
+        // Load the muDM TileModel (tilejson.json) for pyramid metadata; fall back to the legacy
+        // tilejson3d.json (a transition alias with identical schema) for datasets not yet regenerated.
+        // Both are the same muDM TileModel — maxzoom/meters_per_unit/id_fields/encodings ride the same keys.
         try {
-            const tjResp = await fetch(this.baseUrl + 'tilejson3d.json');
+            let tjResp = await fetch(this.baseUrl + 'tilejson.json');
+            if (!tjResp.ok) tjResp = await fetch(this.baseUrl + 'tilejson3d.json');
             if (tjResp.ok) {
                 const tjData = await tjResp.json();
                 this.maxZoom = tjData.maxzoom ?? this.maxZoom;
@@ -191,7 +194,7 @@ export class TileManager {
                 this._encodings = tjData.encodings ?? null;
             }
         } catch (_) {
-            // tilejson3d.json not available — fall back to features.json metadata
+            // neither descriptor available — fall back to features.json metadata
         }
 
         let data = featuresData;

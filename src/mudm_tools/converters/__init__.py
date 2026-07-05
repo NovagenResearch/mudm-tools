@@ -64,3 +64,4 @@ def list_formats() -> list[str]:
 from . import xenium  # noqa: F401, E402
 from . import obj  # noqa: F401, E402
 from . import geojson  # noqa: F401, E402
+from . import labelmask  # noqa: F401, E402

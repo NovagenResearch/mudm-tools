@@ -190,6 +190,10 @@ let _cachedAttributes = [];
 const colorByRangeContainer = document.getElementById('color-by-range');
 const COLOR_MATCH = '#6fdfaf';
 const COLOR_NO_MATCH = '#444444';
+// Continuous value ramp for numeric color-by: blue (low) -> red (high). Replaces the old binary
+// in-range/out-of-range highlight, which painted every mesh one flat color at full range so
+// "color by a numeric feature" looked like it did nothing.
+function _rampColor(t) { t = Math.max(0, Math.min(1, t)); return `hsl(${((1 - t) * 240).toFixed(0)}, 75%, 52%)`; }
 
 function showColorByRange(attrInfo) {
     colorByRangeContainer.innerHTML = '';
@@ -247,12 +251,15 @@ function applyNumericColorBy(attrInfo, rangeMin, rangeMax) {
     const attr = attrInfo.key;
     // Build palette: each unique value → match or no-match color
     const palette = new Map();
+    const [rMin, rMax] = attrInfo.numericRange || [0, 1];
+    const span = (rMax - rMin) || 1;
     for (const val of attrInfo.values) {
         const num = Number(val);
         let matches = true;
         if (rangeMin !== null && num < rangeMin) matches = false;
         if (rangeMax !== null && num > rangeMax) matches = false;
-        palette.set(val, matches ? COLOR_MATCH : COLOR_NO_MATCH);
+        // in filter range -> position on the value ramp; outside -> dimmed
+        palette.set(val, matches ? _rampColor((num - rMin) / span) : COLOR_NO_MATCH);
     }
 
     tileManager.setColorBy(attr, palette);
@@ -265,18 +272,14 @@ function applyNumericColorBy(attrInfo, rangeMin, rangeMax) {
     }
     featureSelector.updateSwatchColors(nameColorMap);
 
-    // Legend: show criteria
+    // Legend: a 5-stop gradient across the data range (matches the mesh ramp), plus a dimmed
+    // "out of range" swatch only when a min/max filter is active.
     const items = new Map();
-    let matchLabel = 'In range';
-    if (rangeMin !== null && rangeMax !== null) {
-        matchLabel = `${rangeMin.toLocaleString()} \u2013 ${rangeMax.toLocaleString()}`;
-    } else if (rangeMin !== null) {
-        matchLabel = `\u2265 ${rangeMin.toLocaleString()}`;
-    } else if (rangeMax !== null) {
-        matchLabel = `\u2264 ${rangeMax.toLocaleString()}`;
+    for (let i = 0; i <= 4; i++) {
+        const t = i / 4;
+        items.set((rMin + t * span).toLocaleString(undefined, { maximumFractionDigits: 2 }), _rampColor(t));
     }
-    items.set(matchLabel, COLOR_MATCH);
-    items.set('Other', COLOR_NO_MATCH);
+    if (rangeMin !== null || rangeMax !== null) items.set('out of range', COLOR_NO_MATCH);
     updateLegend(attr, items);
 }
 

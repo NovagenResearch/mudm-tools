@@ -68,6 +68,22 @@ def extract_features(glb_json: dict) -> list[dict]:
     return features
 
 
+# Structural extras handled elsewhere (color -> its own entry; name -> the feature id; tile_ids ->
+# accumulated separately), so they are not copied into the property bag.
+_NON_PROPERTY_EXTRAS = ("color", "name", "tile_ids")
+
+
+def feature_properties(extras: dict) -> dict:
+    """Scalar feature properties kept from glTF node extras for viewer color-by / filter / hover.
+
+    Keeps EVERY scalar field (str/int/float/bool) rather than a hardcoded allowlist — otherwise any
+    custom per-feature attribute (e.g. a segmentation's volume/sphericity, an EMT score) is silently
+    dropped. Subsumes the old connectome allowlist (acronym/ccf_id/body_id/… are all scalars, still
+    captured). Nested/list values are skipped (the viewer's color-by only handles scalars)."""
+    return {k: v for k, v in extras.items()
+            if k not in _NON_PROPERTY_EXTRAS and isinstance(v, (str, int, float, bool))}
+
+
 def build_index(tiles_dir: Path, id_fields: list[str] | None = None,
                 unique_by: str | None = None,
                 ) -> tuple[dict, dict[int, int], int]:
@@ -132,23 +148,9 @@ def build_index(tiles_dir: Path, id_fields: list[str] | None = None,
                     "color": feat.get("color", "#888888"),
                     "tile_ids": set(),
                 }
-                # Include whichever metadata fields are present
-                for key in ("acronym", "ccf_id", "body_id", "cell_type", "instance",
-                           "brain_regions", "status", "status_label", "pre", "post",
-                           # MANC (VNC connectome) rich annotations — only captured when set,
-                           # so hemibrain/HRA (which don't emit them) are unaffected.
-                           "neuron_class", "subclass", "systematic_type", "soma_side",
-                           "soma_neuromere", "hemilineage", "predicted_nt",
-                           "entry_nerve", "exit_nerve",
-                           # FlyWire (adult brain connectome) hierarchical annotations.
-                           "super_class", "cell_class", "cell_sub_class", "hemibrain_type",
-                           "flow", "side", "nerve", "supertype",
-                           # MaleCNS (whole male CNS) cross-dataset + sexual-dimorphism.
-                           "dimorphism", "flywire_type", "manc_type", "consensus_nt",
-                           # BANC (whole female CNS): brain-vs-VNC region + male cross-ref.
-                           "region", "malecns_type"):
-                    if feat.get(key) is not None:
-                        entry[key] = feat[key]
+                # Keep every scalar extra as a property (no hardcoded allowlist) so custom color-by
+                # fields survive; see feature_properties().
+                entry.update(feature_properties(feat))
                 feature_map[name] = entry
 
             feature_map[name]["tile_ids"].add(tile_id)

@@ -52,6 +52,13 @@ xenium = [
     "tifffile>=2026.3.3",
     "pillow>=12.2.0",
 ]
+# Label-mask (3D segmentation volume) -> mesh 3D-tiles converter (converters/labelmask.py).
+# marching_cubes needs scikit-image; tifffile reads the mask. Install with
+# `pip install mudm-tools[labelmask]` or run with `uv run --extra labelmask`.
+labelmask = [
+    "scikit-image>=0.22",
+    "tifffile>=2026.3.3",
+]
 
 [project.scripts]
 mudm-serve = "mudm_tools.serve:main"

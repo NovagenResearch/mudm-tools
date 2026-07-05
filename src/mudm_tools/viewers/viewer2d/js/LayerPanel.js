@@ -6,13 +6,34 @@ const LAYER_LABELS = {
     transcripts: "Transcripts",
 };
 
+function _rasterLabel(m){
+    if (m && m.raster && m.raster.label) return m.raster.label;
+    const p = (m && m.platform) || '';
+    return ({cosmx:'Morphology (IF composite)', visium:'H&E', 'visium-hd':'H&E',
+             mibi:'Nuclear stain (H3)', merscope:'DAPI', codex:'Nuclear stain', xenium:'DAPI'})[p] || 'Image';
+}
+
 export const LayerPanel = {
     init(metadata, rasterLayer, vectorGridLayer, hiddenLayers, datasetId) {
+        const _fl = (metadata.vectors && metadata.vectors.feature_label) || "Gene";
+        window._featureLabel = _fl;
+        window._featureLabelPlural = (metadata.vectors && metadata.vectors.feature_label_plural) || (_fl.toLowerCase()+"s");
+        const _ftitle = document.getElementById("gene-filter-title"); if (_ftitle) _ftitle.textContent = _fl + " Filter";
         const container = document.getElementById("layer-toggles");
         container.innerHTML = "";
 
+        // Zoom readout — current tile zoom / max. main.js's _updateZoomUI() refreshes this on zoomend and
+        // once per dataset load; the per-layer badges below carry data-min-zoom so it can grey the ones
+        // not yet rendered at the current zoom.
+        const zr = document.createElement("div");
+        zr.id = "zoom-readout";
+        zr.style.cssText = "font-size:0.72rem;color:#a0aec0;margin-bottom:6px;padding-bottom:6px;" +
+            "border-bottom:1px solid #2d3748;";
+        zr.textContent = "Zoom –";
+        container.appendChild(zr);
+
         // DAPI raster toggle
-        this._addToggle(container, "DAPI Image", "#888888", true, (checked) => {
+        this._addToggle(container, _rasterLabel(metadata), "#888888", true, (checked) => {
             if (checked) rasterLayer.setOpacity(1);
             else rasterLayer.setOpacity(0);
         });
@@ -32,7 +53,8 @@ export const LayerPanel = {
                     }
                     vectorGridLayer.restyleAll();
                 },
-                layerDef.type === "point" ? "circle" : "square"
+                layerDef.type === "point" ? "circle" : "square",
+                layerDef.min_zoom || 0
             );
         });
 
@@ -43,7 +65,7 @@ export const LayerPanel = {
         this._loadColorLegend(datasetId, vectorGridLayer);
     },
 
-    _addToggle(container, label, color, checked, onChange, shape = "square") {
+    _addToggle(container, label, color, checked, onChange, shape = "square", minZoom = null) {
         const wrapper = document.createElement("label");
         wrapper.className = "layer-toggle";
         wrapper.style.setProperty("--layer-color", color);
@@ -63,6 +85,20 @@ export const LayerPanel = {
         wrapper.appendChild(checkbox);
         wrapper.appendChild(swatch);
         wrapper.appendChild(text);
+
+        // Per-layer presence badge ("z6+") pushed to the right edge; greyed by _updateZoomUI when the
+        // current zoom is below this floor (i.e. the layer isn't rendered yet). null => no badge (raster).
+        if (minZoom !== null && minZoom !== undefined) {
+            const badge = document.createElement("span");
+            badge.className = "layer-badge";
+            badge.dataset.minZoom = String(minZoom);
+            badge.textContent = "z" + minZoom + "+";
+            badge.title = "Rendered from zoom " + minZoom;
+            badge.style.cssText = "margin-left:auto;font-size:0.66rem;color:#63b3ed;" +
+                "border:1px solid #2d3748;border-radius:3px;padding:0 4px;white-space:nowrap;";
+            wrapper.appendChild(badge);
+        }
+
         container.appendChild(wrapper);
     },
 
@@ -78,7 +114,7 @@ export const LayerPanel = {
             const resp = await fetch(`/tiles2d/${datasetId}/gene_list.json`);
             if (resp.ok) {
                 const genes = await resp.json();
-                select.innerHTML = '<option value="">All genes</option>';
+                select.innerHTML = ('<option value="">All ' + (window._featureLabelPlural || "genes") + '</option>');
                 genes.forEach((g) => {
                     const opt = document.createElement("option");
                     opt.value = g;
@@ -94,7 +130,7 @@ export const LayerPanel = {
                 if (name && !genes.has(name)) {
                     genes.add(name);
                     const current = select.value;
-                    select.innerHTML = '<option value="">All genes</option>';
+                    select.innerHTML = ('<option value="">All ' + (window._featureLabelPlural || "genes") + '</option>');
                     [...genes].sort().forEach((g) => {
                         const opt = document.createElement("option");
                         opt.value = g;
@@ -155,7 +191,9 @@ export const LayerPanel = {
             const entries = [...Object.entries(cm.categories),
                              ["Other", { color: cm.default_color || "#888888", genes: [] }]];
 
+            const _seenCats = new Set();
             for (const [catName, catDef] of entries) {
+                if (_seenCats.has(catName)) continue; _seenCats.add(catName);
                 const item = document.createElement("label");
                 item.style.cssText = "display:flex;align-items:center;gap:6px;margin-bottom:4px;cursor:pointer;font-size:0.8rem;";
 
