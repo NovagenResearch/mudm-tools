@@ -108,6 +108,21 @@ const PALETTE_COLORS = [
 ];
 
 /**
+ * Extract the filter schema + facet-store descriptor for the currently loaded pyramid, if any.
+ * Both come from the muDM TileModel (TileManager.descriptor, set in TileManager.init()): the
+ * per-feature filter-field schema lives at vector_layers[0], and the columnar facet-store parquet
+ * is declared as a role="facets" asset. Either/both can be null (older, un-migrated pyramids),
+ * in which case callers fall back to the features.json-derived path.
+ */
+function facetContext(tm) {
+    const desc = tm.descriptor;
+    const schema = desc?.vector_layers?.[0] || null;
+    const fa = (desc?.assets || []).find(a => a.role === 'facets');
+    const facetStore = fa ? { baseUrl: tm.baseUrl, href: fa.href, key: fa.key } : null;
+    return { schema, facetStore };
+}
+
+/**
  * Discover colorable attributes from feature index.
  * Excludes structural keys and id_fields from features.json config.
  * Returns [{key, label, type: 'categorical'|'numeric', values: string[], numericRange: [min,max]|null}].
@@ -835,7 +850,8 @@ async function loadPyramid(pyramid) {
     const featuresData = await (await fetch(featuresUrl)).json();
     await tileManager.switchPyramid(baseUrl, featuresData);
     const idFieldsArr = tileManager.idFields ? [...tileManager.idFields] : [];
-    await featureSelector.init(featuresData, idFieldsArr);
+    const { schema, facetStore } = facetContext(tileManager);
+    await featureSelector.init(featuresData, idFieldsArr, schema, facetStore);
     syncZoomSlider();
     // Set up the overview (bounds + crosshair snapped to the mid-zoom tile center) BEFORE
     // framing, so resetCamera centers the main view on the overview's selection box.
@@ -877,14 +893,16 @@ async function init() {
             const featuresData = await (await fetch(`/tiles/${defaultPyramid.id}/features.json`)).json();
             await tileManager.init(featuresData);
             const idFieldsArr = tileManager.idFields ? [...tileManager.idFields] : [];
-            await featureSelector.init(featuresData, idFieldsArr);
+            const { schema, facetStore } = facetContext(tileManager);
+            await featureSelector.init(featuresData, idFieldsArr, schema, facetStore);
         } else {
             // Fallback: no manifest, try legacy single-pyramid path
             baseUrl = '/tiles/';
             tileManager = new TileManager(scene, baseUrl);
             const featuresData = await (await fetch('/tiles/features.json')).json();
             await tileManager.init(featuresData);
-            await featureSelector.init(featuresData);
+            const { schema, facetStore } = facetContext(tileManager);
+            await featureSelector.init(featuresData, [], schema, facetStore);
         }
 
         // The GPU-budget slider is the single source of truth. Sync the freshly-created

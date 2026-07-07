@@ -44,14 +44,60 @@ export class FeatureSelector {
         this._filterMin = null;      // numeric min (null = unbounded)
         this._filterMax = null;      // numeric max (null = unbounded)
         this._idFields = new Set();  // fields to exclude (from features.json id_fields)
+
+        // Facet-store path (schema + columnar parquet from the muDM TileModel descriptor) — set by
+        // init() when both are available; null falls back to the features.json-derived path below.
+        this._schema = null;         // vector_layers[0] filter-field schema, or null
+        this._facetStore = null;     // {baseUrl, href, key}, or null
+        this._colCache = {};         // attr key → Map(name -> value), lazily populated by _loadColumn
     }
 
     /**
-     * @param {string|object} featuresSource - a URL to fetch features.json from,
-     *   OR an already-parsed features document (shared with TileManager to avoid
-     *   fetching + parsing the same multi-hundred-MB payload twice).
+     * @param {string|object} featuresSource - a URL to fetch features.json from, an already-parsed
+     *   features document, OR (in the schema+facetStore path) unused — the feature list is read
+     *   column-wise from the facet-store parquet instead.
+     * @param {string[]} idFields - id-like fields to exclude from the filter panel (features.json path).
+     * @param {object|null} schema - vector_layers[0] filter-field schema ({fields, fieldenums,
+     *   fieldranges}) from the muDM TileModel descriptor, or null to use the features.json path.
+     * @param {{baseUrl: string, href: string, key: string}|null} facetStore - the role="facets"
+     *   columnar parquet asset, or null to use the features.json path.
      */
-    async init(featuresSource, idFields = []) {
+    async init(featuresSource, idFields = [], schema = null, facetStore = null) {
+        this._schema = schema;
+        this._facetStore = facetStore;
+        this._colCache = {};
+        this.selected.clear();
+        this._swatchColors = null;
+        this._searchQuery = '';
+        this._filterAttr = '';
+        this._filterType = '';
+        this._filterValues.clear();
+        this._filterMin = null;
+        this._filterMax = null;
+
+        if (schema && facetStore) {
+            // Facet-store path: feature list + filter values are read by-column from the parquet
+            // (hyparquet), not parsed out of the monolithic features.json.
+            this.features = {};                       // not used in the facet path
+            this._idFields = new Set(idFields);
+            const { asyncBufferFromUrl, parquetMetadataAsync, parquetReadObjects } =
+                await import('./vendor/hyparquet.min.js');
+            this._pqRead = parquetReadObjects;
+            this._facetKey = facetStore.key;
+            this._pqFile = await asyncBufferFromUrl({ url: facetStore.baseUrl + facetStore.href });
+            this._pqMeta = await parquetMetadataAsync(this._pqFile);
+            const rows = await parquetReadObjects({ file: this._pqFile, metadata: this._pqMeta,
+                                                    columns: [facetStore.key, 'color'] });
+            this._model = rows.map(r => {
+                const name = String(r[facetStore.key]);
+                return { name, color: r.color || '#888', lower: name.toLowerCase(), props: null };
+            }).sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+            this._filtered = this._model;
+            this._render();
+            return;
+        }
+
+        // Fallback: parse the (already-fetched, or fetched-here) features.json document.
         let data;
         if (typeof featuresSource === 'string') {
             const resp = await fetch(featuresSource);
@@ -77,14 +123,6 @@ export class FeatureSelector {
             // Legacy format: dict keyed by name
             this.features = data.features;
         }
-        this.selected.clear();
-        this._swatchColors = null;
-        this._searchQuery = '';
-        this._filterAttr = '';
-        this._filterType = '';
-        this._filterValues.clear();
-        this._filterMin = null;
-        this._filterMax = null;
         this._buildModel();
         this._render();
     }
@@ -252,6 +290,18 @@ export class FeatureSelector {
      * Excludes ID-like attributes (unique values > 50% of features).
      */
     _discoverFilterAttrs() {
+        if (this._schema) {
+            // Schema-driven path: the descriptor already declares field types/enums/ranges, so no
+            // per-feature scan is needed (and none of the feature properties are even loaded).
+            const fields = this._schema.fields || {}, enums = this._schema.fieldenums || {}, ranges = this._schema.fieldranges || {};
+            const out = [];
+            for (const [key, type] of Object.entries(fields)) {
+                const label = key.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+                if (type === 'number' && ranges[key]) out.push({ key, label, type: 'numeric', values: ranges[key] });   // [min,max]
+                else if (enums[key]) out.push({ key, label, type: 'categorical', values: enums[key] });
+            }
+            return out.sort((a, b) => a.key.localeCompare(b.key));
+        }
         const SKIP = new Set(['color', 'tiles', 'acronym']);
         for (const f of this._idFields) SKIP.add(f);
         const attrMeta = {}; // key → {values: Set, allNumeric: bool}
@@ -289,6 +339,20 @@ export class FeatureSelector {
         return result.sort((a, b) => a.key.localeCompare(b.key));
     }
 
+    /**
+     * Lazily fetch one column from the facet-store parquet (keyed by the facet key column) and cache
+     * it as a name -> value Map. Called before a facet-path filter is applied, since _applyFilters'
+     * scan over _matchesFilter is synchronous and needs the column already resident.
+     */
+    async _loadColumn(attr) {
+        if (this._colCache[attr]) return;
+        const rows = await this._pqRead({ file: this._pqFile, metadata: this._pqMeta,
+                                          columns: [this._facetKey, attr] });
+        const m = new Map();
+        for (const r of rows) m.set(String(r[this._facetKey]), r[attr]);
+        this._colCache[attr] = m;
+    }
+
     _renderFilterRow() {
         const row = document.createElement('div');
         row.className = 'feature-filter-row';
@@ -314,13 +378,14 @@ export class FeatureSelector {
         const valContainer = document.createElement('div');
         valContainer.className = 'feature-filter-values';
 
-        select.addEventListener('change', () => {
+        select.addEventListener('change', async () => {
             this._filterAttr = select.value;
-            this._filterValues.clear();
-            this._filterMin = null;
-            this._filterMax = null;
+            this._filterValues.clear(); this._filterMin = null; this._filterMax = null;
             const attr = attrs.find(a => a.key === select.value);
             this._filterType = attr?.type || '';
+            // Facet path: the filter loop (_applyFilters -> _matchesFilter) is synchronous, so the
+            // active column must already be in _colCache before we (re)apply the filter.
+            if (this._facetStore && this._filterAttr) await this._loadColumn(this._filterAttr);
             this._renderFilterControls(valContainer);
             this._applyFilters();
         });
@@ -498,9 +563,14 @@ export class FeatureSelector {
     _matchesFilter(name) {
         if (!this._filterAttr) return true; // no filter active
 
-        const feat = this.features[name];
-        if (!feat) return false;
-        const val = feat[this._filterAttr];
+        let val;
+        if (this._facetStore) {
+            val = this._colCache[this._filterAttr]?.get(name);
+        } else {
+            const feat = this.features[name];
+            if (!feat) return false;
+            val = feat[this._filterAttr];
+        }
 
         if (this._filterType === 'numeric') {
             if (this._filterMin === null && this._filterMax === null) return true;

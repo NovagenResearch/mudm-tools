@@ -714,6 +714,7 @@ pub(crate) fn encode_glb_meshopt_quantized(
     let mut nodes: Vec<Value> = Vec::new();
     let mut scene_nodes: Vec<Value> = Vec::new();
     let mut any_meshopt = false;
+    let mut any_quantized = false;
 
     for feat in features {
         if feat.positions.is_empty() {
@@ -743,6 +744,7 @@ pub(crate) fn encode_glb_meshopt_quantized(
 
         if let Some(enc) = enc {
             any_meshopt = true;
+            any_quantized = true;
 
             // --- u16 position bufferView (stride 8) + EXT_meshopt_compression ---
             let pos_off = bin_data.len();
@@ -844,6 +846,47 @@ pub(crate) fn encode_glb_meshopt_quantized(
             let node_idx = nodes.len();
             nodes.push(node);
             scene_nodes.push(json!(node_idx));
+        } else if feat.mode == MODE_TRIANGLES && !feat.indices.is_empty() {
+            // Below the meshopt-codec threshold: still u16-quantize (KHR_mesh_quantization); skip the
+            // vertex codec (its per-mesh overhead doesn't pay off on tiny fragments). No vertex reorder
+            // needed (indices stay valid against the original vertex order).
+            any_quantized = true;
+            let (quant, translation, scale) = encoder_meshopt::quantize_positions(&feat.positions, qbits);
+            let mut quant_min = [u16::MAX; 3];
+            let mut quant_max = [0u16; 3];
+            for q in &quant { for d in 0..3 { if q[d] < quant_min[d] { quant_min[d]=q[d]; } if q[d] > quant_max[d] { quant_max[d]=q[d]; } } }
+
+            // u16 POSITION (stride 8 = [u16;4], 4th is padding), PLAIN bufferView (no EXT_meshopt_compression)
+            let pos_off = bin_data.len();
+            let pos_bytes: Vec<u8> = quant.iter().flat_map(|q| q.iter().flat_map(|c| c.to_le_bytes())).collect();
+            bin_data.extend_from_slice(&pos_bytes);
+            let pad = (4 - (bin_data.len() % 4)) % 4; bin_data.extend(std::iter::repeat(0u8).take(pad));
+            let pos_bv = buffer_views.len();
+            buffer_views.push(json!({"buffer":0,"byteOffset":pos_off,"byteLength":pos_bytes.len(),"byteStride":8,"target":ARRAY_BUFFER}));
+            let pos_acc = accessors.len();
+            accessors.push(json!({"bufferView":pos_bv,"byteOffset":0,"componentType":UNSIGNED_SHORT,"count":quant.len(),"type":"VEC3",
+                "min":[quant_min[0],quant_min[1],quant_min[2]], "max":[quant_max[0],quant_max[1],quant_max[2]]}));
+
+            // indices: plain accessor (no codec); u16 when it fits, else u32
+            let idx_u16 = quant.len() < 65536;
+            let (idx_ct, idx_bytes): (u32, Vec<u8>) = if idx_u16 {
+                (UNSIGNED_SHORT, feat.indices.iter().flat_map(|i| (*i as u16).to_le_bytes()).collect())
+            } else {
+                (UNSIGNED_INT, feat.indices.iter().flat_map(|i| i.to_le_bytes()).collect())
+            };
+            let idx_off = bin_data.len(); bin_data.extend_from_slice(&idx_bytes);
+            let pad = (4 - (bin_data.len() % 4)) % 4; bin_data.extend(std::iter::repeat(0u8).take(pad));
+            let idx_bv = buffer_views.len();
+            buffer_views.push(json!({"buffer":0,"byteOffset":idx_off,"byteLength":idx_bytes.len(),"target":ELEMENT_ARRAY_BUFFER}));
+            let idx_acc = accessors.len();
+            accessors.push(json!({"bufferView":idx_bv,"byteOffset":0,"componentType":idx_ct,"count":feat.indices.len(),"type":"SCALAR"}));
+
+            let mesh_idx = meshes.len();
+            meshes.push(json!({"primitives":[json!({"attributes":{"POSITION":pos_acc},"indices":idx_acc,"material":0,"mode":MODE_TRIANGLES})]}));
+            let mut node = json!({"mesh":mesh_idx,"name":format!("feature_{}",nodes.len()),
+                "translation":[translation[0],translation[1],translation[2]], "scale":[scale[0],scale[1],scale[2]]});
+            if let Some(extras)=&feat.extras { node.as_object_mut().unwrap().insert("extras".to_string(), extras.clone()); }
+            let node_idx = nodes.len(); nodes.push(node); scene_nodes.push(json!(node_idx));
         } else {
             // --- raw fallback (identical to encode_glb's f32 path) ---
             let pos_offset = bin_data.len();
@@ -925,17 +968,13 @@ pub(crate) fn encode_glb_meshopt_quantized(
         "materials": [material],
     });
 
-    if any_meshopt {
-        // Both extensions required: EXT_meshopt_compression (codec) +
-        // KHR_mesh_quantization (u16 POSITION). Order is informational.
-        gltf_json.as_object_mut().unwrap().insert(
-            "extensionsUsed".to_string(),
-            json!(["EXT_meshopt_compression", "KHR_mesh_quantization"]),
-        );
-        gltf_json.as_object_mut().unwrap().insert(
-            "extensionsRequired".to_string(),
-            json!(["EXT_meshopt_compression", "KHR_mesh_quantization"]),
-        );
+    let mut ext_used: Vec<&str> = Vec::new();
+    if any_meshopt { ext_used.push("EXT_meshopt_compression"); }
+    if any_quantized { ext_used.push("KHR_mesh_quantization"); }
+    if !ext_used.is_empty() {
+        let arr = json!(ext_used);
+        gltf_json.as_object_mut().unwrap().insert("extensionsUsed".to_string(), arr.clone());
+        gltf_json.as_object_mut().unwrap().insert("extensionsRequired".to_string(), arr);
     }
 
     assemble_glb(&gltf_json, &bin_data)
@@ -1370,8 +1409,12 @@ mod tests {
     }
 
     #[test]
-    fn test_meshopt_q_small_mesh_stays_raw() {
-        // below min_vertices -> raw f32, no extensions.
+    fn test_meshopt_q_small_mesh_skips_codec_but_still_quantized() {
+        // below min_vertices -> the meshopt vertex CODEC is skipped (no
+        // EXT_meshopt_compression), but the mesh is still u16-quantized via plain
+        // KHR_mesh_quantization (universal quantization; see
+        // `every_triangle_mesh_is_quantized`). Superseded the old
+        // "stays fully raw" expectation now that quantization is universal.
         let feat = GlbFeature {
             positions: vec![0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.5, 1.0, 0.0],
             indices: vec![0, 1, 2],
@@ -1379,8 +1422,30 @@ mod tests {
             extras: None,
         };
         let json = parse_glb_json(&encode_glb_meshopt_quantized(&[feat], 50, 16));
-        assert!(json["extensionsUsed"].is_null());
-        assert_eq!(json["accessors"][0]["componentType"], FLOAT);
+        let used = json["extensionsUsed"].as_array().unwrap();
+        assert!(used.iter().any(|v| v == "KHR_mesh_quantization"));
+        assert!(!used.iter().any(|v| v == "EXT_meshopt_compression"));
+        assert_eq!(json["accessors"][0]["componentType"], UNSIGNED_SHORT);
+    }
+
+    #[test]
+    fn every_triangle_mesh_is_quantized() {
+        // a small quad (2 tris, 4 verts) — below a 1000-vertex threshold
+        let small = GlbFeature { mode: MODE_TRIANGLES,
+            positions: vec![0.0,0.0,0.0, 1.0,0.0,0.0, 1.0,1.0,0.0, 0.0,1.0,0.0],
+            indices: vec![0,1,2, 0,2,3], extras: None };
+        let glb = encode_glb_meshopt_quantized(&[small], 1000, 14);
+        let gltf = parse_glb_json(&glb); // helper: read 12-byte header + JSON chunk → serde_json::Value
+        // POSITION accessor is u16 (quantized), NOT f32
+        let acc = &gltf["accessors"][0];
+        assert_eq!(acc["componentType"], UNSIGNED_SHORT, "sub-threshold mesh must be u16-quantized");
+        // node carries the KHR_mesh_quantization dequant TRS
+        assert!(gltf["nodes"][0]["translation"].is_array());
+        assert!(gltf["nodes"][0]["scale"].is_array());
+        // KHR_mesh_quantization declared; EXT_meshopt_compression NOT (no codec below threshold)
+        let used = gltf["extensionsUsed"].as_array().unwrap();
+        assert!(used.iter().any(|e| e=="KHR_mesh_quantization"));
+        assert!(!used.iter().any(|e| e=="EXT_meshopt_compression"));
     }
 
     #[test]

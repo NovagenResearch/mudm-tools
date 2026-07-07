@@ -71,6 +71,8 @@ export class TileManager {
     constructor(scene, baseUrl) {
         this.scene = scene;
         this.baseUrl = baseUrl.endsWith('/') ? baseUrl : baseUrl + '/';
+        /** Parsed muDM TileModel descriptor (tilejson.json / tilejson3d.json), or null until init() loads it. */
+        this.descriptor = null;
         this.loader = new GLTFLoader();
 
         // Configure Draco decoder for KHR_draco_mesh_compression GLBs
@@ -174,6 +176,8 @@ export class TileManager {
      *   payload is also consumed by FeatureSelector — see main.js loadPyramid).
      */
     async init(featuresData = null) {
+        this.descriptor = null;   // reset per-pyramid (switchPyramid calls init); set below only when a
+                                  // descriptor loads, else stays null → FeatureSelector features.json fallback
         const tilesetResp = await fetch(this.baseUrl + 'tileset.json');
         const tileset = await tilesetResp.json();
         this.root = new TileNode(tileset.root, 0, null);
@@ -192,6 +196,7 @@ export class TileManager {
                 this.metersPerUnit = tjData.meters_per_unit ?? this.metersPerUnit;
                 this.idFields = new Set(tjData.id_fields ?? []);
                 this._encodings = tjData.encodings ?? null;
+                this.descriptor = tjData;
             }
         } catch (_) {
             // neither descriptor available — fall back to features.json metadata
