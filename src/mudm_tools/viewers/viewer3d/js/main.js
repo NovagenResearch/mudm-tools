@@ -163,6 +163,45 @@ function discoverAttributes(featureIndex, idFields) {
 }
 
 /**
+ * Colorable attributes straight from the muDM TileModel descriptor schema (vector_layers[0]
+ * fields/fieldenums/fieldranges) — no per-feature scan, so it works even when features.json has been
+ * slimmed to just the spatial index. Mirrors FeatureSelector._discoverFilterAttrs' schema branch.
+ * Numeric attrs get `values: []` here (the distinct values aren't in the schema); the color-by
+ * handler fills them from the facet-store column when the attribute is selected.
+ */
+function discoverAttributesFromSchema(schema) {
+    const fields = schema.fields || {}, enums = schema.fieldenums || {}, ranges = schema.fieldranges || {};
+    const out = [];
+    for (const [key, type] of Object.entries(fields)) {
+        const label = key.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+        if (type === 'number' && ranges[key]) {
+            out.push({ key, label, type: 'numeric', values: [], numericRange: ranges[key] });
+        } else if (enums[key]) {
+            out.push({ key, label, type: 'categorical', values: enums[key], numericRange: null });
+        }
+    }
+    return out.sort((a, b) => a.key.localeCompare(b.key));
+}
+
+// Lazily read one column (keyed by the facet key) from the facet-store parquet via hyparquet and cache
+// it as a name -> value Map. Lets color-by resolve per-feature attribute values when they no longer live
+// in features.json (Phase 5 slim). Cache key includes the pyramid URL so a switch can't serve stale values.
+const _facetColCache = new Map();
+async function loadFacetColumn(facetStore, attr) {
+    const ck = `${facetStore.baseUrl}${facetStore.href}|${attr}`;
+    if (_facetColCache.has(ck)) return _facetColCache.get(ck);
+    const { asyncBufferFromUrl, parquetMetadataAsync, parquetReadObjects } =
+        await import('./vendor/hyparquet.min.js');
+    const file = await asyncBufferFromUrl({ url: facetStore.baseUrl + facetStore.href });
+    const meta = await parquetMetadataAsync(file);
+    const rows = await parquetReadObjects({ file, metadata: meta, columns: [facetStore.key, attr] });
+    const m = new Map();
+    for (const r of rows) m.set(String(r[facetStore.key]), r[attr]);
+    _facetColCache.set(ck, m);
+    return m;
+}
+
+/**
  * Build a color palette for a set of values.
  * Returns Map<string, string> (value → hex color).
  */
@@ -188,7 +227,12 @@ function populateColorByDropdown(featureIndex, idFields) {
     while (colorBySelect.options.length > 1) {
         colorBySelect.remove(1);
     }
-    const attrs = discoverAttributes(featureIndex, idFields);
+    // Prefer the muDM TileModel descriptor schema + facet store (values read by-column from the parquet)
+    // when both are present — this survives a slimmed features.json. Else scan the (fat) feature index.
+    const fc = facetContext(tileManager);
+    _colorByFromSchema = !!(fc.schema && fc.schema.fields && Object.keys(fc.schema.fields).length && fc.facetStore);
+    const attrs = _colorByFromSchema ? discoverAttributesFromSchema(fc.schema)
+                                     : discoverAttributes(featureIndex, idFields);
     for (const attr of attrs) {
         const opt = document.createElement('option');
         opt.value = attr.key;
@@ -200,6 +244,7 @@ function populateColorByDropdown(featureIndex, idFields) {
     _cachedAttributes = attrs;
 }
 let _cachedAttributes = [];
+let _colorByFromSchema = false;   // true when the dropdown was built from the descriptor schema + facet store
 
 // Numeric color-by range controls
 const colorByRangeContainer = document.getElementById('color-by-range');
@@ -319,7 +364,7 @@ function updateLegend(attribute, palette) {
     colorLegend.style.display = '';
 }
 
-colorBySelect.addEventListener('change', () => {
+colorBySelect.addEventListener('change', async () => {
     const attr = colorBySelect.value;
     if (!attr) {
         tileManager.setColorBy(null, null);
@@ -330,6 +375,33 @@ colorBySelect.addEventListener('change', () => {
     }
     const attrInfo = _cachedAttributes.find(a => a.key === attr);
     if (!attrInfo) return;
+
+    // When the color-by list came from the descriptor schema, the attribute values live in the facet
+    // store (not the slimmed features.json). Load that column once and inject it into the feature index
+    // so the palette build, the sidebar swatch map, and TileManager.getFeatureColor (which reads
+    // featureIndex[name][attr]) all work unchanged. Idempotent when the values are already present.
+    const fc = facetContext(tileManager);
+    if (_colorByFromSchema && fc.facetStore) {
+        try {
+            const col = await loadFacetColumn(fc.facetStore, attr);
+            for (const [name, feat] of Object.entries(tileManager.featureIndex)) feat[attr] = col.get(name);
+            if (attrInfo.type === 'numeric') {
+                // Distinct values as STRINGS — applyNumericColorBy + TileManager.getFeatureColor key the
+                // palette by String(feat[attr]), so a number-keyed palette would never match (all no-match
+                // grey). The [min,max] range comes from the descriptor schema (fieldranges); do NOT
+                // Math.min(...col)/max spread the whole column — RangeError on the ~176k-arg giants.
+                attrInfo.values = [...new Set([...col.values()]
+                    .filter(v => v != null && !Number.isNaN(Number(v))).map(v => String(v)))]
+                    .sort((a, b) => Number(a) - Number(b));
+            }
+        } catch (err) {
+            console.error(`color-by: failed to read "${attr}" from the facet store`, err);
+        }
+    }
+
+    // A newer color-by selection may have arrived while we awaited the facet column; drop this stale
+    // result so the applied coloring always matches the current dropdown value.
+    if (colorBySelect.value !== attr) return;
 
     if (attrInfo.type === 'numeric') {
         // Numeric: show range controls, default to full range (all match)
@@ -841,6 +913,8 @@ function syncOverviewRingMax() {
 async function loadPyramid(pyramid) {
     loadingEl.style.display = '';
     loadingEl.textContent = `Loading ${pyramid.label}...`;
+
+    _facetColCache.clear();   // drop the previous pyramid's cached facet columns (they're keyed by URL and never re-read)
 
     const baseUrl = `/tiles/${pyramid.id}/`;
     const featuresUrl = `/tiles/${pyramid.id}/features.json`;
