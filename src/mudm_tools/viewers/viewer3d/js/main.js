@@ -13,6 +13,8 @@ import { SlicePlanePanel } from './SlicePlanePanel.js';
 import { OverviewPanel } from './OverviewPanel.js';
 import { ScaleBar } from './ScaleBar.js';
 import { AxisGizmo } from './AxisGizmo.js';
+import { TileLoadCounter } from './TileLoadCounter.mjs';
+import { LoadingIndicator } from './LoadingIndicator.js';
 
 // --- Scene setup ---
 const canvas = document.getElementById('canvas');
@@ -56,6 +58,12 @@ const axisGizmo = new AxisGizmo();
 
 // --- Tile Manager (baseUrl set after pyramid selection) ---
 let tileManager = new TileManager(scene, '/tiles/default/');
+
+// --- Tile-loading indicator (non-blocking) ---
+const _tileCounter = new TileLoadCounter();
+const _tileIndicator = new LoadingIndicator(document.getElementById('tile-loading'));
+window._tileLoadCounter = _tileCounter;       // exposed for the Playwright gate
+window._tileLoadIndicator = _tileIndicator;
 
 // --- Slice Plane ---
 const sliceContainer = document.getElementById('slice-controls');
@@ -752,6 +760,12 @@ function animate() {
     const moved = controls.update();   // true while inertial damping is settling
     const busy = tileManager._pendingLoads > 0 || tileManager._dirty;
     if (!(needsRender || moved || busy)) return;   // idle → skip the whole frame
+
+    // Non-blocking tile-loading pill: outstanding = in-flight + queued GLB tiles. Runs only on
+    // active frames; the drain-to-0 frame is active (busy via tileManager._dirty), so the burst
+    // always ends and the indicator's own debounce hides the pill.
+    _tileIndicator.update(_tileCounter.setOutstanding(tileManager._pendingLoads + tileManager._loadQueue.length));
+
     needsRender = false;
     tileManager._dirty = false;
 

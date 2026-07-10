@@ -412,6 +412,22 @@
     margin-top: 2px; text-align: center;
     text-shadow: 0 1px 2px rgba(0,0,0,0.9);
   }
+
+  /* Tile-loading pill */
+  .loading-pill {
+    position: fixed; bottom: 12px; left: 50%; transform: translateX(-50%);
+    z-index: 1200; pointer-events: none; display: flex; align-items: center; gap: 8px;
+    background: rgba(20,20,20,0.85); border: 1px solid rgba(255,255,255,0.15);
+    border-radius: 999px; padding: 6px 14px; font-size: 0.8rem; color: #eee;
+    backdrop-filter: blur(8px);
+  }
+  .loading-pill[hidden] { display: none; }
+  .loading-pill__spinner {
+    width: 12px; height: 12px; border-radius: 50%;
+    border: 2px solid rgba(255,255,255,0.25); border-top-color: #4aa3ff;
+    animation: loading-pill-spin 0.8s linear infinite;
+  }
+  @keyframes loading-pill-spin { to { transform: rotate(360deg); } }
 </style>
 
 <script type="importmap">
@@ -522,6 +538,11 @@
 <div id="info-panel">
   <h3 id="info-title">Region</h3>
   <table id="info-table"><tbody></tbody></table>
+</div>
+
+<div id="tile-loading" class="loading-pill" hidden>
+  <span class="loading-pill__spinner" aria-hidden="true"></span>
+  <span class="loading-pill__count">Loading…</span>
 </div>
 
 <script type="module" src="js/main.js"></script>

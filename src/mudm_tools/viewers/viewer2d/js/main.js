@@ -306,6 +306,8 @@ function _rasterOf(m){
 import { LayerPanel } from "./LayerPanel.js";
 import { InfoPanel } from "./InfoPanel.js";
 import { loadDescriptor } from "./descriptor.js";
+import { TileLoadCounter } from "./TileLoadCounter.mjs";
+import { LoadingIndicator } from "./LoadingIndicator.js";
 
 let map;
 let metadata;
@@ -315,6 +317,49 @@ let hiddenLayers = new Set();
 let hoveredFeatureId = null;
 let geneColorMap = null;  // { gene_name → hex color }
 let currentDatasetId = null;
+
+// --- Tile-loading indicator (non-blocking) ---
+const _tileCounter = new TileLoadCounter();
+const _tileIndicator = new LoadingIndicator(document.getElementById("tile-loading"));
+window._tileLoadCounter = _tileCounter;      // exposed for the Playwright gate
+window._tileLoadIndicator = _tileIndicator;
+let _tilesRequested = 0, _tilesResolved = 0;
+const _loadingLayers = new Set();            // GridLayers still mid-load
+function _pushLoading() {
+    _tileIndicator.update(_tileCounter.setOutstanding(Math.max(0, _tilesRequested - _tilesResolved)));
+}
+function _resetLoading() {
+    _tilesRequested = 0; _tilesResolved = 0; _loadingLayers.clear();
+    _tileIndicator.update(_tileCounter.reset());
+}
+// Aggregate GridLayer tile events (raster + vector) into ONE outstanding count. `tileerror`
+// counts as resolved so an aborted tile can't strand the pill. When every wired layer has
+// fired `load` (fully idle) we zero the tallies to reconcile any tiles dropped without a
+// tileload/tileerror (fast pan-away).
+function _wireTileCounting(layer) {
+    layer.on("loading", () => {
+        if (layer !== rasterLayer && layer !== vectorGridLayer) return;
+        _loadingLayers.add(layer);
+    });
+    layer.on("tileloadstart", () => {
+        if (layer !== rasterLayer && layer !== vectorGridLayer) return;
+        _tilesRequested++; _pushLoading();
+    });
+    layer.on("tileload", () => {
+        if (layer !== rasterLayer && layer !== vectorGridLayer) return;
+        _tilesResolved++; _pushLoading();
+    });
+    layer.on("tileerror", () => {
+        if (layer !== rasterLayer && layer !== vectorGridLayer) return;
+        _tilesResolved++; _pushLoading();
+    });
+    layer.on("load", () => {
+        if (layer !== rasterLayer && layer !== vectorGridLayer) return;
+        _loadingLayers.delete(layer);
+        if (_loadingLayers.size === 0) { _tilesRequested = 0; _tilesResolved = 0; }
+        _pushLoading();
+    });
+}
 
 const BASE_URL = "";
 
@@ -413,6 +458,7 @@ async function loadDatasets() {
 async function loadDataset(datasetId) {
     if (datasetId === currentDatasetId) return;  // ignore duplicate re-selects (deep-link shim's 'change')
     currentDatasetId = datasetId;
+    _resetLoading();  // new dataset → drop any stale in-flight tallies
     // Consume the muDM TileModel (tilejson.json); metadata.json is a transition fallback. `vm.meta` is
     // the metadata-shaped view the raster/2.5D/facet machinery reads — one descriptor, one fetch.
     const vm = await loadDescriptor(BASE_URL, datasetId);
@@ -465,6 +511,7 @@ async function loadDataset(datasetId) {
             bounds: imageBounds,
         }
     );
+    _wireTileCounting(rasterLayer);
     rasterLayer.addTo(map);
 
     map.fitBounds(dataBounds);
@@ -647,6 +694,7 @@ function setupVectorLayer(datasetId, imageBounds, maxZoom) {
         InfoPanel.pin(_withFacets(props), def);
     });
 
+    _wireTileCounting(vectorGridLayer);
     vectorGridLayer.addTo(map);
 }
 
