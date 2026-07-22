@@ -742,8 +742,14 @@ window.addEventListener('keydown', (e) => {
 //     async load/unload (tileManager._dirty).
 let animating = false;
 let needsRender = true;
+// Set by any camera/zoom change (the OrbitControls 'change' funnel — orbit, wheel, zoom slider,
+// keyboard, and the programmatic frameBox/frameZoomRegion reframes all reach it via
+// controls.update()). Read once per frame by the loading pill to re-baseline its burst on
+// navigation (so a zoom-out can't inflate the tile denominator), then cleared.
+let _viewChanged = false;
 function requestRender() { needsRender = true; }
-controls.addEventListener('change', requestRender);
+function _onViewChange() { _viewChanged = true; needsRender = true; }
+controls.addEventListener('change', _onViewChange);
 window.addEventListener('resize', requestRender);
 // Catch-all for sidebar UI + overview interactions + keyboard shortcuts —
 // these mutate the scene/overview without moving the main camera. Capture phase
@@ -761,15 +767,21 @@ function animate() {
     const busy = tileManager._pendingLoads > 0 || tileManager._dirty;
     if (!(needsRender || moved || busy)) return;   // idle → skip the whole frame
 
-    // Non-blocking tile-loading pill: outstanding = in-flight + queued GLB tiles. Runs only on
-    // active frames; the drain-to-0 frame is active (busy via tileManager._dirty), so the burst
-    // always ends and the indicator's own debounce hides the pill.
-    _tileIndicator.update(_tileCounter.setOutstanding(tileManager._pendingLoads + tileManager._loadQueue.length));
-
     needsRender = false;
     tileManager._dirty = false;
 
     tileManager.update(camera);
+
+    // Non-blocking tile-loading pill: outstanding = in-flight + queued GLB tiles, measured AFTER
+    // update() rebuilds this frame's desired set. A camera/zoom change (_viewChanged) re-baselines
+    // the burst so an abandoned view's progress can't inflate the new view's denominator — the
+    // count then reflects only what the current view needs (and shrinks on a zoom-out). Runs only
+    // on active frames; the drain-to-0 frame is active (busy via tileManager._dirty), so the burst
+    // always ends and the indicator's own debounce hides the pill.
+    _tileIndicator.update(_tileCounter.setOutstanding(
+        tileManager._pendingLoads + tileManager._loadQueue.length, _viewChanged));
+    _viewChanged = false;
+
     renderer.render(scene, camera);
 
     // Render overview panels (skip when the panel is collapsed/disabled —

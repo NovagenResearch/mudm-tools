@@ -10,7 +10,7 @@ from .convert import convert
 from .clip import clip
 from .transform import transform_tile
 from .tile import create_tile
-from .simplify import simplify
+from .simplify import douglas_peucker_floor, compute_tolerance
 
 
 def default_tolerance_func(z, options):
@@ -124,7 +124,77 @@ def get_default_options():
         "projector": None,  # which projection to use
         "bounds": None,  # [west, south, east, north]
         "tolerance_function": default_tolerance_func,  # function to calculate tolerance per zoom
+        # Polygon level-of-detail controls (parity with the Rust tiler's
+        # StreamingTileGenerator2D.configure_polygon_simplify). Polygon LOD is
+        # OPT-IN: it is applied only when poly_simplify_tolerances is provided.
+        #   poly_simplify_tolerances: optional per-zoom epsilon array (index = zoom,
+        #     length ~= maxZoom, i.e. n-1 for n zoom levels; the finest level is
+        #     never simplified). None (default) leaves polygons at full detail at
+        #     every zoom. Indices beyond the array fall back to compute_tolerance.
+        #   poly_min_edges: minimum ring vertex floor (clamped to >= 4); only takes
+        #     effect alongside a tolerance array.
+        "poly_simplify_tolerances": None,
+        "poly_min_edges": 4,
     }
+
+
+def _zoom_epsilon(z, max_zoom, per_zoom):
+    """Per-zoom simplification epsilon, mirroring the Rust tiler: an explicit
+    per-zoom tolerance array when one is supplied for this zoom, otherwise the
+    compute_tolerance doubling schedule."""
+    if per_zoom is not None and z < len(per_zoom):
+        return float(per_zoom[z])
+    return compute_tolerance(z, max_zoom)
+
+
+def build_zoom_geometries(features, options):
+    """Populate ``feature['geometry_z{z}']`` for every zoom level, applying
+    polygon level-of-detail per zoom.
+
+    Polygons are simplified with reduce-to-floor importance-ranked
+    Douglas-Peucker (parity with the Rust streaming tiler); non-polygon
+    geometry is copied unchanged. Simplification applies to polygons only.
+    Mutates ``features`` in place.
+    """
+    max_zoom = options.get("maxZoom")
+    per_zoom = options.get("poly_simplify_tolerances")
+    min_verts = max(int(options.get("poly_min_edges", 4)), 4)
+
+    # Independent geometry per zoom level (copied from the source geometry).
+    for z in range(max_zoom + 1):
+        for feature in features:
+            feature[f"geometry_z{z}"] = feature["geometry"].copy()
+
+    # Polygon level-of-detail is OPT-IN: it applies only when an explicit
+    # per-zoom tolerance schedule is supplied. Without one, polygons keep full
+    # detail at every zoom, so the tiler's default output is unchanged. This
+    # mirrors the Rust tiler, where the polygon branch is gated on
+    # per_zoom_tolerances.is_some().
+    if per_zoom is None:
+        return
+
+    # Simplify polygon rings per zoom.
+    for z in range(max_zoom + 1):
+        eps = _zoom_epsilon(z, max_zoom, per_zoom)
+        if eps <= 0.0:
+            continue  # finest level (or an explicit 0): keep full detail
+        for feature in features:
+            if feature["type"] != "Polygon":
+                continue
+            gkey = f"geometry_z{z}"
+            for iring in range(len(feature[gkey])):
+                ring = feature[gkey][iring]
+                # Ring is stored flat as [x, y, 0, x, y, 0, ...].
+                coords = [(ring[i], ring[i + 1]) for i in range(0, len(ring), 3)]
+                if len(coords) <= min_verts:
+                    continue  # already at/below the floor; keep as-is
+                simplified = douglas_peucker_floor(coords, eps, min_verts)
+                flat = []
+                for x, y in simplified:
+                    flat.append(x)
+                    flat.append(y)
+                    flat.append(0)
+                feature[gkey][iring] = flat
 
 
 class MuDMVt:
@@ -175,38 +245,11 @@ class MuDMVt:
 
         features = convert(data, options)
 
-        # Create a separate geometry for each zoom level
-        for z in range(options.get("maxZoom") + 1):
-            for feature in features:
-                feature[f"geometry_z{z}"] = feature["geometry"].copy()
-
-        tolerance_func = options["tolerance_function"]  # Resolved above
-
-        # Simplify features for each zoom level
-        for z in range(options.get("maxZoom") + 1):
-            # Calculate tolerance using the provided or default function
-            tolerance = tolerance_func(z, options)
-            for feature in features:
-                geometry_key = f"geometry_z{z}"
-                # check feature type only simplify Polygon
-                if feature["type"] == "Polygon":
-                    for iring in range(len(feature[geometry_key])):
-                        ring = feature[geometry_key][iring]
-                        # Convert geom to list of [x, y] pairs
-                        coords = [[ring[i], ring[i + 1]] for i in range(0, len(ring), 3)]
-                        scoords = simplify(coords, tolerance)
-                        # Check that it has at least 4 pairs of coordinates
-                        if len(scoords) < 4:
-                            # If not, use the original coordinates
-                            feature[geometry_key][iring] = ring
-                        else:
-                            # flatten the simplified coords
-                            simplified_ring = []
-                            for i in range(len(scoords)):
-                                simplified_ring.append(scoords[i][0])
-                                simplified_ring.append(scoords[i][1])
-                                simplified_ring.append(0)
-                            feature[geometry_key][iring] = simplified_ring
+        # Build per-zoom geometries with polygon level-of-detail (parity with
+        # the Rust streaming tiler: importance-ranked Douglas-Peucker that
+        # reduces rings to a minimum-vertex floor instead of reverting to full
+        # detail).
+        build_zoom_geometries(features, options)
 
         # tiles and tile_coords are part of the public API
         self.tiles = {}

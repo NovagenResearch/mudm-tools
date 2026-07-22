@@ -64,6 +64,8 @@ fn collect_parquet_rows_2d(
     world_bounds: &(f64, f64, f64, f64),
     max_zoom: u32,
     simplify: bool,
+    per_zoom_tolerances: Option<&[f64]>,
+    min_verts: usize,
 ) -> Vec<ParquetRow2D> {
     let (xmin, ymin, xmax, ymax) = *world_bounds;
     let dx = if xmax != xmin { xmax - xmin } else { 1.0 };
@@ -83,11 +85,13 @@ fn collect_parquet_rows_2d(
                 }
 
                 // Optionally simplify at coarse zoom levels (simplify operates on f64)
-                let (work_xy_f32, work_rl) = if do_simplify && frag.geom_type == POLYGON && !frag.ring_lengths.is_empty() {
-                    let eps = simplify2d::compute_tolerance(tz, max_zoom);
+                let (work_xy_f32, work_rl) = if do_simplify && frag.geom_type == POLYGON && per_zoom_tolerances.is_some() && !frag.ring_lengths.is_empty() {
+                    let eps = per_zoom_tolerances
+                        .and_then(|t| t.get(tz as usize).copied())
+                        .unwrap_or_else(|| simplify2d::compute_tolerance(tz, max_zoom));
                     if eps > 0.0 {
                         let xy_f64: Vec<f64> = frag.xy.iter().map(|&v| v as f64).collect();
-                        let (simp, rl) = simplify2d::simplify_polygon_rings(&xy_f64, &frag.ring_lengths, eps);
+                        let (simp, rl) = simplify2d::simplify_polygon_rings(&xy_f64, &frag.ring_lengths, eps, min_verts);
                         let simp_f32: Vec<f32> = simp.iter().map(|&v| v as f32).collect();
                         (simp_f32, rl)
                     } else {
@@ -341,6 +345,15 @@ pub struct StreamingTileGenerator2D {
     shard_counter: std::sync::atomic::AtomicUsize,
     fragment_reader: Option<Fragment2DReader>,
     parquet_stream_active: bool,
+    /// Per-zoom polygon Douglas-Peucker tolerances (one per simplified zoom
+    /// level, indexed by zoom; the finest level is never simplified). None =>
+    /// polygon simplification is DISABLED (full detail at every zoom). Providing
+    /// an array is what opts in to polygon LOD. Set via
+    /// `configure_polygon_simplify`.
+    poly_simplify_tolerances: Option<Vec<f64>>,
+    /// Minimum ring vertex count (incl. closing vertex): polygons are reduced
+    /// *to* this floor, never below it. Default 4 (a triangle).
+    poly_min_verts: usize,
 }
 
 #[pymethods]
@@ -385,7 +398,29 @@ impl StreamingTileGenerator2D {
             shard_counter: std::sync::atomic::AtomicUsize::new(1),
             fragment_reader: None,
             parquet_stream_active: false,
+            poly_simplify_tolerances: None,
+            poly_min_verts: 4,
         })
+    }
+
+    /// Configure polygon Douglas-Peucker simplification (POLYGON geometry only).
+    ///
+    /// Polygon LOD is opt-in: it is applied only when `per_zoom_tolerances` is
+    /// provided. `per_zoom_tolerances`: one tolerance per simplified zoom level
+    /// in normalized [0,1] space, indexed by zoom (the finest `max_zoom` level is
+    /// never simplified, so this typically has length `max_zoom`); None (the
+    /// default) leaves polygons at full detail at every zoom. `min_edges`:
+    /// minimum ring vertex count (including the closing vertex) — a ring is
+    /// reduced *to* this floor rather than reverting to full detail (clamped to
+    /// >= 4); it only takes effect alongside a tolerance array.
+    #[pyo3(signature = (per_zoom_tolerances=None, min_edges=4))]
+    fn configure_polygon_simplify(
+        &mut self,
+        per_zoom_tolerances: Option<Vec<f64>>,
+        min_edges: usize,
+    ) {
+        self.poly_simplify_tolerances = per_zoom_tolerances;
+        self.poly_min_verts = min_edges.max(4);
     }
 
     /// LOD gate (Path B): emit the tag `key` only on tiles at zoom >= `min_zoom`.
@@ -1225,9 +1260,11 @@ impl StreamingTileGenerator2D {
         let tiles: Vec<((u32, u32, u32), Vec<Fragment2D>)> = groups.into_iter().collect();
         let wb = world_bounds;
         let max_zoom = self.max_zoom;
+        let poly_tol = self.poly_simplify_tolerances.clone();
+        let min_verts = self.poly_min_verts;
 
         let rows = py.allow_threads(|| {
-            collect_parquet_rows_2d(&tiles, &wb, max_zoom, simplify)
+            collect_parquet_rows_2d(&tiles, &wb, max_zoom, simplify, poly_tol.as_deref(), min_verts)
         });
 
         build_python_dict(py, &rows, &self.tags_registry)
@@ -1294,9 +1331,11 @@ impl StreamingTileGenerator2D {
         let tiles: Vec<((u32, u32, u32), Vec<Fragment2D>)> = groups.into_iter().collect();
         let wb = world_bounds;
         let max_zoom = self.max_zoom;
+        let poly_tol = self.poly_simplify_tolerances.clone();
+        let min_verts = self.poly_min_verts;
 
         let rows = py.allow_threads(|| {
-            collect_parquet_rows_2d(&tiles, &wb, max_zoom, simplify)
+            collect_parquet_rows_2d(&tiles, &wb, max_zoom, simplify, poly_tol.as_deref(), min_verts)
         });
 
         let dict = build_python_dict(py, &rows, &self.tags_registry)?;
@@ -1351,10 +1390,13 @@ impl StreamingTileGenerator2D {
         let tags_snapshot: HashMap<u32, Vec<(String, TagValue)>> = tags_reg.clone();
         let tmz_snapshot: HashMap<String, u32> = self.tag_min_zoom.clone();
 
+        let poly_tol = self.poly_simplify_tolerances.clone();
+        let min_verts = self.poly_min_verts;
         let tile_count = py.allow_threads(|| {
             generate_pbf_tiles(
                 &tiles, &out_dir, &world_bounds, max_zoom, extent,
                 simplify, &ln, &tags_snapshot, &tmz_snapshot,
+                poly_tol.as_deref(), min_verts,
             )
         }).map_err(|e| pyo3::exceptions::PyIOError::new_err(e))?;
 
@@ -1420,10 +1462,13 @@ impl StreamingTileGenerator2D {
         let out_dir = output_dir.to_string();
         let comp = compression.to_string();
 
+        let poly_tol = self.poly_simplify_tolerances.clone();
+        let min_verts = self.poly_min_verts;
         let total = py.allow_threads(|| {
             write_parquet_native(
                 &tiles, &out_dir, &world_bounds, max_zoom,
                 simplify, &tags_snapshot, &comp, &mut HashMap::new(), &tmz_snapshot,
+                poly_tol.as_deref(), min_verts,
             )
         }).map_err(|e| pyo3::exceptions::PyIOError::new_err(e))?;
 
@@ -1465,6 +1510,8 @@ impl StreamingTileGenerator2D {
         let tmz_snapshot: HashMap<String, u32> = self.tag_min_zoom.clone();
         let out_dir = output_dir.to_string();
         let comp = compression.to_string();
+        let poly_tol = self.poly_simplify_tolerances.clone();
+        let min_verts = self.poly_min_verts;
         let budget = max_batch_bytes.max(1);
 
         let total = py.allow_threads(|| -> Result<u64, String> {
@@ -1495,6 +1542,7 @@ impl StreamingTileGenerator2D {
                 total += write_parquet_native(
                     &tiles, &out_dir, &world_bounds, max_zoom,
                     simplify, &tags_snapshot, &comp, &mut part_base, &tmz_snapshot,
+                    poly_tol.as_deref(), min_verts,
                 )?;
             }
             Ok(total)
@@ -1540,6 +1588,8 @@ impl StreamingTileGenerator2D {
         let pq_out = parquet_dir.to_string();
         let ln = layer_name.to_string();
         let comp = compression.to_string();
+        let poly_tol = self.poly_simplify_tolerances.clone();
+        let min_verts = self.poly_min_verts;
 
         // Run PBF + Parquet concurrently via rayon::join (GIL released)
         let (pbf_result, pq_result) = py.allow_threads(|| {
@@ -1547,10 +1597,12 @@ impl StreamingTileGenerator2D {
                 || generate_pbf_tiles(
                     &tiles, &pbf_out, &world_bounds, max_zoom, extent,
                     simplify, &ln, &tags_snapshot, &tmz_snapshot,
+                    poly_tol.as_deref(), min_verts,
                 ),
                 || write_parquet_native(
                     &tiles, &pq_out, &world_bounds, max_zoom,
                     simplify, &tags_snapshot, &comp, &mut HashMap::new(), &tmz_snapshot,
+                    poly_tol.as_deref(), min_verts,
                 ),
             )
         });
@@ -1607,6 +1659,8 @@ fn write_parquet_native(
     // ⇒ byte-identical to before).
     part_base: &mut HashMap<u32, u32>,
     tag_min_zoom: &HashMap<String, u32>,
+    per_zoom_tolerances: Option<&[f64]>,
+    min_verts: usize,
 ) -> Result<u64, String> {
     use arrow::array::*;
     use arrow::datatypes::{DataType, Field, Schema};
@@ -1726,7 +1780,7 @@ fn write_parquet_native(
                         })
                 });
             }
-            let rows = collect_parquet_rows_2d(&tiles_owned, world_bounds, max_zoom, simplify);
+            let rows = collect_parquet_rows_2d(&tiles_owned, world_bounds, max_zoom, simplify, per_zoom_tolerances, min_verts);
             drop(tiles_owned);
 
             if rows.is_empty() { return Ok(()); }
@@ -1815,6 +1869,8 @@ fn generate_pbf_tiles(
     layer_name: &str,
     tags_registry: &HashMap<u32, Vec<(String, TagValue)>>,
     tag_min_zoom: &HashMap<String, u32>,
+    per_zoom_tolerances: Option<&[f64]>,
+    min_verts: usize,
 ) -> Result<u32, String> {
     let tile_count = std::sync::atomic::AtomicU32::new(0);
 
@@ -1836,10 +1892,12 @@ fn generate_pbf_tiles(
             let xy_f64: Vec<f64> = frag.xy.iter().map(|&v| v as f64).collect();
 
             // Optionally simplify at coarse zoom levels
-            let (work_xy, work_rl) = if do_simplify && frag.geom_type == POLYGON && !frag.ring_lengths.is_empty() {
-                let eps = simplify2d::compute_tolerance(tz, max_zoom);
+            let (work_xy, work_rl) = if do_simplify && frag.geom_type == POLYGON && per_zoom_tolerances.is_some() && !frag.ring_lengths.is_empty() {
+                let eps = per_zoom_tolerances
+                    .and_then(|t| t.get(tz as usize).copied())
+                    .unwrap_or_else(|| simplify2d::compute_tolerance(tz, max_zoom));
                 if eps > 0.0 {
-                    simplify2d::simplify_polygon_rings(&xy_f64, &frag.ring_lengths, eps)
+                    simplify2d::simplify_polygon_rings(&xy_f64, &frag.ring_lengths, eps, min_verts)
                 } else {
                     (xy_f64, frag.ring_lengths.clone())
                 }

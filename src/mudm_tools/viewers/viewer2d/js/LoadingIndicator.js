@@ -13,7 +13,7 @@ export class LoadingIndicator {
     if (!this.el) return;
     if (active && total > 0) {
       this._cancelHide();
-      const text = `Loading ${loaded} of ${total} tiles`;
+      const text = `${loaded} of ${total} loaded`;
       if (this._countEl) this._countEl.textContent = text; else this.el.textContent = text;
       this.el.hidden = false;
     } else {

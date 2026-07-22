@@ -739,6 +739,9 @@ function initMap() {
     scaleControl.addTo(map);
 
     map.on("zoomend", _updateZoomUI);  // keep the zoom readout + layer badges in sync as the user zooms
+    // Re-baseline the loading pill at the start of every navigation gesture, so a zoom-out / pan
+    // can't inflate the tile denominator with the previous view's still-in-flight tallies.
+    map.on("zoomstart movestart", _resetLoading);
 
     map.on("zoomend moveend", () => {
         if (!metadata) return;
