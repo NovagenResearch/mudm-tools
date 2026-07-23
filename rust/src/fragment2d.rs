@@ -91,7 +91,8 @@ impl Fragment2DWriter {
     }
 
     pub fn flush(&mut self) -> io::Result<()> {
-        if let Some(encoder) = self.writer.take() {
+        if let Some(mut encoder) = self.writer.take() {
+            crate::fragment::write_shard_trailer(&mut encoder, self.count)?; // S1
             encoder.finish()?;
         }
         Ok(())
@@ -104,7 +105,14 @@ impl Fragment2DWriter {
 
 impl Drop for Fragment2DWriter {
     fn drop(&mut self) {
-        if let Some(encoder) = self.writer.take() {
+        // M2 (streaming_review.md, mirrored from Fragment3DWriter): do not
+        // finalize during a panic-unwind — a cleanly-finished frame would make
+        // the truncated shard decode as a silent EOF instead of an error.
+        if std::thread::panicking() {
+            return;
+        }
+        if let Some(mut encoder) = self.writer.take() {
+            let _ = crate::fragment::write_shard_trailer(&mut encoder, self.count); // S1
             let _ = encoder.finish();
         }
     }
@@ -113,6 +121,8 @@ impl Drop for Fragment2DWriter {
 /// Single-shard reader over one ZSTD-compressed fragment file.
 struct ShardReader2D {
     reader: BufReader<zstd::stream::read::Decoder<'static, BufReader<File>>>,
+    read_count: u64, // S1
+    complete: bool,  // S1
 }
 
 impl ShardReader2D {
@@ -121,6 +131,8 @@ impl ShardReader2D {
         let decoder = zstd::stream::read::Decoder::new(file)?;
         Ok(Self {
             reader: BufReader::with_capacity(1 << 20, decoder),
+            read_count: 0,
+            complete: false,
         })
     }
 
@@ -128,8 +140,39 @@ impl ShardReader2D {
         let mut magic = [0u8; 4];
         match self.reader.read_exact(&mut magic) {
             Ok(()) => {}
-            Err(ref e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+            // S1 (mirrors fragment.rs): clean EOF only after the count trailer.
+            Err(ref e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                if self.complete {
+                    return Ok(None);
+                }
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "shard truncated: missing end-of-shard count trailer (incomplete write)",
+                ));
+            }
             Err(e) => return Err(e),
+        }
+        if &magic == crate::fragment::TRAILER_MAGIC {
+            let count = self.reader.read_u64::<LittleEndian>()?;
+            let mut tend = [0u8; 4];
+            self.reader.read_exact(&mut tend)?;
+            if &tend != crate::fragment::TRAILER_END {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "shard trailer corrupt (bad end magic)",
+                ));
+            }
+            if count != self.read_count {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "shard fragment-count mismatch: trailer={} read={}",
+                        count, self.read_count
+                    ),
+                ));
+            }
+            self.complete = true;
+            return Ok(None);
         }
         if &magic != MAGIC {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "Bad fragment2d magic"));
@@ -142,6 +185,17 @@ impl ShardReader2D {
         let geom_type = self.reader.read_u8()?;
         let n_verts = self.reader.read_u32::<LittleEndian>()? as usize;
 
+        // M5 (streaming_review.md, mirrored from fragment.rs): cap untrusted
+        // lengths before allocating so a corrupt shard surfaces InvalidData
+        // instead of aborting the process on a multi-GB allocation.
+        const MAX_FRAGMENT_ITEMS: usize = 100_000_000;
+        if n_verts > MAX_FRAGMENT_ITEMS {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("implausible fragment2d vertex count {}", n_verts),
+            ));
+        }
+
         // XY: read f32 directly
         let mut xy = Vec::with_capacity(n_verts * 2);
         for _ in 0..n_verts * 2 {
@@ -150,6 +204,12 @@ impl ShardReader2D {
 
         // Ring lengths
         let n_rl = self.reader.read_u32::<LittleEndian>()? as usize;
+        if n_rl > MAX_FRAGMENT_ITEMS {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("implausible fragment2d ring count {}", n_rl),
+            ));
+        }
         let mut ring_lengths = Vec::with_capacity(n_rl);
         for _ in 0..n_rl {
             ring_lengths.push(self.reader.read_u32::<LittleEndian>()?);
@@ -162,6 +222,7 @@ impl ShardReader2D {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "Bad fragment2d end magic"));
         }
 
+        self.read_count += 1; // S1
         Ok(Some(Fragment2D {
             feature_id, tile_z, tile_x, tile_y,
             geom_type, xy, ring_lengths,
@@ -188,13 +249,20 @@ impl Fragment2DReader {
 
     /// Open a reader over a directory of shard files (*.mf2d).
     pub fn open_dir(dir: &Path) -> io::Result<Self> {
-        let mut paths: Vec<PathBuf> = std::fs::read_dir(dir)?
+        let paths: Vec<PathBuf> = std::fs::read_dir(dir)?
             .filter_map(|e| e.ok())
             .map(|e| e.path())
             .filter(|p| p.extension().map_or(false, |ext| ext == "mf2d"))
             .collect();
-        paths.sort();
+        Self::from_paths(paths)
+    }
 
+    /// Open a reader over an EXPLICIT list of shard files (bounded read: the
+    /// caller hands ONE byte-budget chunk of paths, not the whole frag_dir —
+    /// mirrors `Fragment3DReader::from_paths`). Used by the bounded 2D Parquet
+    /// path so peak resident scales with the chunk, not the corpus.
+    pub fn from_paths(mut paths: Vec<PathBuf>) -> io::Result<Self> {
+        paths.sort(); // deterministic order (stable chunk boundaries)
         if paths.is_empty() {
             return Ok(Self {
                 paths,
@@ -202,7 +270,6 @@ impl Fragment2DReader {
                 current_index: 0,
             });
         }
-
         let shard = ShardReader2D::open(&paths[0])?;
         Ok(Self {
             paths,

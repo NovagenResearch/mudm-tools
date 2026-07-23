@@ -38,6 +38,12 @@ class ObjConverter:
                 values are dicts of properties.
             glob (str): Glob pattern for OBJ files. Default: "*.obj".
             generate_parquet (bool): Also generate Parquet. Default: True.
+            compression (str): GLB tile compression — "meshopt-q14" (default),
+                "meshopt", "meshopt-q16", "meshopt-q10", "draco", or "none". The
+                meshopt-q* variants u16-quantize positions via KHR_mesh_quantization
+                (~25% smaller wire than raw-f32 "meshopt", visually lossless for these
+                surfaces); all are decoded natively by the bundled 3D viewer
+                (EXT_meshopt_compression [+ KHR_mesh_quantization]).
         """
         from mudm_tools._rs import StreamingTileGenerator
 
@@ -52,6 +58,11 @@ class ObjConverter:
         tags_map = config.get("tags", {})
         glob_pattern = config.get("glob", "*.obj")
         do_parquet = config.get("generate_parquet", True)
+        compression = config.get("compression", "meshopt-q14")
+        # LOD mesh simplification (per-zoom QEM decimation). Default on. Set False for small
+        # datasets where decimation facets smooth surfaces (e.g. HRA anatomy) and the size
+        # savings aren't needed — tiles stay full-detail at every zoom.
+        simplify = config.get("simplify", True)
 
         t_start = time.time()
 
@@ -91,6 +102,7 @@ class ObjConverter:
             [str(f) for f in obj_files],
             bounds,
             all_tags,
+            simplify=simplify,
         )
         t_ingest = time.time() - t0
         print(f"{len(fids)} features ({t_ingest:.1f}s)", flush=True)
@@ -99,21 +111,26 @@ class ObjConverter:
         print("Encoding 3D Tiles...", end=" ", flush=True)
         t0 = time.time()
         tiles_dir = out_dir / "3dtiles"
-        gen.generate_3dtiles(str(tiles_dir), bounds)
+        gen.generate_3dtiles(str(tiles_dir), bounds, compression=compression)
         t_tiles = time.time() - t0
-        print(f"done ({t_tiles:.1f}s)", flush=True)
+        print(f"done ({t_tiles:.1f}s, compression={compression})", flush=True)
 
         # Generate Parquet
         t_parquet = 0.0
         if do_parquet:
+            # G1 (streaming_review.md §G): route through the bounded,
+            # memory-ceiling-aware partitioned path. The previous call to the
+            # unbounded gen.generate_parquet_native loaded the WHOLE decoded
+            # corpus into RAM — the real OOM exposure for large OBJ corpora. The
+            # wrapper derives max_batch_bytes from the configured ceiling; output
+            # rows are content-identical (only part-file numbering differs).
+            # `simplify` was already applied at ingest (add_obj_files above).
+            from mudm_tools.tiling3d.parquet_writer import generate_parquet
+
             print("Encoding Parquet...", end=" ", flush=True)
             t0 = time.time()
             pq_dir = out_dir / "features.parquet"
-            pq_rows = gen.generate_parquet_native(
-                str(pq_dir),
-                bounds,
-                simplify=True,
-            )
+            pq_rows = generate_parquet(gen, str(pq_dir), bounds, partitioned=True)
             t_parquet = time.time() - t0
             print(f"{pq_rows:,} rows ({t_parquet:.1f}s)", flush=True)
 

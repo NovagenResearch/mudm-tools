@@ -270,6 +270,24 @@
   #zoom-distribution {
     margin-top: 6px; color: #777; font-size: 11px;
   }
+  /* Opacity Controls */
+  #opacity-controls {
+    flex-shrink: 0;
+    padding: 10px 12px;
+    border-top: 1px solid rgba(255,255,255,0.08);
+    font-size: 12px;
+  }
+  #opacity-controls h3 {
+    font-size: 11px; color: #999; text-transform: uppercase;
+    letter-spacing: 0.5px; margin-bottom: 8px;
+  }
+  #opacity-slider-row {
+    display: flex; align-items: center; gap: 8px;
+  }
+  #opacity-slider {
+    flex: 1; height: 4px; accent-color: #6fdfaf; cursor: pointer;
+  }
+  #opacity-label { color: #6fdfaf; font-weight: 600; min-width: 36px; text-align: right; }
 
   /* Stats */
   #stats {
@@ -394,6 +412,22 @@
     margin-top: 2px; text-align: center;
     text-shadow: 0 1px 2px rgba(0,0,0,0.9);
   }
+
+  /* Tile-loading pill */
+  .loading-pill {
+    position: fixed; bottom: 12px; left: 50%; transform: translateX(-50%);
+    z-index: 1200; pointer-events: none; display: flex; align-items: center; gap: 8px;
+    background: rgba(20,20,20,0.85); border: 1px solid rgba(255,255,255,0.15);
+    border-radius: 999px; padding: 6px 14px; font-size: 0.8rem; color: #eee;
+    backdrop-filter: blur(8px);
+  }
+  .loading-pill[hidden] { display: none; }
+  .loading-pill__spinner {
+    width: 12px; height: 12px; border-radius: 50%;
+    border: 2px solid rgba(255,255,255,0.25); border-top-color: #4aa3ff;
+    animation: loading-pill-spin 0.8s linear infinite;
+  }
+  @keyframes loading-pill-spin { to { transform: rotate(360deg); } }
 </style>
 
 <script type="importmap">
@@ -416,6 +450,13 @@
     <select id="color-by-select"><option value="">Original</option></select>
     <div id="color-by-range" style="display:none;margin-top:6px;"></div>
   </div>
+  <div id="opacity-controls">
+    <h3>Opacity</h3>
+    <div id="opacity-slider-row">
+      <input type="range" id="opacity-slider" min="0" max="100" step="1" value="100">
+      <span id="opacity-label">100%</span>
+    </div>
+  </div>
   <div id="screenshot-controls">
     <button id="screenshot-btn" title="Save screenshot (S)">Screenshot (S)</button>
   </div>
@@ -429,49 +470,35 @@
   </div>
   <div id="slice-controls"></div>
   <div id="lod-controls">
-    <h3>Level of Detail</h3>
-    <div class="lod-mode-row">
-      <label><input type="radio" name="lod-mode" value="dynamic" checked> Dynamic</label>
-      <label><input type="radio" name="lod-mode" value="forced"> Force Zoom</label>
-    </div>
+    <h3>Zoom level</h3>
     <div id="zoom-slider-row">
-      <span class="label">Zoom:</span>
-      <input type="range" id="zoom-slider" min="0" max="3" step="1" value="3" disabled>
+      <span class="label">Level:</span>
+      <input type="range" id="zoom-slider" min="0" max="3" step="1" value="3">
       <span id="zoom-label">3</span>
     </div>
     <div id="zoom-distribution"></div>
-  </div>
-  <div id="overview-controls">
-    <h3>Overview</h3>
-    <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;">
-      <input type="checkbox" id="overview-toggle" style="accent-color:#6fdfaf;">
-      <label for="overview-toggle" style="cursor:pointer;color:#ccc;">Enable overview</label>
-    </div>
-    <div id="overview-options" style="display:none;">
-      <div style="display:flex;gap:10px;margin-bottom:8px;flex-wrap:wrap;">
-        <label style="display:flex;align-items:center;gap:4px;cursor:pointer;color:#ccc;">
-          <input type="radio" name="overview-axes" value="xy-xz" checked style="accent-color:#6fdfaf;"> XY+XZ
-        </label>
-        <label style="display:flex;align-items:center;gap:4px;cursor:pointer;color:#ccc;">
-          <input type="radio" name="overview-axes" value="xy-yz" style="accent-color:#6fdfaf;"> XY+YZ
-        </label>
-        <label style="display:flex;align-items:center;gap:4px;cursor:pointer;color:#ccc;">
-          <input type="radio" name="overview-axes" value="xz-yz" style="accent-color:#6fdfaf;"> XZ+YZ
-        </label>
-      </div>
-      <div style="display:flex;align-items:center;gap:8px;">
-        <span style="color:#999;font-size:12px;">Neighbors:</span>
-        <input type="range" id="overview-ring-slider" min="0" max="2" step="1" value="0"
-          style="flex:1;height:4px;accent-color:#6fdfaf;cursor:pointer;">
-        <span id="overview-ring-label" style="color:#6fdfaf;font-weight:600;min-width:16px;">0</span>
-      </div>
-    </div>
   </div>
 </div>
 
 <canvas id="canvas"></canvas>
 
-<div id="overview-container" style="display:none;">
+<div id="overview-container">
+  <div id="overview-toolbar" style="padding:8px 10px;border-bottom:1px solid rgba(255,255,255,0.08);background:rgba(0,0,0,0.25);flex-shrink:0;">
+    <div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:6px;">
+      <label style="display:flex;align-items:center;gap:4px;cursor:pointer;color:#ccc;font-size:12px;">
+        <input type="radio" name="overview-axes" value="xy-xz" checked style="accent-color:#6fdfaf;"> XY+XZ</label>
+      <label style="display:flex;align-items:center;gap:4px;cursor:pointer;color:#ccc;font-size:12px;">
+        <input type="radio" name="overview-axes" value="xy-yz" style="accent-color:#6fdfaf;"> XY+YZ</label>
+      <label style="display:flex;align-items:center;gap:4px;cursor:pointer;color:#ccc;font-size:12px;">
+        <input type="radio" name="overview-axes" value="xz-yz" style="accent-color:#6fdfaf;"> XZ+YZ</label>
+    </div>
+    <div style="display:flex;align-items:center;gap:8px;">
+      <span style="color:#999;font-size:12px;">Neighbors:</span>
+      <input type="range" id="overview-ring-slider" min="0" max="2" step="1" value="0"
+        style="flex:1;height:4px;accent-color:#6fdfaf;cursor:pointer;">
+      <span id="overview-ring-label" style="color:#6fdfaf;font-weight:600;min-width:16px;font-size:12px;">0</span>
+    </div>
+  </div>
   <div class="overview-panel-wrapper">
     <span class="overview-panel-label" id="overview-label-0">XY</span>
     <div class="overview-scale-bar" id="overview-scale-0">
@@ -511,6 +538,11 @@
 <div id="info-panel">
   <h3 id="info-title">Region</h3>
   <table id="info-table"><tbody></tbody></table>
+</div>
+
+<div id="tile-loading" class="loading-pill" hidden>
+  <span class="loading-pill__spinner" aria-hidden="true"></span>
+  <span class="loading-pill__count">0 of 0 loaded</span>
 </div>
 
 <script type="module" src="js/main.js"></script>

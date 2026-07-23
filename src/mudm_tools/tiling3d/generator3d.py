@@ -35,6 +35,25 @@ _SHARED_TILES: dict[tuple, dict] = {}
 _SHARED_BOUNDS: tuple[float, ...] | None = None
 
 
+# Memory-governed parallelism: when a byte budget is set, per-worker headroom is estimated as a
+# fraction of the process's baseline RSS (the shared in-memory octree that fork workers duplicate via
+# COW-defeated refcounting), floored so small datasets still fan out.
+_WORKER_COW_FRACTION = 0.5
+_MIN_PER_WORKER_BYTES = 1_000_000_000  # 1 GB
+
+
+def _process_rss_bytes() -> int:
+    """Best-effort resident-set size of this process in bytes (0 if unknown)."""
+    try:
+        import resource
+
+        rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        # Linux reports KiB; macOS/BSD report bytes.
+        return rss * 1024 if sys.platform.startswith("linux") else rss
+    except Exception:
+        return 0
+
+
 def _get_mp_context() -> multiprocessing.context.BaseContext:
     """Return the best multiprocessing context for the platform.
 
@@ -155,10 +174,12 @@ class TileGenerator3D:
         config: OctreeConfig | None = None,
         output_format: Literal["pbf3", "3dtiles"] = "pbf3",
         workers: int | None = None,
+        max_memory_bytes: int | None = None,
     ) -> None:
         self.config = config or OctreeConfig()
         self.output_format = output_format
         self._workers = workers
+        self._max_memory_bytes = max_memory_bytes
         self._octree: Octree | None = None
         self._proj: CartesianProjector3D | None = None
         self._bounds: tuple[float, float, float, float, float, float] | None = None
@@ -170,10 +191,32 @@ class TileGenerator3D:
         self._vocabularies: dict[str, Vocabulary] | None = None
 
     def _effective_workers(self) -> int:
-        """Resolve worker count: None/0 → cpu_count, else use as-is."""
-        if self._workers is None or self._workers == 0:
-            return os.cpu_count() or 1
-        return max(1, self._workers)
+        """Resolve the worker count. When a memory budget (``max_memory_bytes``) is set, DERIVE the
+        count so peak memory stays under it — the caller caps MEMORY and parallelism self-sizes,
+        instead of hand-picking workers. Without a budget: None/0 → cpu_count (legacy behavior)."""
+        requested = (
+            self._workers if (self._workers and self._workers > 0) else (os.cpu_count() or 1)
+        )
+        budget = self._max_memory_bytes
+        if not budget or budget <= 0:
+            return max(1, requested)
+        # The fork Pool's peak scales with how much of the shared in-memory tile set each worker
+        # duplicates (CPython refcounting defeats copy-on-write). Reserve the current RSS (the octree
+        # baseline) and give each worker a conservative slice of it. A kernel cgroup cap is the hard
+        # backstop; this keeps the run from hitting it.
+        baseline = _process_rss_bytes()
+        if baseline <= 0:
+            return max(1, requested)  # RSS unknown → don't out-think it
+        usable = budget - baseline
+        per_worker = max(_MIN_PER_WORKER_BYTES, int(baseline * _WORKER_COW_FRACTION))
+        n = 1 if usable <= 0 else max(1, min(requested, int(usable // per_worker)))
+        if n < requested:
+            print(
+                f"[TileGenerator3D] memory budget {budget / 1e9:.0f} GB, baseline RSS "
+                f"{baseline / 1e9:.1f} GB → {n} worker(s) (requested {requested})",
+                file=sys.stderr,
+            )
+        return n
 
     def _scan_properties(self, collection: MuDMFeatureCollection) -> None:
         """Scan all feature properties to compute field types, ranges, enums."""

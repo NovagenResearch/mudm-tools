@@ -64,6 +64,8 @@ fn collect_parquet_rows_2d(
     world_bounds: &(f64, f64, f64, f64),
     max_zoom: u32,
     simplify: bool,
+    per_zoom_tolerances: Option<&[f64]>,
+    min_verts: usize,
 ) -> Vec<ParquetRow2D> {
     let (xmin, ymin, xmax, ymax) = *world_bounds;
     let dx = if xmax != xmin { xmax - xmin } else { 1.0 };
@@ -83,11 +85,13 @@ fn collect_parquet_rows_2d(
                 }
 
                 // Optionally simplify at coarse zoom levels (simplify operates on f64)
-                let (work_xy_f32, work_rl) = if do_simplify && frag.geom_type == POLYGON && !frag.ring_lengths.is_empty() {
-                    let eps = simplify2d::compute_tolerance(tz, max_zoom);
+                let (work_xy_f32, work_rl) = if do_simplify && frag.geom_type == POLYGON && per_zoom_tolerances.is_some() && !frag.ring_lengths.is_empty() {
+                    let eps = per_zoom_tolerances
+                        .and_then(|t| t.get(tz as usize).copied())
+                        .unwrap_or_else(|| simplify2d::compute_tolerance(tz, max_zoom));
                     if eps > 0.0 {
                         let xy_f64: Vec<f64> = frag.xy.iter().map(|&v| v as f64).collect();
-                        let (simp, rl) = simplify2d::simplify_polygon_rings(&xy_f64, &frag.ring_lengths, eps);
+                        let (simp, rl) = simplify2d::simplify_polygon_rings(&xy_f64, &frag.ring_lengths, eps, min_verts);
                         let simp_f32: Vec<f32> = simp.iter().map(|&v| v as f32).collect();
                         (simp_f32, rl)
                     } else {
@@ -331,11 +335,25 @@ pub struct StreamingTileGenerator2D {
     buffer: f64,
     feature_count: u32,
     tags_registry: HashMap<u32, Vec<(String, TagValue)>>,
+    /// LOD gate: per-feature tag keys present only on tiles at zoom >= the
+    /// recorded value (keys absent here appear at all zooms). Lets heavy
+    /// per-feature tags (e.g. per-cell expression) ride the fine tiles without
+    /// bloating coarse ones, where features are sub-pixel anyway.
+    tag_min_zoom: HashMap<String, u32>,
     fragment_writer: Option<Fragment2DWriter>,
     frag_dir: PathBuf,
     shard_counter: std::sync::atomic::AtomicUsize,
     fragment_reader: Option<Fragment2DReader>,
     parquet_stream_active: bool,
+    /// Per-zoom polygon Douglas-Peucker tolerances (one per simplified zoom
+    /// level, indexed by zoom; the finest level is never simplified). None =>
+    /// polygon simplification is DISABLED (full detail at every zoom). Providing
+    /// an array is what opts in to polygon LOD. Set via
+    /// `configure_polygon_simplify`.
+    poly_simplify_tolerances: Option<Vec<f64>>,
+    /// Minimum ring vertex count (incl. closing vertex): polygons are reduced
+    /// *to* this floor, never below it. Default 4 (a triangle).
+    poly_min_verts: usize,
 }
 
 #[pymethods]
@@ -374,12 +392,79 @@ impl StreamingTileGenerator2D {
             buffer,
             feature_count: 0,
             tags_registry: HashMap::new(),
+            tag_min_zoom: HashMap::new(),
             fragment_writer: Some(writer),
             frag_dir,
             shard_counter: std::sync::atomic::AtomicUsize::new(1),
             fragment_reader: None,
             parquet_stream_active: false,
+            poly_simplify_tolerances: None,
+            poly_min_verts: 4,
         })
+    }
+
+    /// Configure polygon Douglas-Peucker simplification (POLYGON geometry only).
+    ///
+    /// Polygon LOD is opt-in: it is applied only when `per_zoom_tolerances` is
+    /// provided. `per_zoom_tolerances`: one tolerance per simplified zoom level
+    /// in normalized [0,1] space, indexed by zoom (the finest `max_zoom` level is
+    /// never simplified, so this typically has length `max_zoom`); None (the
+    /// default) leaves polygons at full detail at every zoom. `min_edges`:
+    /// minimum ring vertex count (including the closing vertex) — a ring is
+    /// reduced *to* this floor rather than reverting to full detail (clamped to
+    /// >= 4); it only takes effect alongside a tolerance array.
+    #[pyo3(signature = (per_zoom_tolerances=None, min_edges=4))]
+    fn configure_polygon_simplify(
+        &mut self,
+        per_zoom_tolerances: Option<Vec<f64>>,
+        min_edges: usize,
+    ) {
+        self.poly_simplify_tolerances = per_zoom_tolerances;
+        self.poly_min_verts = min_edges.max(4);
+    }
+
+    /// LOD gate (Path B): emit the tag `key` only on tiles at zoom >= `min_zoom`.
+    /// Used to keep heavy per-feature tags (e.g. per-cell `expression`) off the
+    /// coarse tiles, where features are sub-pixel. Tags without a gate appear at
+    /// all zooms.
+    fn set_tag_min_zoom(&mut self, key: String, min_zoom: u32) {
+        self.tag_min_zoom.insert(key, min_zoom);
+    }
+
+    /// Attach extra tags to already-ingested features by matching an existing
+    /// tag value (Path B): for every feature whose `id_key` tag equals a key in
+    /// `attrs`, append that entry's (tag_key, value) pairs. Lets a converter
+    /// join per-entity attributes (e.g. per-cell expression keyed by `cell_id`)
+    /// onto the muDM tag registry AFTER `add_parquet_polygons`, so the tags flow
+    /// natively into BOTH the PBF and the Parquet output (no sidecar). Returns
+    /// the number of features that received at least one extra tag.
+    fn attach_tags_by_id(
+        &mut self,
+        id_key: &str,
+        attrs: HashMap<String, Vec<(String, String)>>,
+    ) -> u32 {
+        let mut n: u32 = 0;
+        for tags in self.tags_registry.values_mut() {
+            // Read the id value first; the immutable borrow ends before we push.
+            let id_val = tags.iter().find_map(|(k, v)| {
+                if k == id_key {
+                    if let TagValue::Str(s) = v { Some(s.clone()) } else { None }
+                } else {
+                    None
+                }
+            });
+            if let Some(id) = id_val {
+                if let Some(extra) = attrs.get(&id) {
+                    if !extra.is_empty() {
+                        for (k, v) in extra {
+                            tags.push((k.clone(), TagValue::Str(v.clone())));
+                        }
+                        n += 1;
+                    }
+                }
+            }
+        }
+        n
     }
 
     /// Add a single 2D feature (already projected to [0,1]²).
@@ -594,16 +679,22 @@ impl StreamingTileGenerator2D {
             .collect();
         let writers_ref = &writers;
 
-        let fid_counter = AtomicU32::new(self.feature_count);
-        let fid_counter_ref = &fid_counter;
+        // H2 (streaming_review.md): feature ids must be DETERMINISTIC. The old
+        // `AtomicU32::fetch_add` inside the par_iter assigned ids in rayon
+        // scheduling order — different every run — and coarse-zoom decimation
+        // keys off `fid % skip_factor`, so the SET OF POINTS KEPT varied
+        // run-to-run. Ids are now derived from the (stable) row position:
+        // batch base + index within the batch's surviving rows.
+        let base_fid = self.feature_count;
 
         // Read Parquet and process batches in parallel — GIL released
-        let all_tags: Vec<Vec<(u32, Vec<(String, TagValue)>)>> = py.allow_threads(|| {
+        let (all_tags, final_fid): (Vec<Vec<(u32, Vec<(String, TagValue)>)>>, u32) = py.allow_threads(|| {
             let file = File::open(&path).expect("Cannot open parquet file");
             let builder = ParquetRecordBatchReaderBuilder::try_new(file)
                 .expect("Parquet reader error");
             let reader = builder.build().expect("Parquet build error");
 
+            let mut next_fid = base_fid;
             let mut batch_tags = Vec::new();
 
             for batch_result in reader {
@@ -653,15 +744,18 @@ impl StreamingTileGenerator2D {
                     rows.push((raw_x, raw_y, prop_val));
                 }
 
-                // Parallel clip + write for this batch
+                // Parallel clip + write for this batch. fid = batch base + row
+                // index (H2): deterministic regardless of rayon scheduling.
+                let batch_base = next_fid;
                 let this_tags: Vec<(u32, Vec<(String, TagValue)>)> = rows.par_iter()
-                    .map(|(raw_x, raw_y, prop_val)| {
+                    .enumerate()
+                    .map(|(ri, (raw_x, raw_y, prop_val))| {
                         let x = raw_x * coord_scale;
                         let y = raw_y * coord_scale;
                         let nx = (x - xmin) / proj_dx;
                         let ny = (y - ymin) / proj_dy;
 
-                        let fid = fid_counter_ref.fetch_add(1, Ordering::Relaxed);
+                        let fid = batch_base + ri as u32;
 
                         let mut tags: Vec<(String, TagValue)> = Vec::with_capacity(2);
                         tags.push(("layer_type".to_string(), TagValue::Str(lt_str.clone())));
@@ -677,8 +771,15 @@ impl StreamingTileGenerator2D {
                         };
 
                         let fragments = clip2d::quadtree_clip(&cf, min_zoom, max_zoom, buffer);
+                        // L6 (streaming_review.md): total indexing — falls back
+                        // to the last writer if this ever runs inside a pool
+                        // larger than the one the writers were sized for.
                         let writer_idx = rayon::current_thread_index().unwrap_or(n_writers - 1);
-                        let mut w = writers_ref[writer_idx].lock().unwrap();
+                        let mut w = writers_ref
+                            .get(writer_idx)
+                            .unwrap_or(&writers_ref[n_writers - 1])
+                            .lock()
+                            .unwrap();
                         for ((tz, tx, ty), clipped) in fragments {
                             // Decimation: at lower zooms, skip most points
                             if tz < max_zoom {
@@ -701,10 +802,11 @@ impl StreamingTileGenerator2D {
                     })
                     .collect();
 
+                next_fid += rows.len() as u32;
                 batch_tags.push(this_tags);
             }
 
-            batch_tags
+            (batch_tags, next_fid)
         });
 
         // Flush shard writers
@@ -722,7 +824,7 @@ impl StreamingTileGenerator2D {
             }
         }
 
-        self.feature_count = fid_counter.load(Ordering::Relaxed);
+        self.feature_count = final_fid;
         Ok(total_count)
     }
 
@@ -792,16 +894,21 @@ impl StreamingTileGenerator2D {
             .collect();
         let writers_ref = &writers;
 
-        let fid_counter = AtomicU32::new(self.feature_count);
-        let fid_counter_ref = &fid_counter;
+        // H2 (streaming_review.md): deterministic feature ids — batch base +
+        // polygon index instead of fetch_add in rayon scheduling order (ids
+        // flow into the emitted fragments, so output bytes depended on
+        // scheduling). Polygon order itself is already deterministic
+        // (`id_order` tracks first occurrence in row order).
+        let base_fid = self.feature_count;
 
         // Read Parquet and process batches — GIL released
-        let all_tags: Vec<Vec<(u32, Vec<(String, TagValue)>)>> = py.allow_threads(|| {
+        let (all_tags, final_fid): (Vec<Vec<(u32, Vec<(String, TagValue)>)>>, u32) = py.allow_threads(|| {
             let file = File::open(&path).expect("Cannot open parquet file");
             let builder = ParquetRecordBatchReaderBuilder::try_new(file)
                 .expect("Parquet reader error");
             let reader = builder.build().expect("Parquet build error");
 
+            let mut next_fid = base_fid;
             let mut batch_tags = Vec::new();
 
             for batch_result in reader {
@@ -878,8 +985,10 @@ impl StreamingTileGenerator2D {
                     })
                     .collect();
 
+                let batch_base = next_fid;
                 let this_tags: Vec<(u32, Vec<(String, TagValue)>)> = polygons.par_iter()
-                    .map(|(cell_id, verts)| {
+                    .enumerate()
+                    .map(|(pi, (cell_id, verts))| {
                         // Build normalized polygon ring
                         let mut xy = Vec::with_capacity(verts.len() * 2);
                         let mut bb = BBox2D::empty();
@@ -895,7 +1004,7 @@ impl StreamingTileGenerator2D {
 
                         let ring_lengths = vec![verts.len() as u32];
 
-                        let fid = fid_counter_ref.fetch_add(1, Ordering::Relaxed);
+                        let fid = batch_base + pi as u32; // H2: deterministic
 
                         let mut tags: Vec<(String, TagValue)> = Vec::with_capacity(2);
                         tags.push(("layer_type".to_string(), TagValue::Str(lt_str.clone())));
@@ -909,8 +1018,15 @@ impl StreamingTileGenerator2D {
                         };
 
                         let fragments = clip2d::quadtree_clip(&cf, min_zoom, max_zoom, buffer);
+                        // L6 (streaming_review.md): total indexing — falls back
+                        // to the last writer if this ever runs inside a pool
+                        // larger than the one the writers were sized for.
                         let writer_idx = rayon::current_thread_index().unwrap_or(n_writers - 1);
-                        let mut w = writers_ref[writer_idx].lock().unwrap();
+                        let mut w = writers_ref
+                            .get(writer_idx)
+                            .unwrap_or(&writers_ref[n_writers - 1])
+                            .lock()
+                            .unwrap();
                         for ((tz, tx, ty), clipped) in fragments {
                             let frag = Fragment2D {
                                 feature_id: fid,
@@ -926,10 +1042,11 @@ impl StreamingTileGenerator2D {
                     })
                     .collect();
 
+                next_fid += polygons.len() as u32;
                 batch_tags.push(this_tags);
             }
 
-            batch_tags
+            (batch_tags, next_fid)
         });
 
         // Flush shard writers
@@ -947,7 +1064,7 @@ impl StreamingTileGenerator2D {
             }
         }
 
-        self.feature_count = fid_counter.load(Ordering::Relaxed);
+        self.feature_count = final_fid;
         Ok(total_count)
     }
 
@@ -992,13 +1109,39 @@ impl StreamingTileGenerator2D {
             .collect();
         let writers_ref = &writers;
 
-        // Atomic feature ID counter
-        let fid_counter = AtomicU32::new(self.feature_count);
-        let fid_counter_ref = &fid_counter;
+        // H2 (streaming_review.md): deterministic feature ids. The old
+        // `fetch_add` assigned ids in rayon scheduling order across files —
+        // different every run, and the ids flow into the emitted fragments.
+        // Ids are now (per-file offset + feature index within the file): a
+        // parallel pre-pass counts each file's features (the JSON is parsed
+        // twice — acceptable on this path), offsets are prefix-summed
+        // sequentially. Every extracted feature consumes an id, including
+        // those whose geometry yields no clip output (deterministic gaps).
+        let counts: Vec<u32> = py.allow_threads(|| {
+            paths.par_iter().map(|path| {
+                let json_str = match std::fs::read_to_string(path) {
+                    Ok(s) => s,
+                    Err(_) => return 0u32,
+                };
+                let parsed: serde_json::Value = match serde_json::from_str(&json_str) {
+                    Ok(v) => v,
+                    Err(_) => return 0u32,
+                };
+                extract_geojson_features(&parsed).len() as u32
+            }).collect()
+        });
+        let mut file_base: Vec<u32> = Vec::with_capacity(paths.len());
+        let mut acc = self.feature_count;
+        for c in &counts {
+            file_base.push(acc);
+            acc += *c;
+        }
+        let file_base_ref = &file_base;
+        let final_fid = acc;
 
         // Collect tags from all files in parallel
         let all_results: Vec<Vec<(u32, Vec<(String, TagValue)>)>> = py.allow_threads(|| {
-            paths.par_iter().map(|path| {
+            paths.par_iter().enumerate().map(|(pi, path)| {
                 let json_str = match std::fs::read_to_string(path) {
                     Ok(s) => s,
                     Err(_) => return vec![],
@@ -1010,15 +1153,17 @@ impl StreamingTileGenerator2D {
 
                 let features = extract_geojson_features(&parsed);
                 let mut file_results = Vec::new();
+                let mut local_idx: u32 = 0;
 
                 for (geom_type, coordinates, properties) in features {
+                    let fid = file_base_ref[pi] + local_idx; // H2: deterministic
+                    local_idx += 1;
+
                     let clip_feats = parse_geojson_geometry(
                         &geom_type, &coordinates,
                         xmin, ymin, proj_dx, proj_dy,
                     );
                     if clip_feats.is_empty() { continue; }
-
-                    let fid = fid_counter_ref.fetch_add(1, Ordering::Relaxed);
 
                     let mut tag_vec: Vec<(String, TagValue)> = Vec::new();
                     if let Some(obj) = properties.as_object() {
@@ -1040,7 +1185,12 @@ impl StreamingTileGenerator2D {
                         let fragments = clip2d::quadtree_clip(&cf, min_zoom, max_zoom, buffer);
                         let writer_idx = rayon::current_thread_index()
                             .unwrap_or(n_writers - 1);
-                        let mut w = writers_ref[writer_idx].lock().unwrap();
+                        // L6: total indexing (see the parquet sites).
+                        let mut w = writers_ref
+                            .get(writer_idx)
+                            .unwrap_or(&writers_ref[n_writers - 1])
+                            .lock()
+                            .unwrap();
                         for ((tz, tx, ty), clipped) in fragments {
                             let frag_out = Fragment2D {
                                 feature_id: fid,
@@ -1075,7 +1225,7 @@ impl StreamingTileGenerator2D {
             }
         }
 
-        self.feature_count = fid_counter.load(Ordering::Relaxed);
+        self.feature_count = final_fid;
         fids.sort();
         Ok(fids)
     }
@@ -1110,9 +1260,11 @@ impl StreamingTileGenerator2D {
         let tiles: Vec<((u32, u32, u32), Vec<Fragment2D>)> = groups.into_iter().collect();
         let wb = world_bounds;
         let max_zoom = self.max_zoom;
+        let poly_tol = self.poly_simplify_tolerances.clone();
+        let min_verts = self.poly_min_verts;
 
         let rows = py.allow_threads(|| {
-            collect_parquet_rows_2d(&tiles, &wb, max_zoom, simplify)
+            collect_parquet_rows_2d(&tiles, &wb, max_zoom, simplify, poly_tol.as_deref(), min_verts)
         });
 
         build_python_dict(py, &rows, &self.tags_registry)
@@ -1179,9 +1331,11 @@ impl StreamingTileGenerator2D {
         let tiles: Vec<((u32, u32, u32), Vec<Fragment2D>)> = groups.into_iter().collect();
         let wb = world_bounds;
         let max_zoom = self.max_zoom;
+        let poly_tol = self.poly_simplify_tolerances.clone();
+        let min_verts = self.poly_min_verts;
 
         let rows = py.allow_threads(|| {
-            collect_parquet_rows_2d(&tiles, &wb, max_zoom, simplify)
+            collect_parquet_rows_2d(&tiles, &wb, max_zoom, simplify, poly_tol.as_deref(), min_verts)
         });
 
         let dict = build_python_dict(py, &rows, &self.tags_registry)?;
@@ -1234,11 +1388,15 @@ impl StreamingTileGenerator2D {
         // Build the tag vectors for each feature outside of the parallel section
         // (tags_registry is not Send, so we need to snapshot it)
         let tags_snapshot: HashMap<u32, Vec<(String, TagValue)>> = tags_reg.clone();
+        let tmz_snapshot: HashMap<String, u32> = self.tag_min_zoom.clone();
 
+        let poly_tol = self.poly_simplify_tolerances.clone();
+        let min_verts = self.poly_min_verts;
         let tile_count = py.allow_threads(|| {
             generate_pbf_tiles(
                 &tiles, &out_dir, &world_bounds, max_zoom, extent,
-                simplify, &ln, &tags_snapshot,
+                simplify, &ln, &tags_snapshot, &tmz_snapshot,
+                poly_tol.as_deref(), min_verts,
             )
         }).map_err(|e| pyo3::exceptions::PyIOError::new_err(e))?;
 
@@ -1300,14 +1458,94 @@ impl StreamingTileGenerator2D {
         let tiles: Vec<((u32, u32, u32), Vec<Fragment2D>)> = groups.into_iter().collect();
         let max_zoom = self.max_zoom;
         let tags_snapshot: HashMap<u32, Vec<(String, TagValue)>> = self.tags_registry.clone();
+        let tmz_snapshot: HashMap<String, u32> = self.tag_min_zoom.clone();
         let out_dir = output_dir.to_string();
         let comp = compression.to_string();
 
+        let poly_tol = self.poly_simplify_tolerances.clone();
+        let min_verts = self.poly_min_verts;
         let total = py.allow_threads(|| {
             write_parquet_native(
                 &tiles, &out_dir, &world_bounds, max_zoom,
-                simplify, &tags_snapshot, &comp,
+                simplify, &tags_snapshot, &comp, &mut HashMap::new(), &tmz_snapshot,
+                poly_tol.as_deref(), min_verts,
             )
+        }).map_err(|e| pyo3::exceptions::PyIOError::new_err(e))?;
+
+        Ok(total)
+    }
+
+    /// Bounded Parquet (G1, streaming_review.md §G): byte-chunk the shard files
+    /// and write each chunk via `write_parquet_native` with a PERSISTENT
+    /// per-zoom part counter, so peak resident scales with `max_batch_bytes`
+    /// (one chunk's tiles) instead of the whole corpus (the unbounded
+    /// `generate_parquet_native` read everything into RAM). Output ROWS are
+    /// identical; only part-file numbering differs (persistent cross-chunk vs
+    /// per-zoom restart) — readers use Hive/glob discovery. Truncated shards are
+    /// surfaced (S1 trailer) rather than silently dropped.
+    #[pyo3(signature = (output_dir, world_bounds, simplify=true, compression="zstd", max_batch_bytes=2_000_000_000))]
+    fn generate_parquet_native_partitioned(
+        &mut self,
+        py: Python<'_>,
+        output_dir: &str,
+        world_bounds: (f64, f64, f64, f64),
+        simplify: bool,
+        compression: &str,
+        max_batch_bytes: usize,
+    ) -> PyResult<u64> {
+        if let Some(mut writer) = self.fragment_writer.take() {
+            writer.flush()
+                .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
+        }
+        let mut shard_paths: Vec<std::path::PathBuf> = std::fs::read_dir(&self.frag_dir)
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().map_or(false, |ext| ext == "mf2d"))
+            .collect();
+        shard_paths.sort(); // stable chunk boundaries
+
+        let max_zoom = self.max_zoom;
+        let tags_snapshot: HashMap<u32, Vec<(String, TagValue)>> = self.tags_registry.clone();
+        let tmz_snapshot: HashMap<String, u32> = self.tag_min_zoom.clone();
+        let out_dir = output_dir.to_string();
+        let comp = compression.to_string();
+        let poly_tol = self.poly_simplify_tolerances.clone();
+        let min_verts = self.poly_min_verts;
+        let budget = max_batch_bytes.max(1);
+
+        let total = py.allow_threads(|| -> Result<u64, String> {
+            // Byte-budget chunks of shard paths (mirrors 3D run_native_partitioned).
+            let mut chunks: Vec<Vec<std::path::PathBuf>> = Vec::new();
+            let n = shard_paths.len();
+            let mut cursor = 0usize;
+            while cursor < n {
+                let start = cursor;
+                let mut est = 0usize;
+                let mut end = start;
+                while end < n && (end == start || est < budget) {
+                    est += std::fs::metadata(&shard_paths[end])
+                        .map(|m| m.len() as usize * 3)
+                        .unwrap_or(0);
+                    end += 1;
+                }
+                chunks.push(shard_paths[start..end].to_vec());
+                cursor = end;
+            }
+            // One chunk resident at a time; persistent per-zoom part numbering.
+            let mut part_base: HashMap<u32, u32> = HashMap::new();
+            let mut total = 0u64;
+            for chunk in chunks {
+                let mut reader = Fragment2DReader::from_paths(chunk).map_err(|e| e.to_string())?;
+                let groups = reader.read_all_grouped().map_err(|e| e.to_string())?;
+                let tiles: Vec<((u32, u32, u32), Vec<Fragment2D>)> = groups.into_iter().collect();
+                total += write_parquet_native(
+                    &tiles, &out_dir, &world_bounds, max_zoom,
+                    simplify, &tags_snapshot, &comp, &mut part_base, &tmz_snapshot,
+                    poly_tol.as_deref(), min_verts,
+                )?;
+            }
+            Ok(total)
         }).map_err(|e| pyo3::exceptions::PyIOError::new_err(e))?;
 
         Ok(total)
@@ -1345,21 +1583,26 @@ impl StreamingTileGenerator2D {
         let max_zoom = self.max_zoom;
         let min_zoom = self.min_zoom;
         let tags_snapshot: HashMap<u32, Vec<(String, TagValue)>> = self.tags_registry.clone();
+        let tmz_snapshot: HashMap<String, u32> = self.tag_min_zoom.clone();
         let pbf_out = pbf_dir.to_string();
         let pq_out = parquet_dir.to_string();
         let ln = layer_name.to_string();
         let comp = compression.to_string();
+        let poly_tol = self.poly_simplify_tolerances.clone();
+        let min_verts = self.poly_min_verts;
 
         // Run PBF + Parquet concurrently via rayon::join (GIL released)
         let (pbf_result, pq_result) = py.allow_threads(|| {
             rayon::join(
                 || generate_pbf_tiles(
                     &tiles, &pbf_out, &world_bounds, max_zoom, extent,
-                    simplify, &ln, &tags_snapshot,
+                    simplify, &ln, &tags_snapshot, &tmz_snapshot,
+                    poly_tol.as_deref(), min_verts,
                 ),
                 || write_parquet_native(
                     &tiles, &pq_out, &world_bounds, max_zoom,
-                    simplify, &tags_snapshot, &comp,
+                    simplify, &tags_snapshot, &comp, &mut HashMap::new(), &tmz_snapshot,
+                    poly_tol.as_deref(), min_verts,
                 ),
             )
         });
@@ -1410,6 +1653,14 @@ fn write_parquet_native(
     simplify: bool,
     tags: &HashMap<u32, Vec<(String, TagValue)>>,
     compression: &str,
+    // G1 (streaming_review.md §G): persistent per-zoom part-number base so the
+    // bounded partitioned path can call this once per shard-chunk without part
+    // files colliding. The whole-corpus callers pass a fresh empty map (base 0
+    // ⇒ byte-identical to before).
+    part_base: &mut HashMap<u32, u32>,
+    tag_min_zoom: &HashMap<String, u32>,
+    per_zoom_tolerances: Option<&[f64]>,
+    min_verts: usize,
 ) -> Result<u64, String> {
     use arrow::array::*;
     use arrow::datatypes::{DataType, Field, Schema};
@@ -1456,8 +1707,13 @@ fn write_parquet_native(
     ]);
     let schema_ref = std::sync::Arc::new(schema);
 
+    // PY-1 (streaming_review.md §G): match level 3 (parquet-rs ZSTD(Default) is
+    // level 1) — same fix as the 3D legacy path.
     let comp = match compression {
-        "zstd" => Compression::ZSTD(Default::default()),
+        "zstd" => Compression::ZSTD(
+            parquet::basic::ZstdLevel::try_new(3)
+                .map_err(|e| format!("zstd level: {}", e))?,
+        ),
         "lz4" => Compression::LZ4_RAW,
         "snappy" => Compression::SNAPPY,
         _ => Compression::UNCOMPRESSED,
@@ -1483,8 +1739,15 @@ fn write_parquet_native(
         let zoom_dir = out_path.join(format!("zoom={}", zoom));
         std::fs::create_dir_all(&zoom_dir).map_err(|e| format!("mkdir: {}", e))?;
 
-        // Split tiles into chunks → each chunk collects rows + writes its own part file in parallel
-        let n_parts = rayon::current_num_threads().max(1);
+        // PY-2 / H1 (streaming_review.md §G): deterministic output — sort tiles
+        // by key (the source is ahash iteration order) and use a FIXED part
+        // grain instead of `current_num_threads()`. Mirrors the 3D legacy fix.
+        let mut zoom_tiles: Vec<&((u32, u32, u32), Vec<Fragment2D>)> = zoom_tiles.clone();
+        zoom_tiles.sort_by_key(|entry| entry.0);
+        const PART_GRAIN: usize = 64;
+        let n_parts = PART_GRAIN.min(zoom_tiles.len()).max(1);
+        // G1: continue part numbering across chunk-calls (0 for whole-corpus).
+        let part_base_z = *part_base.get(&zoom).unwrap_or(&0);
         let chunk_size = (zoom_tiles.len() + n_parts - 1) / n_parts;
 
         let chunks: Vec<(usize, &[&((u32, u32, u32), Vec<Fragment2D>)])> =
@@ -1492,16 +1755,39 @@ fn write_parquet_native(
         chunks.par_iter().try_for_each(|(part_idx, tile_chunk)| -> Result<(), String> {
             let part_idx = *part_idx;
             // Collect rows for this chunk of tiles (Rayon parallel internally)
-            let tiles_owned: Vec<((u32, u32, u32), Vec<Fragment2D>)> = tile_chunk
+            let mut tiles_owned: Vec<((u32, u32, u32), Vec<Fragment2D>)> = tile_chunk
                 .iter()
                 .map(|&entry| entry.clone())
                 .collect();
-            let rows = collect_parquet_rows_2d(&tiles_owned, world_bounds, max_zoom, simplify);
+            // H1a: canonicalize within-tile fragment order. Fragment2D has no
+            // frag_cmp; sort by (feature_id, geom_type, ring_lengths, xy bits)
+            // — a total order over the fields, deterministic across readers.
+            for (_k, frags) in tiles_owned.iter_mut() {
+                frags.sort_by(|a, b| {
+                    a.feature_id
+                        .cmp(&b.feature_id)
+                        .then_with(|| a.geom_type.cmp(&b.geom_type))
+                        .then_with(|| a.ring_lengths.cmp(&b.ring_lengths))
+                        .then_with(|| a.xy.len().cmp(&b.xy.len()))
+                        .then_with(|| {
+                            a.xy.iter()
+                                .zip(b.xy.iter())
+                                .find_map(|(x, y)| match x.total_cmp(y) {
+                                    std::cmp::Ordering::Equal => None,
+                                    o => Some(o),
+                                })
+                                .unwrap_or(std::cmp::Ordering::Equal)
+                        })
+                });
+            }
+            let rows = collect_parquet_rows_2d(&tiles_owned, world_bounds, max_zoom, simplify, per_zoom_tolerances, min_verts);
             drop(tiles_owned);
 
             if rows.is_empty() { return Ok(()); }
 
-            let file_path = zoom_dir.join(format!("part_{:03}.parquet", part_idx));
+            // muDM tile-geometry parquet (custom schema, NOT GeoParquet) — see mudm-data .mu.parquet convention
+            let file_path =
+                zoom_dir.join(format!("part_{:03}.mu.parquet", part_base_z as usize + part_idx));
             let file = std::fs::File::create(&file_path)
                 .map_err(|e| format!("create {}: {}", file_path.display(), e))?;
             let mut pq_writer = ArrowWriter::try_new(file, schema_ref.clone(), Some(props.clone()))
@@ -1526,6 +1812,11 @@ fn write_parquet_native(
 
                 if let Some(tag_vec) = tags.get(&row.feature_id) {
                     for (k, v) in tag_vec {
+                        // LOD gate (Path B): skip tags whose tag_min_zoom exceeds
+                        // this zoom (e.g. per-cell expression on coarse tiles).
+                        if tag_min_zoom.get(k).map_or(false, |&mz| zoom < mz) {
+                            continue;
+                        }
                         map_builder.keys().append_value(k);
                         match v {
                             TagValue::Str(s) => map_builder.values().append_value(s),
@@ -1558,6 +1849,7 @@ fn write_parquet_native(
             total_rows_ref.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
             Ok(())
         })?;
+        part_base.insert(zoom, part_base_z + n_parts as u32); // G1
     }
 
     Ok(total_rows.load(std::sync::atomic::Ordering::Relaxed))
@@ -1576,6 +1868,9 @@ fn generate_pbf_tiles(
     simplify: bool,
     layer_name: &str,
     tags_registry: &HashMap<u32, Vec<(String, TagValue)>>,
+    tag_min_zoom: &HashMap<String, u32>,
+    per_zoom_tolerances: Option<&[f64]>,
+    min_verts: usize,
 ) -> Result<u32, String> {
     let tile_count = std::sync::atomic::AtomicU32::new(0);
 
@@ -1597,10 +1892,12 @@ fn generate_pbf_tiles(
             let xy_f64: Vec<f64> = frag.xy.iter().map(|&v| v as f64).collect();
 
             // Optionally simplify at coarse zoom levels
-            let (work_xy, work_rl) = if do_simplify && frag.geom_type == POLYGON && !frag.ring_lengths.is_empty() {
-                let eps = simplify2d::compute_tolerance(tz, max_zoom);
+            let (work_xy, work_rl) = if do_simplify && frag.geom_type == POLYGON && per_zoom_tolerances.is_some() && !frag.ring_lengths.is_empty() {
+                let eps = per_zoom_tolerances
+                    .and_then(|t| t.get(tz as usize).copied())
+                    .unwrap_or_else(|| simplify2d::compute_tolerance(tz, max_zoom));
                 if eps > 0.0 {
-                    simplify2d::simplify_polygon_rings(&xy_f64, &frag.ring_lengths, eps)
+                    simplify2d::simplify_polygon_rings(&xy_f64, &frag.ring_lengths, eps, min_verts)
                 } else {
                     (xy_f64, frag.ring_lengths.clone())
                 }
@@ -1631,10 +1928,15 @@ fn generate_pbf_tiles(
                 continue;
             }
 
-            // Collect tags for this feature
-            let tags = tags_registry.get(&frag.feature_id)
+            // Collect tags for this feature. LOD gate (Path B): drop tags whose
+            // tag_min_zoom exceeds this tile's zoom (e.g. per-cell expression on
+            // coarse tiles), so heavy tags ride only the fine tiles.
+            let mut tags = tags_registry.get(&frag.feature_id)
                 .cloned()
                 .unwrap_or_default();
+            if !tag_min_zoom.is_empty() {
+                tags.retain(|(k, _)| tag_min_zoom.get(k).map_or(true, |&mz| tz >= mz));
+            }
 
             mvt_features.push(encoder_mvt::MvtFeature {
                 id: frag.feature_id as u64,

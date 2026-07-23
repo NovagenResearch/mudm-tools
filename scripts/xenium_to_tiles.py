@@ -532,9 +532,12 @@ def convert_xenium(
     bounds_um = compute_bounds(parquet_files)
     print(f"World bounds (µm): {bounds_um}")
 
-    # Generate raster tiles first (determines max_zoom and pixel grid)
+    # Generate raster tiles first (determines max_zoom and pixel grid).
+    # Candidate order mirrors mudm_tools.converters.xenium._find_morphology_image: named DAPI, then the
+    # XOA 2.0/3.0 numbered per-channel layout (channel 0 = DAPI), then a single-file morphology image.
     morph_candidates = [
         data_dir / "morphology_focus" / "ch0000_dapi.ome.tif",
+        data_dir / "morphology_focus" / "morphology_focus_0000.ome.tif",
         data_dir / "morphology_focus.ome.tif",
     ]
     morph_path = None

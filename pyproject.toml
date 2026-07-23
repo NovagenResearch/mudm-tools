@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mudm-tools"
-version = "0.6.3"
+version = "0.6.4"
 description = "Processing pipelines, tiling engines, and format converters for muDM spatial data."
 readme = "README.md"
 authors = [
@@ -34,11 +34,15 @@ dependencies = [
     "pygltflib>=1.16",
     "numpy>=1.26",
     "scipy>=1.13",
-    "scikit-learn>=1.3",
+    "pillow>=12.2.0",
 ]
 
 [project.optional-dependencies]
 draco = ["DracoPy>=1.4"]
+# Optional Zarr CSC companion for the Xenium facet store (XeniumConverter facets emit_zarr=True). Lazily
+# imported in converters/xenium.py; the default facet store (parquet) needs no zarr. Enable with
+# `pip install mudm-tools[zarr]` or `uv run --with zarr`.
+zarr = ["zarr>=3.0"]
 # Xenium spatial-transcriptomics converter (scripts/xenium_to_tiles.py +
 # converters/xenium.py). Optional: install with `pip install mudm-tools[xenium]`
 # or run tests with `uv run --extra xenium pytest`.
@@ -47,9 +51,17 @@ xenium = [
     "tifffile>=2026.3.3",
     "pillow>=12.2.0",
 ]
+# Label-mask (3D segmentation volume) -> mesh 3D-tiles converter (converters/labelmask.py).
+# marching_cubes needs scikit-image; tifffile reads the mask. Install with
+# `pip install mudm-tools[labelmask]` or run with `uv run --extra labelmask`.
+labelmask = [
+    "scikit-image>=0.22",
+    "tifffile>=2026.3.3",
+]
 
 [project.scripts]
 mudm-serve = "mudm_tools.serve:main"
+mudm-render-overview = "mudm_tools.viewers.overview:main"
 
 [project.urls]
 Homepage = "https://github.com/NovagenResearch/mudm-tools"
@@ -67,7 +79,7 @@ features = ["pyo3/extension-module"]
 where = ["src"]
 
 [tool.setuptools.package-data]
-"mudm_tools.viewers" = ["**/*.html", "**/*.js", "**/*.css"]
+"mudm_tools.viewers" = ["**/*.html", "**/*.js", "**/*.mjs", "**/*.css"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests/"]
@@ -104,6 +116,7 @@ follow_imports = "skip"
 
 [dependency-groups]
 dev = [
+    "mapbox-vector-tile>=2.2.0",
     "maturin>=1.13.1",
     "pytest>=9.0.3",
 ]

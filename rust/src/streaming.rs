@@ -29,7 +29,7 @@ use rayon::prelude::*;
 use ahash::AHashMap;
 
 use crate::types::BBox3D;
-use crate::fragment::{Fragment3D, Fragment3DWriter, Fragment3DReader, prefetch_advise};
+use crate::fragment::{Fragment3D, Fragment3DWriter, Fragment3DReader};
 use crate::encoder_pbf3;
 use crate::encoder_glb::{self, GlbFeature};
 use crate::tileset_json;
@@ -245,6 +245,7 @@ fn simplify_and_clip_per_zoom(
     max_zoom: u32,
     base_cells: u32,
     buffer: f64,
+    do_simplify: bool,
 ) -> Vec<((u32, u32, u32, u32), ClipFeature)> {
     let mut result = Vec::new();
     let full_index_count = indices.len();
@@ -254,7 +255,10 @@ fn simplify_and_clip_per_zoom(
     let mut cur_idx = indices.to_vec();
 
     for zoom in (min_zoom..=max_zoom).rev() {
-        if zoom < max_zoom {
+        // do_simplify=false → full-detail mesh at EVERY zoom (just clipped), no LOD decimation.
+        // Used for small datasets (e.g. HRA anatomy) where QEM facets smooth surfaces and the
+        // size savings aren't needed; large sets (hemibrain) keep simplify=true for browsability.
+        if do_simplify && zoom < max_zoom {
             // Cascade: simplify from current (already reduced) mesh
             let target_idx = simplify::compute_target_index_count(
                 base_cells, zoom, max_zoom, full_index_count,
@@ -1768,19 +1772,37 @@ fn simplify_fragment(frag: Fragment3D, base_cells: u32, max_zoom: u32) -> Fragme
     }
 }
 
+/// Single-pass tile-key hash-partition spill (GRACE-style external grouping).
+///
+/// Reads every ingest shard in `frag_dir` ONCE and routes each fragment by
+/// `hash(tile_z, tile_x, tile_y, tile_d) % num_buckets` into one of
+/// `num_buckets` on-disk partitions, returning the per-partition file lists.
+/// Shards are processed in `n_groups` parallel chunks, each owning its OWN set
+/// of K writers — so there is no cross-thread lock contention on the hot path,
+/// and only `n_groups × num_buckets` spill files are created regardless of the
+/// input shard count (a large `max_zoom` run emits 100k+ tiny chunk shards, so
+/// a per-shard scheme would explode the file/inode count). Resident RAM is
+/// O(n_groups × K × 1 MB writer buffers), independent of corpus size.
+///
+/// `simplify`: when true, coarse-zoom mesh fragments (geom_type 4/5,
+/// `tile_z < max_zoom`) are simplified during the spill. The 3D-tiles encode
+/// path passes `false` (its `_encode_grouped_fragments` runs `do_simplify=false`),
+/// so the spilled fragments are byte-for-byte the inputs — only routing differs.
 fn redistribute_fragments_to_buckets(
     frag_dir: &Path,
     num_buckets: usize,
     max_zoom: u32,
     base_cells: u32,
-) -> io::Result<Vec<PathBuf>> {
+    simplify: bool,
+) -> io::Result<Vec<Vec<PathBuf>>> {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
 
     let bucket_dir = frag_dir.join("buckets");
     std::fs::create_dir_all(&bucket_dir)?;
 
-    // Discover ingestion shard files (exclude the buckets subdirectory)
+    // Discover ingestion shard files (the buckets subdir is a directory, so the
+    // .mjf extension filter excludes it).
     let mut shard_paths: Vec<PathBuf> = std::fs::read_dir(frag_dir)?
         .filter_map(|e| e.ok())
         .map(|e| e.path())
@@ -1788,115 +1810,111 @@ fn redistribute_fragments_to_buckets(
         .collect();
     shard_paths.sort();
 
-    if shard_paths.is_empty() {
-        // No fragments — create empty bucket directories
-        let mut bucket_dirs = Vec::with_capacity(num_buckets);
-        for i in 0..num_buckets {
-            let bdir = bucket_dir.join(format!("b_{:04}", i));
-            std::fs::create_dir_all(&bdir)?;
-            bucket_dirs.push(bdir);
-        }
-        return Ok(bucket_dirs);
-    }
+    // Bound the writer-buffer footprint: each group holds up to `num_buckets`
+    // lazy 1 MB-buffered writers, so cap `n_groups × num_buckets` (here ≲ 512 ⇒
+    // ≲ ~0.5–1.5 GB of spill buffers) regardless of core count / K. Spill is
+    // I/O-bound, so fewer groups at large K costs little throughput.
+    let n_groups = rayon::current_num_threads()
+        .max(1)
+        .min((512 / num_buckets.max(1)).max(1));
 
-    // Phase 1: Each shard writes to its own set of bucket files in parallel.
-    // shard S writes to buckets/shard_{S}_bucket_{B}.mjf
-    let n_shards = shard_paths.len();
-    let errors: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    if !shard_paths.is_empty() {
+        let chunk_size = shard_paths.len().div_ceil(n_groups).max(1);
+        let group_chunks: Vec<&[PathBuf]> = shard_paths.chunks(chunk_size).collect();
+        let errors: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
-    shard_paths.par_iter().enumerate().for_each(|(shard_idx, shard_path)| {
-        // Each thread creates its own bucket writers
-        let mut writers: Vec<Option<Fragment3DWriter>> = (0..num_buckets).map(|_| None).collect();
+        // Each chunk owns its own K writers — no shared state, no locks on the
+        // hot path. Writers are lazy, so empty buckets create no file.
+        group_chunks.par_iter().enumerate().for_each(|(g, chunk)| {
+            let mut writers: Vec<Option<Fragment3DWriter>> =
+                (0..num_buckets).map(|_| None).collect();
 
-        let mut reader = match Fragment3DReader::new(shard_path) {
-            Ok(r) => r,
-            Err(e) => {
-                errors.lock().unwrap().push(format!("shard {}: {}", shard_idx, e));
-                return;
-            }
-        };
+            for shard_path in chunk.iter() {
+                let mut reader = match Fragment3DReader::new(shard_path) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        errors.lock().unwrap().push(format!("group {} open: {}", g, e));
+                        return;
+                    }
+                };
+                loop {
+                    match reader.read_next() {
+                        Ok(Some(frag)) => {
+                            let frag = if simplify
+                                && (frag.geom_type == 4 || frag.geom_type == 5)
+                                && frag.tile_z < max_zoom
+                            {
+                                simplify_fragment(frag, base_cells, max_zoom)
+                            } else {
+                                frag
+                            };
 
-        loop {
-            match reader.read_next() {
-                Ok(Some(frag)) => {
-                    // Simplify coarse zoom meshes before writing to bucket
-                    let frag = if (frag.geom_type == 4 || frag.geom_type == 5)
-                                  && frag.tile_z < max_zoom {
-                        simplify_fragment(frag, base_cells, max_zoom)
-                    } else {
-                        frag
-                    };
+                            let mut hasher = DefaultHasher::new();
+                            (frag.tile_z, frag.tile_x, frag.tile_y, frag.tile_d)
+                                .hash(&mut hasher);
+                            let bucket = (hasher.finish() as usize) % num_buckets;
 
-                    let mut hasher = DefaultHasher::new();
-                    (frag.tile_z, frag.tile_x, frag.tile_y, frag.tile_d).hash(&mut hasher);
-                    let bucket = (hasher.finish() as usize) % num_buckets;
-
-                    // Lazy-init writer for this bucket
-                    if writers[bucket].is_none() {
-                        let path = bucket_dir.join(
-                            format!("shard_{:03}_bucket_{:04}.mjf", shard_idx, bucket)
-                        );
-                        match Fragment3DWriter::new(&path) {
-                            Ok(w) => writers[bucket] = Some(w),
-                            Err(e) => {
-                                errors.lock().unwrap().push(format!(
-                                    "shard {} bucket {}: {}", shard_idx, bucket, e
-                                ));
-                                return;
+                            if writers[bucket].is_none() {
+                                let path =
+                                    bucket_dir.join(format!("g{:04}_b{:04}.mjf", g, bucket));
+                                match Fragment3DWriter::new(&path) {
+                                    Ok(w) => writers[bucket] = Some(w),
+                                    Err(e) => {
+                                        errors.lock().unwrap().push(format!(
+                                            "group {} bucket {} create: {}", g, bucket, e
+                                        ));
+                                        return;
+                                    }
+                                }
+                            }
+                            if let Some(ref mut w) = writers[bucket] {
+                                if let Err(e) = w.write(&frag) {
+                                    errors.lock().unwrap().push(format!(
+                                        "group {} bucket {} write: {}", g, bucket, e
+                                    ));
+                                    return;
+                                }
                             }
                         }
-                    }
-
-                    if let Some(ref mut w) = writers[bucket] {
-                        if let Err(e) = w.write(&frag) {
-                            errors.lock().unwrap().push(format!(
-                                "shard {} bucket {} write: {}", shard_idx, bucket, e
-                            ));
+                        Ok(None) => break,
+                        Err(e) => {
+                            errors.lock().unwrap().push(format!("group {} read: {}", g, e));
                             return;
                         }
                     }
                 }
-                Ok(None) => break,
-                Err(e) => {
-                    errors.lock().unwrap().push(format!("shard {} read: {}", shard_idx, e));
-                    return;
+            }
+
+            // Finalize this chunk's ZSTD frames, surfacing flush errors (Drop
+            // would swallow them).
+            for mut w in writers.into_iter().flatten() {
+                if let Err(e) = w.flush() {
+                    errors.lock().unwrap().push(format!("group {} flush: {}", g, e));
                 }
             }
-        }
+        });
 
-        // Flush all writers for this shard
-        for w in writers.into_iter().flatten() {
-            // Drop handles flush via the Drop impl
-            drop(w);
+        let errs = errors.into_inner().unwrap();
+        if !errs.is_empty() {
+            return Err(io::Error::new(io::ErrorKind::Other, errs.join("; ")));
         }
-    });
-
-    let errs = errors.into_inner().unwrap();
-    if !errs.is_empty() {
-        return Err(io::Error::new(io::ErrorKind::Other, errs.join("; ")));
     }
 
-    // Phase 2: For each bucket index, collect all per-shard files into a
-    // single Fragment3DReader path list. We don't need to merge them into one
-    // file — Fragment3DReader::open_dir reads multiple files sequentially.
-    // Create per-bucket subdirectories with the per-shard files.
-    let mut bucket_dirs: Vec<PathBuf> = Vec::with_capacity(num_buckets);
+    // Gather each bucket's per-group files (n_groups × num_buckets existence
+    // checks — trivial vs the corpus). A bucket with no fragments has no files.
+    let mut buckets: Vec<Vec<PathBuf>> = Vec::with_capacity(num_buckets);
     for b in 0..num_buckets {
-        let bdir = bucket_dir.join(format!("b_{:04}", b));
-        std::fs::create_dir_all(&bdir)?;
-
-        // Move per-shard bucket files into this directory
-        for s in 0..n_shards {
-            let src = bucket_dir.join(format!("shard_{:03}_bucket_{:04}.mjf", s, b));
-            if src.exists() {
-                let dst = bdir.join(format!("shard_{:03}.mjf", s));
-                std::fs::rename(&src, &dst)?;
+        let mut files = Vec::new();
+        for g in 0..n_groups {
+            let p = bucket_dir.join(format!("g{:04}_b{:04}.mjf", g, b));
+            if p.exists() {
+                files.push(p);
             }
         }
-        bucket_dirs.push(bdir);
+        buckets.push(files);
     }
 
-    Ok(bucket_dirs)
+    Ok(buckets)
 }
 
 /// WS-C C.2 test probe: the maximum *actual* resident decoded-fragment bytes
@@ -1915,6 +1933,14 @@ static PEAK_RESIDENT_BYTES: std::sync::atomic::AtomicUsize =
 /// the bounded bucketing actually split the corpus. Process-global, one store
 /// per generate call — no effect on output bytes.
 static NG_LAST_BUCKET_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// WS-C test probe: the partition count `k` used by the last
+/// `read_group_simplify_encode` (3D-tiles encode). `k == 1` means the corpus fit
+/// one partition (no spill); `k > 1` proves the hash-partition spill split the
+/// corpus under the memory ceiling. Read from Python via
+/// `_get_tiles_partition_count`; one store per call, no effect on output bytes.
+static TILES_LAST_PARTITION_COUNT: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
 /// WS-B test probe (mirrors the WS-C `PEAK_RESIDENT_BYTES` pattern for the NG
@@ -1938,18 +1964,86 @@ fn observe_ng_resident_bytes(n: usize) {
     NG_PEAK_RESIDENT_BYTES.fetch_max(n, Ordering::Relaxed);
 }
 
-/// Memory-adaptive pipeline: per-zoom batched read → group → simplify → encode.
+/// Bucket-count planner for `generate_neuroglancer_multilod`. Returns the
+/// UNCAPPED ideal number of feature-buckets `k` for a corpus whose decoded
+/// resident bytes are estimated at `est_resident_bytes`, under the resolved
+/// memory ceiling `max_memory_bytes`; the caller applies the `.min(256)` cap
+/// (+ a warning when the ideal exceeds it).
 ///
-/// Processes each zoom level separately, with hash-based spatial batching to
-/// stay within the given memory budget. This scales from small datasets on
-/// laptops (128 GB) to 100+ TB datasets on large machines (768 GB+).
+/// This MIRRORS the 3D-tiles encode planner's budget headroom (see
+/// `read_group_simplify_encode`: `effective_budget = 0.8 × ceiling`, then
+/// `partition_target = 0.4 × effective_budget` = **0.32 × ceiling**). That
+/// reserves headroom for ZSTD decode beyond the 3× estimate AND for the
+/// per-feature Draco-encode buffers (`all_draco_data` / `vertex_map`) that
+/// `Fragment3D::estimate_bytes` does not count. The NG path previously divided
+/// the estimate by the *bare* ceiling (no headroom), targeting 1.0×ceiling per
+/// bucket — 3.125× too few buckets — which OOM'd the 139k-feature FlyWire-full
+/// run (~715 GB on a 754 GB host). `partition_target` floors at 1 so a zero/tiny
+/// ceiling can never divide by zero.
+fn ng_bucket_count(est_resident_bytes: usize, max_memory_bytes: usize) -> usize {
+    let effective_budget = ((max_memory_bytes as f64 * 0.8) as usize).max(1);
+    let partition_target = ((effective_budget as f64 * 0.4) as usize).max(1);
+    est_resident_bytes.div_ceil(partition_target).max(1)
+}
+
+/// WS-C Step 2b (hard-cap floor): a tile whose resident fragment bytes exceed
+/// the full ceiling cannot be split (it is written whole via one `fs::write`),
+/// so record a Fatal `3dtiles`/`ceiling_floor` failure and return a typed
+/// `OutOfMemory` error — fail fast rather than silently OOM. The message wording
+/// is preserved verbatim (tests assert the `ceiling`/`floor` substrings).
+fn floor_check(
+    largest_tile: usize,
+    max_memory_bytes: usize,
+    largest_tile_key: (u32, u32, u32, u32),
+    collector: &ErrorCollector,
+) -> io::Result<()> {
+    if largest_tile > max_memory_bytes {
+        let (tz, tx, ty, td) = largest_tile_key;
+        let tile_id = format!("{}/{}/{}/{}", tz, tx, ty, td);
+        collector.record_failure(
+            "3dtiles",
+            Severity::Fatal,
+            &tile_id,
+            "ceiling_floor",
+            &format!(
+                "tile resident {} bytes exceeds memory ceiling {} bytes \
+                 (irreducible: a tile is written whole)",
+                largest_tile, max_memory_bytes,
+            ),
+        );
+        return Err(io::Error::new(
+            io::ErrorKind::OutOfMemory,
+            format!(
+                "ceiling_floor: tile {} resident {} bytes exceeds memory \
+                 ceiling {} bytes",
+                tile_id, largest_tile, max_memory_bytes,
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Memory-bounded 3D-tiles encode via single-pass tile-key hash-partition spill
+/// (GRACE-style external grouping).
 ///
-/// For each zoom level, estimates how many batches are needed to fit within
-/// `max_memory_bytes`, then for each batch reads all fragment files (keeping
-/// only matching zoom + batch), groups by tile key, simplifies, and encodes.
+/// Pass 1: read every ingest shard ONCE and route each fragment by
+/// `hash(tile_z, tile_x, tile_y, tile_d)` into one of K on-disk partitions
+/// (`redistribute_fragments_to_buckets`, `simplify=false`). Pass 2: encode each
+/// partition in isolation (read once, group by tile key, encode). Peak resident
+/// is bounded BEFORE materialization — K is sized from the on-disk estimate so
+/// one partition targets ~0.4×budget — rather than measured AFTER an over-read,
+/// which is what let the former reactive per-zoom resplit loop OOM on its first
+/// coarse-estimate batch. I/O is read+write+read (≈3×), K-independent, vs the
+/// old K× full re-reads.
 ///
-/// Fragment files are re-read for each (zoom, batch) pass. Sequential I/O and
-/// OS page cache make re-reads fast.
+/// K is corpus-wide: the hash includes `tile_z`, so all zooms are partitioned in
+/// one pass (no per-zoom re-reads). `k == 1` (the corpus fits one partition)
+/// skips the spill and reads/encodes `frag_dir` directly.
+///
+/// The irreducible-single-tile floor (`ceiling_floor`) is detected per partition
+/// (it is data-dependent — detectable, not preventable). Output GLB bytes are
+/// byte-identical to a single-batch encode: same tile grouping, same `frag_cmp`
+/// within-tile sort in `_encode_grouped_fragments`, `simplify=false`.
 ///
 /// Returns (tile_count, tile_keys).
 fn read_group_simplify_encode(
@@ -1965,26 +2059,6 @@ fn read_group_simplify_encode(
     io_threads: usize,
     collector: &ErrorCollector,
 ) -> io::Result<(u32, Vec<(u32, u32, u32, u32)>)> {
-    use dashmap::DashMap;
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-
-    // WS-C C.3 (Option A): cap the per-zoom read concurrency at the I/O-thread
-    // count (≤16, mirroring the Parquet `read_k` cap at the overlap read site).
-    // `io_threads == 0` means "use the ambient global rayon pool" (the parallel
-    // default); `1` is the serial fallback; `N>1` runs the per-zoom read on a
-    // scoped pool of N threads. This is I/O scheduling only — it does not change
-    // which fragments land in which tile, so GLB output stays byte-identical
-    // (the per-tile `feature_id` sort, C.4, canonicalizes within-tile order).
-    let read_pool: Option<rayon::ThreadPool> = if io_threads > 1 {
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(io_threads.min(16))
-            .build()
-            .ok()
-    } else {
-        None
-    };
-
     // Discover fragment files
     let mut all_paths: Vec<PathBuf> = std::fs::read_dir(frag_dir)?
         .filter_map(|e| e.ok())
@@ -1997,303 +2071,133 @@ fn read_group_simplify_encode(
         return Ok((0, Vec::new()));
     }
 
-    // Partition fragment files by zoom level based on naming convention:
-    //   "frag_XXXXX.mjf"       → plain: contains ALL zoom levels (small neurons)
-    //   "frag_XXXXX_zN.mjf"    → zoom-specific: coarse zoom N only (large neurons)
-    //   "frag_XXXXX_cXXXX.mjf" → chunk: max_zoom only (large neurons)
-    let mut files_per_zoom: Vec<Vec<PathBuf>> = (0..=max_zoom).map(|_| Vec::new()).collect();
-    let mut mixed_files: Vec<PathBuf> = Vec::new();
+    // Clear any stale spill scratch from a prior (possibly errored) K>1 call on a
+    // REUSED generator (EMIT-ALL reuses one generator across generate_3dtiles +
+    // generate_parquet), so the gather step never picks up orphaned partitions.
+    let _ = std::fs::remove_dir_all(frag_dir.join("buckets"));
 
-    for path in &all_paths {
-        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-        if let Some(pos) = stem.rfind("_z") {
-            // Zoom-specific file: frag_XXXXX_zN
-            if let Ok(z) = stem[pos + 2..].parse::<u32>() {
-                if z <= max_zoom {
-                    files_per_zoom[z as usize].push(path.clone());
-                }
-            } else {
-                mixed_files.push(path.clone());
-            }
-        } else if stem.contains("_c") {
-            // Chunk file: frag_XXXXX_cXXXX → max_zoom only
-            // Verify it's actually a chunk pattern (ends with digits after _c)
-            if let Some(pos) = stem.rfind("_c") {
-                if stem[pos + 2..].parse::<u32>().is_ok() {
-                    files_per_zoom[max_zoom as usize].push(path.clone());
-                } else {
-                    mixed_files.push(path.clone());
-                }
-            }
-        } else {
-            // Plain file: contains all zoom levels
-            mixed_files.push(path.clone());
-        }
-    }
-
-    // Add mixed (all-zoom) files to every zoom level
-    for zoom_files in &mut files_per_zoom {
-        zoom_files.extend(mixed_files.iter().cloned());
-        zoom_files.sort(); // maintain deterministic order
-    }
-
-    // Log partition info
-    for (z, files) in files_per_zoom.iter().enumerate() {
-        let disk_bytes: u64 = files.iter()
-            .filter_map(|p| std::fs::metadata(p).ok())
-            .map(|m| m.len())
-            .sum();
+    // Single-pass tile-key hash-partition spill (GRACE-style external grouping).
+    // K is sized PREVENTIVELY from the on-disk estimate so each partition's
+    // resident set fits well under the budget BEFORE it is materialized — unlike
+    // the former reactive read-then-measure-then-reread loop, which could OOM on
+    // the first over-read of a coarse estimate. Hashing on the full tile key
+    // (incl. tile_z) partitions all zooms in one pass, so there are no per-zoom
+    // re-reads. (This mirrors the disk×3 / capped-K convention of the NG
+    // `generate_neuroglancer_multilod` path; see the resident WARNING below for
+    // the rare case where the 3× estimate under-counts.)
+    let total_disk: u64 = all_paths
+        .iter()
+        .filter_map(|p| std::fs::metadata(p).ok())
+        .map(|m| m.len())
+        .sum();
+    let effective_budget = ((max_memory_bytes as f64 * 0.8) as usize).max(1);
+    // Target each partition at 0.4×budget: leaves headroom for ZSTD expansion
+    // beyond the ~3× estimate AND for the encode stage's GLB buffers (which
+    // `estimate_bytes` does not count).
+    let partition_target = ((effective_budget as f64 * 0.4) as usize).max(1);
+    let est_resident = (total_disk as f64 * 3.0) as usize; // ZSTD ~3×
+    let k_ideal = est_resident.div_ceil(partition_target).max(1);
+    let k = k_ideal.min(256);
+    if k_ideal > 256 {
+        // NOT silently capped: the corpus is so large vs the budget that even 256
+        // partitions each exceed the per-partition target, so peak per partition
+        // (~est_resident/256) will run higher than planned. Raise the ceiling
+        // (MUDM_MAX_MEMORY_GB) if this approaches physical RAM.
         eprintln!(
-            "[encode] zoom {}: {} files ({:.1} GB on disk)",
-            z, files.len(), disk_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+            "[encode] WARNING: corpus needs {} partitions for the {}-byte target \
+             but K is capped at 256; per-partition peak (~{} bytes) may exceed it.",
+            k_ideal, partition_target, est_resident / 256,
         );
     }
+    TILES_LAST_PARTITION_COUNT.store(k, Ordering::Relaxed);
+    eprintln!(
+        "[encode] {} shard files, {:.1} GB on disk → {} partition(s)",
+        all_paths.len(),
+        total_disk as f64 / (1024.0 * 1024.0 * 1024.0),
+        k,
+    );
 
-    // WS-C C.1: process zoom levels SERIALLY (one zoom resident at a time) so
-    // peak decoded-fragment residency is ~one zoom's batch rather than
-    // `(max_zoom+1) × per-zoom budget` when all zooms ran concurrently
-    // (`into_par_iter`). Parallelism is retained INSIDE each zoom: the per-zoom
-    // `zoom_files.par_iter()` read below and the encode `par_iter` in
-    // `_encode_grouped_fragments`. A tile's GLB bytes are independent of which
-    // zoom is scheduled when, so this is byte-neutral (changes peak memory and
-    // scheduling only).
-    let results: Vec<io::Result<(u32, Vec<(u32, u32, u32, u32)>)>> =
-        files_per_zoom.into_iter().enumerate().map(|(zoom_idx, zoom_files)| {
-            let zoom = zoom_idx as u32;
-
-            // Estimate memory for this zoom from actual file sizes
-            let zoom_disk_bytes: u64 = zoom_files.iter()
-                .filter_map(|p| std::fs::metadata(p).ok())
-                .map(|m| m.len())
-                .sum();
-            let zoom_estimate = (zoom_disk_bytes as f64 * 3.0) as usize; // ZSTD ~3x
-
-            // WS-C C.2: derive the per-zoom byte budget from the WS-0 ceiling
-            // (`max_memory_bytes`, == `self.max_memory_bytes` when no explicit
-            // per-call budget was given). The `disk_bytes × 3.0` guess only
-            // seeds the INITIAL `n_batches`; after a batch's DashMap is built we
-            // re-check the ACTUAL resident bytes (Σ `Fragment3D::estimate_bytes`)
-            // and re-split (increase `n_batches`, re-read the whole zoom) when a
-            // batch overshoots — mirroring the Parquet byte-budget chunker. This
-            // bounds peak resident decoded bytes to the budget instead of merely
-            // reducing it. The irreducible floor (one TILE > the full ceiling)
-            // is detected per batch and surfaced as a Fatal `ceiling_floor`
-            // (collect-then-raise at the caller), per spec §WS-0.
-            let effective_budget = ((max_memory_bytes as f64 * 0.8) as usize).max(1);
-            let mut n_batches =
-                ((zoom_estimate + effective_budget - 1) / effective_budget).max(1);
-
-            // Re-split loop: keep increasing `n_batches` until no batch's actual
-            // resident set overshoots the budget for a *reducible* reason (i.e.
-            // a batch holds >1 tile and could be split further). A batch whose
-            // overshoot is a single tile larger than the budget is irreducible
-            // by hash-batching: it is accepted if it fits the full ceiling, or
-            // raised as a floor violation if it does not.
-            'resplit: loop {
-                let n_b = n_batches;
-                let mut zoom_count = 0u32;
-                let mut zoom_keys = Vec::new();
-                let mut needs_resplit = false;
-
-                for batch in 0..n_b {
-                    let groups: DashMap<(u32, u32, u32, u32), Vec<Fragment3D>> = DashMap::new();
-
-                    // WS-C C.3 (Option A): the per-zoom read body. `prefetch_advise`
-                    // issues a best-effort OS readahead hint (posix_fadvise on
-                    // Linux, mmap+madvise elsewhere) BEFORE the decoder opens the
-                    // shard, overlapping open()+decode. Both the hint and the
-                    // scoped-pool scheduling are I/O-only: identical fragments are
-                    // grouped into identical tiles regardless, so GLB bytes are
-                    // unchanged.
-                    let read_one = |path: &PathBuf| {
-                        prefetch_advise(path);
-                        let mut reader = match Fragment3DReader::new(path) {
-                            Ok(r) => r,
-                            Err(_) => return,
-                        };
-
-                        let mut local: AHashMap<(u32, u32, u32, u32), Vec<Fragment3D>> = AHashMap::new();
-
-                        loop {
-                            match reader.read_next() {
-                                Ok(Some(frag)) => {
-                                    // Filter: only this zoom level (needed for mixed files)
-                                    if frag.tile_z != zoom {
-                                        continue;
-                                    }
-
-                                    // Filter: only this batch (by tile key hash)
-                                    if n_b > 1 {
-                                        let mut hasher = DefaultHasher::new();
-                                        (frag.tile_x, frag.tile_y, frag.tile_d).hash(&mut hasher);
-                                        if (hasher.finish() as usize) % n_b != batch {
-                                            continue;
-                                        }
-                                    }
-
-                                    let key = (frag.tile_z, frag.tile_x, frag.tile_y, frag.tile_d);
-                                    local.entry(key).or_default().push(frag);
-                                }
-                                Ok(None) => break,
-                                Err(_) => break,
-                            }
-                        }
-
-                        // Batch-insert into shared DashMap
-                        for (key, mut frags) in local {
-                            groups.entry(key).or_default().extend(frags.drain(..));
-                        }
-                    };
-
-                    // Run the read on the capped `io_threads` scoped pool when one
-                    // was built (`io_threads > 1`); otherwise on the ambient pool
-                    // (`io_threads == 0`, parallel default) / serially via rayon's
-                    // single-thread behavior under `MUDM_IO_THREADS=1`.
-                    match &read_pool {
-                        Some(pool) => pool.install(|| zoom_files.par_iter().for_each(&read_one)),
-                        None => zoom_files.par_iter().for_each(&read_one),
-                    }
-
-                    // WS-C C.2 back-pressure: measure the ACTUAL resident bytes
-                    // of this batch's DashMap and the largest single tile within
-                    // it (the irreducible unit — written whole via `fs::write`).
-                    let mut batch_resident: usize = 0;
-                    let mut largest_tile: usize = 0;
-                    let mut largest_tile_key = (0u32, 0u32, 0u32, 0u32);
-                    for entry in groups.iter() {
-                        let tile_bytes: usize =
-                            entry.value().iter().map(|f| f.estimate_bytes()).sum();
-                        batch_resident += tile_bytes;
-                        if tile_bytes > largest_tile {
-                            largest_tile = tile_bytes;
-                            largest_tile_key = *entry.key();
-                        }
-                    }
-
-                    // Step 2b (hard-cap floor): a single tile exceeding the full
-                    // ceiling cannot be split (it is one `fs::write`). Record a
-                    // Fatal `ceiling_floor` failure and bail; the caller (GIL
-                    // frame) checks `had_fatal()` and raises the typed error.
-                    if largest_tile > max_memory_bytes {
-                        let (tz, tx, ty, td) = largest_tile_key;
-                        let tile_id = format!("{}/{}/{}/{}", tz, tx, ty, td);
-                        collector.record_failure(
-                            "3dtiles",
-                            Severity::Fatal,
-                            &tile_id,
-                            "ceiling_floor",
-                            &format!(
-                                "tile resident {} bytes exceeds memory ceiling {} bytes \
-                                 (irreducible: a tile is written whole)",
-                                largest_tile, max_memory_bytes,
-                            ),
-                        );
-                        return Err(io::Error::new(
-                            io::ErrorKind::OutOfMemory,
-                            format!(
-                                "ceiling_floor: tile {} resident {} bytes exceeds memory \
-                                 ceiling {} bytes",
-                                tile_id, largest_tile, max_memory_bytes,
-                            ),
-                        ));
-                    }
-
-                    // If the batch overshoots the budget AND the overshoot is
-                    // reducible (the largest tile itself fits the budget, so
-                    // re-splitting can shrink this batch), trigger a re-split.
-                    // An overshoot caused by one tile larger than the budget but
-                    // within the ceiling is accepted as-is (hash-batching cannot
-                    // split a single tile further).
-                    if batch_resident > effective_budget && largest_tile <= effective_budget {
-                        needs_resplit = true;
-                        break;
-                    }
-
-                    observe_resident_bytes(batch_resident);
-
-                    // Encode this batch's tile groups
-                    let owned: AHashMap<(u32, u32, u32, u32), Vec<Fragment3D>> =
-                        groups.into_iter().collect();
-
-                    if !owned.is_empty() {
-                        let (count, keys) = _encode_grouped_fragments(
-                            owned, tags_registry, out_dir,
-                            xmin, ymin, zmin, dx, dy, dz,
-                            max_zoom, base_cells, effective_compression,
-                            collector,
-                        )?;
-                        zoom_count += count;
-                        zoom_keys.extend(keys);
-                    }
-                }
-
-                if needs_resplit {
-                    // Double the split granularity and re-read the whole zoom.
-                    // Anything already encoded this pass is overwritten by the
-                    // re-read (same tile keys → same `fs::write` targets), so the
-                    // final output is independent of the discarded partial pass.
-                    n_batches = n_batches.saturating_add(1).max(n_batches * 2);
-                    continue 'resplit;
-                }
-
-                eprintln!("[encode] zoom {} done: {} tiles", zoom, zoom_count);
-                break 'resplit Ok((zoom_count, zoom_keys));
+    // Measure → floor-check → record peak → encode one partition's tile groups.
+    // Shared by the K==1 fast path and the per-partition loop.
+    let encode_groups =
+        |groups: ahash::AHashMap<(u32, u32, u32, u32), Vec<Fragment3D>>|
+         -> io::Result<(u32, Vec<(u32, u32, u32, u32)>)> {
+            if groups.is_empty() {
+                return Ok((0, Vec::new()));
             }
-        }).collect();
+            let mut resident: usize = 0;
+            let mut largest_tile: usize = 0;
+            let mut largest_tile_key = (0u32, 0u32, 0u32, 0u32);
+            for (key, frags) in &groups {
+                let tile_bytes: usize = frags.iter().map(|f| f.estimate_bytes()).sum();
+                resident += tile_bytes;
+                if tile_bytes > largest_tile {
+                    largest_tile = tile_bytes;
+                    largest_tile_key = *key;
+                }
+            }
+            floor_check(largest_tile, max_memory_bytes, largest_tile_key, collector)?;
+            if resident > effective_budget {
+                // The 3× disk estimate under-counted (data more compressible than
+                // assumed, or tile-key hash skew concentrated this partition):
+                // peak for this partition runs above plan. Visible, not fatal — it
+                // still fits the full ceiling unless floor_check above fired.
+                eprintln!(
+                    "[encode] WARNING: partition resident {} bytes exceeds the \
+                     {}-byte soft budget (compression worse than the 3× estimate \
+                     or skewed tile keys); peak this partition is higher than planned.",
+                    resident, effective_budget,
+                );
+            }
+            observe_resident_bytes(resident);
+            _encode_grouped_fragments(
+                groups, tags_registry, out_dir,
+                xmin, ymin, zmin, dx, dy, dz,
+                max_zoom, base_cells, effective_compression, collector,
+            )
+        };
 
-    // Aggregate results from all zoom levels
+    // K==1 fast path: the whole corpus fits one partition — read + group +
+    // encode directly, with NO spill write/read pass. Reads in PARALLEL (L1,
+    // streaming_review.md — this most-common path was the only serial read):
+    // same multiset as the serial read, and `_encode_grouped_fragments`
+    // canonicalizes within-tile order, so the GLB bytes are unchanged.
+    if k == 1 {
+        let groups = Fragment3DReader::from_paths(all_paths)
+            .read_all_grouped_parallel(io_threads, true)?;
+        let (count, keys) = encode_groups(groups)?;
+        eprintln!("[encode] done: {} tiles (single partition, no spill)", count);
+        return Ok((count, keys));
+    }
+
+    // K>1: spill once into K tile-key partitions (`simplify=false` — the encode
+    // stage runs `do_simplify=false`, so fragments pass through verbatim and the
+    // output stays byte-identical), then encode each partition in isolation. One
+    // partition is resident at a time, so peak ≈ corpus/K, bounded before read.
+    let buckets =
+        redistribute_fragments_to_buckets(frag_dir, k, max_zoom, base_cells, false)?;
+
     let mut total_count = 0u32;
     let mut all_tile_keys = Vec::new();
-    for result in results {
-        let (count, keys) = result?;
+    for (bi, files) in buckets.into_iter().enumerate() {
+        if files.is_empty() {
+            continue;
+        }
+        // Bounded to one partition (~corpus/K); read in parallel, group by tile.
+        let groups = Fragment3DReader::from_paths(files)
+            .read_all_grouped_parallel(io_threads, true)?;
+        let (count, keys) = encode_groups(groups)?;
+        eprintln!("[encode] partition {}/{}: {} tiles", bi + 1, k, count);
         total_count += count;
         all_tile_keys.extend(keys);
     }
 
+    // Best-effort spill-scratch cleanup (the caller's temp-dir teardown would
+    // otherwise reclaim it).
+    let _ = std::fs::remove_dir_all(frag_dir.join("buckets"));
+    eprintln!("[encode] done: {} tiles across {} partition(s)", total_count, k);
+
     Ok((total_count, all_tile_keys))
-}
-
-/// Encode all tiles from a bucket directory into GLB files.
-///
-/// The bucket_dir contains one or more `.mjf` shard files for this bucket.
-///
-/// Returns (tile_count, tile_keys).
-fn encode_bucket_to_3dtiles(
-    bucket_dir: &Path,
-    tags_registry: &HashMap<u32, Vec<(String, TagValue)>>,
-    out_dir: &Path,
-    xmin: f64, ymin: f64, zmin: f64,
-    dx: f64, dy: f64, dz: f64,
-    max_zoom: u32,
-    base_cells: u32,
-    effective_compression: &str,
-    collector: &ErrorCollector,
-) -> io::Result<(u32, Vec<(u32, u32, u32, u32)>)> {
-    // Read all fragments from this bucket's shard files and group by tile key
-    let mut reader = Fragment3DReader::open_dir(bucket_dir)?;
-    let groups = reader.read_all_grouped()?;
-    _encode_grouped_fragments(groups, tags_registry, out_dir,
-        xmin, ymin, zmin, dx, dy, dz, max_zoom, base_cells, effective_compression,
-        collector)
-}
-
-/// Encode a single bucket file into GLB tiles.
-fn encode_bucket_file_to_3dtiles(
-    bucket_file: &Path,
-    tags_registry: &HashMap<u32, Vec<(String, TagValue)>>,
-    out_dir: &Path,
-    xmin: f64, ymin: f64, zmin: f64,
-    dx: f64, dy: f64, dz: f64,
-    max_zoom: u32,
-    base_cells: u32,
-    effective_compression: &str,
-    collector: &ErrorCollector,
-) -> io::Result<(u32, Vec<(u32, u32, u32, u32)>)> {
-    let mut reader = Fragment3DReader::new(bucket_file)?;
-    let groups = reader.read_all_grouped()?;
-    _encode_grouped_fragments(groups, tags_registry, out_dir,
-        xmin, ymin, zmin, dx, dy, dz, max_zoom, base_cells, effective_compression,
-        collector)
 }
 
 /// Shared encoding logic for grouped fragments.
@@ -2369,6 +2273,12 @@ fn _encode_grouped_fragments(
             let data = match effective_compression {
                 "draco" => encoder_glb::encode_glb_draco(&features, 50),
                 "meshopt" => encoder_glb::encode_glb_meshopt(&features, 50),
+                // meshopt-u16 quick win (doc §7.5): KHR_mesh_quantization positions.
+                // "meshopt-q" defaults to q14 (gltfpack/Draco-GLB convention,
+                // visually lossless for these surfaces); suffix selects precision.
+                "meshopt-q" | "meshopt-q14" => encoder_glb::encode_glb_meshopt_quantized(&features, 50, 14),
+                "meshopt-q16" => encoder_glb::encode_glb_meshopt_quantized(&features, 50, 16),
+                "meshopt-q10" => encoder_glb::encode_glb_meshopt_quantized(&features, 50, 10),
                 _ => encoder_glb::encode_glb(&features),
             };
             let tile_path = out_dir
@@ -2870,20 +2780,29 @@ fn native_writer_props(
 }
 
 /// Rust analogue of Python `_RotatingWriter`: appends row batches to
-/// `{dir}/part_{idx:03}.parquet`, rotating to a new part when the current part's
+/// `{dir}/part_{idx:03}.mu.parquet`, rotating to a new part when the current part's
 /// cumulative uncompressed-binary bytes would exceed `max_file_bytes`. State
 /// persists across shard chunks, so one part file may span multiple chunks.
 ///
-/// NOTE: superseded by `run_native_partitioned`'s per-zoom part-splitting (which
-/// fans ZSTD across cores). Retained for a possible single-writer-per-zoom mode.
-#[allow(dead_code)]
+/// Wired into `run_native_partitioned` as the per-zoom CROSS-CHUNK accumulator:
+/// one open writer per zoom, so part files span byte-chunks and rotate only when
+/// cumulative bytes exceed `max_file_bytes`. This is the de-fragmentation fix —
+/// it replaces the old per-chunk grain-64 split (`consume_chunk`) that emitted a
+/// fresh part set for every chunk (yielding tens of thousands of tiny parts).
 struct RotatingWriterRs {
     dir: std::path::PathBuf,
     schema: std::sync::Arc<arrow::datatypes::Schema>,
     props: std::sync::Arc<parquet::file::properties::WriterProperties>,
     max_file_bytes: u64,
+    /// Byte target for the IN-MEMORY row group; the writer flushes the current
+    /// row group once it reaches this, bounding resident RAM (the parquet
+    /// ArrowWriter otherwise only auto-flushes by ROW COUNT, default ~1M).
+    row_group_target: u64,
     idx: u32,
     cum_bytes: u64,
+    /// Uncompressed-binary bytes buffered in the CURRENT (un-flushed) row group,
+    /// persisted across chunk writes so cross-chunk accumulation stays bounded.
+    rg_bytes: u64,
     writer: Option<parquet::arrow::ArrowWriter<std::fs::File>>,
 }
 
@@ -2894,7 +2813,17 @@ impl RotatingWriterRs {
         props: std::sync::Arc<parquet::file::properties::WriterProperties>,
         max_file_bytes: u64,
     ) -> Self {
-        Self { dir, schema, props, max_file_bytes, idx: 0, cum_bytes: 0, writer: None }
+        // Row-group byte target: bounds in-memory buffering (128 MB default;
+        // env-overridable for tuning/tests).
+        let row_group_target = std::env::var("MUDM_PARQUET_ROW_GROUP_BYTES")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(128 * 1024 * 1024);
+        Self {
+            dir, schema, props, max_file_bytes, row_group_target,
+            idx: 0, cum_bytes: 0, rg_bytes: 0, writer: None,
+        }
     }
 
     /// Write one zoom's rows for one chunk, rotating first if the current part
@@ -2922,11 +2851,13 @@ impl RotatingWriterRs {
             }
             self.idx += 1;
             self.cum_bytes = 0;
+            self.rg_bytes = 0; // new file -> fresh row group
         }
         if self.writer.is_none() {
             std::fs::create_dir_all(&self.dir)
                 .map_err(|e| format!("mkdir {}: {}", self.dir.display(), e))?;
-            let path = self.dir.join(format!("part_{:03}.parquet", self.idx));
+            // muDM tile-geometry parquet (custom schema, NOT GeoParquet) — see mudm-data .mu.parquet convention
+            let path = self.dir.join(format!("part_{:03}.mu.parquet", self.idx));
             let file = std::fs::File::create(&path)
                 .map_err(|e| format!("create {}: {}", path.display(), e))?;
             let w = parquet::arrow::ArrowWriter::try_new(
@@ -2938,25 +2869,41 @@ impl RotatingWriterRs {
             self.writer = Some(w);
         }
 
-        // Split into sub-batches under the 1.5 GB Arrow LargeBinary offset guard.
+        // Bound the IN-MEMORY row group by BYTES. The parquet ArrowWriter only
+        // auto-flushes a row group by ROW COUNT (default ~1,048,576); for large-
+        // binary mesh rows that buffers GBs before any flush, and file rotation
+        // only fires BETWEEN write() calls — so without this a single chunk's
+        // zoom rows could buffer multi-GB per open writer (the finest-zoom OOM
+        // class). `rg_bytes` persists across chunk writes, so we flush the row
+        // group once cumulative bytes reach `target` (also keeping each
+        // RecordBatch under the 1.5 GB LargeBinary offset guard). Deterministic:
+        // the single ordered consumer feeds a fixed row sequence -> fixed flush
+        // boundaries -> thread-count-independent part bytes.
         const SUB_LIMIT: u64 = 1_500_000_000;
-        let w = self.writer.as_mut().unwrap();
-        let mut start = 0usize;
-        let mut acc = 0u64;
-        for i in 0..rows.len() {
-            let rb = (rows[i].positions.len() + rows[i].indices.len()) as u64;
-            if acc > 0 && acc + rb > SUB_LIMIT {
-                let batch = build_batch_no_zoom(&rows[start..i], tags)?;
-                w.write(&batch).map_err(|e| format!("write: {}", e))?;
-                start = i;
-                acc = 0;
+        let target = self.row_group_target.min(SUB_LIMIT).max(1);
+        let mut rg = self.rg_bytes;
+        {
+            let w = self.writer.as_mut().unwrap();
+            let mut start = 0usize;
+            for i in 0..rows.len() {
+                let rb = (rows[i].positions.len() + rows[i].indices.len()) as u64;
+                if rg > 0 && rg + rb > target {
+                    if start < i {
+                        let batch = build_batch_no_zoom(&rows[start..i], tags)?;
+                        w.write(&batch).map_err(|e| format!("write: {}", e))?;
+                        start = i;
+                    }
+                    w.flush().map_err(|e| format!("flush row group: {}", e))?;
+                    rg = 0;
+                }
+                rg += rb;
             }
-            acc += rb;
+            if start < rows.len() {
+                let batch = build_batch_no_zoom(&rows[start..], tags)?;
+                w.write(&batch).map_err(|e| format!("write: {}", e))?;
+            }
         }
-        if start < rows.len() {
-            let batch = build_batch_no_zoom(&rows[start..], tags)?;
-            w.write(&batch).map_err(|e| format!("write: {}", e))?;
-        }
+        self.rg_bytes = rg;
         self.cum_bytes += batch_bytes;
         Ok(())
     }
@@ -2966,6 +2913,20 @@ impl RotatingWriterRs {
             w.close().map_err(|e| format!("close: {}", e))?;
         }
         Ok(())
+    }
+}
+
+impl Drop for RotatingWriterRs {
+    /// Best-effort finalize so a mid-run error (which skips the explicit close
+    /// loop in `run_native_partitioned`) cannot leave a footerless / unreadable
+    /// part file on disk. The parquet footer is written ONLY by ArrowWriter::close
+    /// — without this, a dropped-while-open writer yields a corrupt file. Errors
+    /// during unwind are unrecoverable, so they're swallowed; the normal path
+    /// still calls close() explicitly to surface real write errors.
+    fn drop(&mut self) {
+        if let Some(w) = self.writer.take() {
+            let _ = w.close();
+        }
     }
 }
 
@@ -2989,6 +2950,11 @@ fn read_chunk_sorted(
         .map_err(|e| e.to_string())?
         .into_iter()
         .collect();
+    // H1a (streaming_review.md): canonicalize the TILE order too. The map
+    // iterates in ahash order, which is seeded per-instance — random per run —
+    // and parquet row order is tile order × within-tile order, so sorting only
+    // within tiles left the emitted row order nondeterministic run-to-run.
+    tiles.sort_by_key(|(k, _)| *k);
     for (_k, v) in tiles.iter_mut() {
         v.sort_by(crate::fragment::frag_cmp);
     }
@@ -2996,11 +2962,18 @@ fn read_chunk_sorted(
 }
 
 /// Transform one chunk's tiles -> rows, partition by zoom, and write each zoom's
-/// rows as ~cores parallel part files (parallel ZSTD). Mutates `part_counter`
+/// rows as parallel part files (parallel ZSTD). Mutates `part_counter`
 /// (deterministic, single-caller) and returns the chunk's row count. The
 /// `into_par_iter()` write uses the CURRENT rayon pool (the dedicated consumer
-/// pool when overlapping). Byte-identical to the sequential write path.
+/// pool when overlapping). Byte-identical to the sequential write path: the
+/// part SPLITTING uses a fixed grain (H1b) and the input `tiles` arrive fully
+/// canonicalized (H1a), so neither thread count nor branch affects the bytes.
+///
+/// SUPERSEDED by `consume_chunk_rotating` (cross-chunk de-fragmentation): this
+/// per-chunk split emitted a fresh part set for every byte-chunk (the tens-of-
+/// thousands-of-tiny-parts root cause). Retained for reference / the grain logic.
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
 fn consume_chunk(
     tiles: &[((u32, u32, u32, u32), Vec<Fragment3D>)],
     out: &std::path::Path,
@@ -3030,7 +3003,17 @@ fn consume_chunk(
         .map(|r| (r.positions.len() + r.indices.len()) as u64)
         .sum::<u64>()
         .max(1);
-    let cores = rayon::current_num_threads().max(1) as u64;
+    // H1b (streaming_review.md): part-splitting must be CONTENT-deterministic.
+    // This previously used rayon::current_num_threads(), which differs between
+    // the overlap branch (the (cores − read_k)-wide consumer pool) and the
+    // serial branch (the global pool), and varies with RAYON_NUM_THREADS — so
+    // part boundaries/numbering changed with the thread count whenever the
+    // parallelism term was binding (zoom bytes ≥ 16 MB × cores). A fixed
+    // splitting grain keeps the file layout identical everywhere; the parallel
+    // write below still uses however many threads actually exist (scheduling
+    // is free — the SLICING is what must be stable).
+    const PART_SPLIT_GRAIN: u64 = 64;
+    let grain = PART_SPLIT_GRAIN;
     let mut zoom_vecs: Vec<(u32, Vec<ParquetRow>)> = by_zoom.into_iter().collect();
     zoom_vecs.sort_by_key(|(z, _)| *z);
 
@@ -3044,7 +3027,7 @@ fn consume_chunk(
             .map(|r| (r.positions.len() + r.indices.len()) as u64)
             .sum();
         const MIN_PART_BYTES: u64 = 16 * 1024 * 1024;
-        let by_parallel = (cores * zbytes + total_bytes - 1) / total_bytes;
+        let by_parallel = (grain * zbytes + total_bytes - 1) / total_bytes;
         let by_size = (zbytes + max_file_bytes.max(1) - 1) / max_file_bytes.max(1);
         let cap_minsize = (zbytes / MIN_PART_BYTES).max(1);
         let n_parts = by_parallel
@@ -3069,7 +3052,8 @@ fn consume_chunk(
             let dir = out.join(format!("zoom={}", z));
             std::fs::create_dir_all(&dir)
                 .map_err(|e| format!("mkdir {}: {}", dir.display(), e))?;
-            let path = dir.join(format!("part_{:03}.parquet", idx));
+            // muDM tile-geometry parquet (custom schema, NOT GeoParquet) — see mudm-data .mu.parquet convention
+            let path = dir.join(format!("part_{:03}.mu.parquet", idx));
             let batch = build_batch_no_zoom(slice, tags)?;
             let file = std::fs::File::create(&path)
                 .map_err(|e| format!("create {}: {}", path.display(), e))?;
@@ -3087,6 +3071,64 @@ fn consume_chunk(
     let mut chunk_total = 0u64;
     for r in results {
         chunk_total += r?;
+    }
+    Ok(chunk_total)
+}
+
+/// Transform one chunk's tiles -> rows, partition by zoom, and APPEND each zoom's
+/// rows to its PERSISTENT `RotatingWriterRs` in `writers` (one open writer per
+/// zoom, kept across all chunks). Part files therefore span chunks and rotate
+/// only when a zoom's cumulative bytes exceed `max_file_bytes` — this is the
+/// de-fragmentation fix (replaces `consume_chunk`'s fresh per-chunk part set).
+///
+/// Determinism: the single ORDERED consumer feeds chunks in fixed order and
+/// `tiles` arrive canonicalized (H1a), so each per-zoom writer sees a stable row
+/// sequence -> stable part bytes, independent of thread count (the H1b property,
+/// now via accumulation rather than a fixed grain). Bounded memory: peak resident
+/// is the current chunk plus one in-flight row group (bounded by `row_group_target`,
+/// 128 MB default, of source bytes) per open zoom writer — independent of chunk count.
+#[allow(clippy::too_many_arguments)]
+fn consume_chunk_rotating(
+    tiles: &[((u32, u32, u32, u32), Vec<Fragment3D>)],
+    out: &std::path::Path,
+    schema: &std::sync::Arc<arrow::datatypes::Schema>,
+    props: &std::sync::Arc<parquet::file::properties::WriterProperties>,
+    tags: &HashMap<u32, Vec<(String, TagValue)>>,
+    world_bounds: (f64, f64, f64, f64, f64, f64),
+    max_zoom: u32,
+    base_cells: u32,
+    max_file_bytes: u64,
+    writers: &mut std::collections::HashMap<u32, RotatingWriterRs>,
+) -> Result<u64, String> {
+    use std::collections::HashMap as StdHashMap;
+
+    let rows = collect_parquet_rows(tiles, &world_bounds, max_zoom, base_cells);
+    if rows.is_empty() {
+        return Ok(0);
+    }
+    let mut by_zoom: StdHashMap<u32, Vec<ParquetRow>> = StdHashMap::new();
+    for r in rows {
+        by_zoom.entry(r.zoom as u32).or_default().push(r);
+    }
+    // Deterministic zoom order (mirrors consume_chunk's canonical ordering).
+    let mut zoom_vecs: Vec<(u32, Vec<ParquetRow>)> = by_zoom.into_iter().collect();
+    zoom_vecs.sort_by_key(|(z, _)| *z);
+
+    let mut chunk_total = 0u64;
+    for (z, zrows) in &zoom_vecs {
+        if zrows.is_empty() {
+            continue;
+        }
+        let w = writers.entry(*z).or_insert_with(|| {
+            RotatingWriterRs::new(
+                out.join(format!("zoom={}", z)),
+                schema.clone(),
+                props.clone(),
+                max_file_bytes,
+            )
+        });
+        w.write(zrows, tags)?;
+        chunk_total += zrows.len() as u64;
     }
     Ok(chunk_total)
 }
@@ -3142,7 +3184,14 @@ fn run_native_partitioned(
         // DEDICATED (cores-K)-wide pool to avoid oversubscription with the read
         // pool; build_global is NOT used (other call sites need the full pool).
         let cores = rayon::current_num_threads().max(1);
-        let read_k = if io_threads == 0 { 12 } else { io_threads.min(16) };
+        // M4 (streaming_review.md): never starve the consumer on small hosts.
+        // Readers block on I/O + zstd; the consumer runs the QEM-heavy
+        // transform (the actual bottleneck). The old `min(16)`-only sizing
+        // left a 1-wide consumer on ≤16-core machines (read_k = cores, cpw = 1)
+        // — slower than MUDM_NO_OVERLAP=1. Cap readers at a quarter of the
+        // pool (≥1) so the consumer always keeps the majority share.
+        let base = if io_threads == 0 { 12 } else { io_threads };
+        let read_k = base.min(16).min((cores / 4).max(1));
         let cpw = cores.saturating_sub(read_k).max(1);
         let consumer_pool = rayon::ThreadPoolBuilder::new()
             .num_threads(cpw)
@@ -3171,16 +3220,25 @@ fn run_native_partitioned(
             // Consumer on the dedicated pool. `move` takes rx by value (Receiver
             // is !Sync) plus the Copy references; all captures are Send.
             let consumed: Result<u64, String> = consumer_pool.install(move || {
-                let mut pc: StdHashMap<u32, u32> = StdHashMap::new();
+                // Persistent per-zoom writers accumulate ACROSS chunks (the
+                // de-fragmentation fix). The single ordered consumer keeps the
+                // fed-row sequence stable -> deterministic part bytes.
+                let mut writers: StdHashMap<u32, RotatingWriterRs> = StdHashMap::new();
                 let mut t: u64 = 0;
                 let mut expected = 0usize;
                 for (got, tiles) in rx {
-                    debug_assert_eq!(got, expected, "consumer received chunks out of order");
+                    // Structurally unviolable (single producer, FIFO channel),
+                    // but it guards write ORDER (and thus part bytes) and costs
+                    // one comparison per chunk — keep it hard (S3).
+                    assert_eq!(got, expected, "consumer received chunks out of order");
                     expected += 1;
-                    t += consume_chunk(
+                    t += consume_chunk_rotating(
                         &tiles, out, schema_ref, props_ref, tags, world_bounds,
-                        max_zoom, base_cells, max_file_bytes, &mut pc,
+                        max_zoom, base_cells, max_file_bytes, &mut writers,
                     )?;
+                }
+                for (_z, w) in writers.iter_mut() {
+                    w.close()?;
                 }
                 Ok(t)
             });
@@ -3189,14 +3247,17 @@ fn run_native_partitioned(
             Ok(t)
         })?
     } else {
-        let mut part_counter: StdHashMap<u32, u32> = StdHashMap::new();
+        let mut writers: StdHashMap<u32, RotatingWriterRs> = StdHashMap::new();
         let mut t: u64 = 0;
         for chunk in chunks {
             let tiles = read_chunk_sorted(chunk, io_threads)?;
-            t += consume_chunk(
+            t += consume_chunk_rotating(
                 &tiles, out, &schema, &props, tags, world_bounds, max_zoom,
-                base_cells, max_file_bytes, &mut part_counter,
+                base_cells, max_file_bytes, &mut writers,
             )?;
+        }
+        for (_z, w) in writers.iter_mut() {
+            w.close()?;
         }
         t
     };
@@ -3404,8 +3465,11 @@ fn detect_max_memory_bytes(explicit: usize) -> usize {
 /// Detect the default I/O concurrency for the parallel read path.
 ///
 /// Honors the `MUDM_IO_THREADS` env override (an explicit `1` selects the
-/// serial fallback); otherwise uses `available_parallelism()`, falling back to
-/// 8 when the platform can't report it.
+/// serial fallback; the override is taken as-is — an explicit user choice);
+/// otherwise uses `available_parallelism()` capped at 16 (L5,
+/// streaming_review.md: shard reads hit the measured I/O + zstd-decode knee
+/// well before nproc on many-core hosts; the old uncapped default built an
+/// nproc-wide scoped read pool).
 fn detect_io_threads() -> usize {
     if let Ok(v) = std::env::var("MUDM_IO_THREADS") {
         if let Ok(n) = v.parse::<usize>() {
@@ -3413,7 +3477,7 @@ fn detect_io_threads() -> usize {
         }
     }
     std::thread::available_parallelism()
-        .map(|n| n.get())
+        .map(|n| n.get().min(16))
         .unwrap_or(8)
 }
 
@@ -3632,12 +3696,19 @@ impl StreamingTileGenerator {
     /// under ONE `py.allow_threads` (GIL-free, no Python dict bridge, no
     /// `_dict_to_record_batch`, no Python-side rotation). Bounded memory via the
     /// byte-budget shard cursor + persistent per-zoom rotating writers. Output is
-    /// `{output_dir}/zoom=N/part_NNN.parquet`, byte-identical (modulo within-tile
-    /// row order) to the pyarrow partitioned path. `overlap_read` runs the
-    /// producer/consumer read∥transform pipeline (default ON; measured ~23%
-    /// faster cold on oden, byte-identical) — pass `False` or set
-    /// `MUDM_NO_OVERLAP=1` to fall back to the strictly-sequential path.
-    #[pyo3(signature = (output_dir, world_bounds, compression="zstd", compression_level=3, max_batch_bytes=2_000_000_000, max_file_bytes=500_000_000, overlap_read=true))]
+    /// `{output_dir}/zoom=N/part_NNN.parquet`. Determinism: tile order and part
+    /// splitting are canonicalized (H1a/H1b, streaming_review.md), so output is
+    /// byte-identical run-to-run, across thread counts, and between the overlap
+    /// and sequential branches. `overlap_read` runs the producer/consumer
+    /// read∥transform pipeline (default ON; measured ~23% faster cold on oden) —
+    /// pass `False` or set `MUDM_NO_OVERLAP=1` for the strictly-sequential path.
+    ///
+    /// `max_batch_bytes = 0` (the default) auto-derives the chunk budget from
+    /// the configured memory ceiling (M3): ceiling × 0.8 × 0.4 ÷ the number of
+    /// chunk-sized buffers the pipeline can hold at once ((2 + cap) in flight
+    /// when overlapping, plus the consumer's row copy). An explicit value is
+    /// used as-is (the old fixed default was 2 GB).
+    #[pyo3(signature = (output_dir, world_bounds, compression="zstd", compression_level=3, max_batch_bytes=0, max_file_bytes=500_000_000, overlap_read=true))]
     fn generate_parquet_native_partitioned(
         &mut self,
         py: Python<'_>,
@@ -3661,6 +3732,21 @@ impl StreamingTileGenerator {
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(1)
             .max(1);
+        // M3 (streaming_review.md): this path previously ignored the configured
+        // memory ceiling entirely (fixed 2 GB chunks; MUDM_MAX_MEMORY_GB had no
+        // effect here), and the overlap pipeline holds up to (2 + cap) chunks
+        // resident (consumer's + channel + producer's in-progress) plus the
+        // consumer's ParquetRow copy. 0 = auto: divide the headroom-adjusted
+        // ceiling (the same 0.8 × 0.4 convention as the other emit paths) by
+        // that buffer count. Floor at 64 MB so tiny ceilings still make progress
+        // (single-shard chunks remain the irreducible floor).
+        let max_batch_bytes = if max_batch_bytes > 0 {
+            max_batch_bytes
+        } else {
+            let buffers = if overlap { 3 + channel_cap } else { 2 };
+            ((self.max_memory_bytes as f64 * 0.8 * 0.4) as usize / buffers)
+                .max(64 * 1024 * 1024)
+        };
         self._init_parquet_stream()?;
         let shard_paths = std::mem::take(&mut self.shard_paths_snapshot);
         let max_zoom = self.max_zoom;
@@ -3702,6 +3788,12 @@ impl StreamingTileGenerator {
     /// grouped by tile-key hash, then encodes one bucket at a time.
     /// Peak memory is O(fragments_per_bucket) instead of O(all_fragments),
     /// enabling datasets that exceed available RAM.
+    ///
+    /// When the corpus does not fit one partition (K>1), fragments are spilled
+    /// to disk under the temp dir before encoding, so the run needs roughly
+    /// **1× the on-disk fragment size as free scratch space** (reclaimed after).
+    /// Partition count K scales with the dataset vs the memory ceiling
+    /// (``MUDM_MAX_MEMORY_GB`` / ``_set_max_memory``).
     ///
     /// Writes tiles to ``output_dir/{z}/{x}/{y}/{d}.glb`` and
     /// ``tileset.json`` to ``output_dir/tileset.json``.
@@ -3976,6 +4068,13 @@ impl StreamingTileGenerator {
     /// `_set_max_memory`); `k == 1` is the whole-corpus-equivalent path.
     fn _get_ng_bucket_count(&self) -> usize {
         NG_LAST_BUCKET_COUNT.load(Ordering::Relaxed)
+    }
+
+    /// WS-C test probe: the partition count `k` used by the last
+    /// `generate_3dtiles` call. `k > 1` proves the hash-partition spill split the
+    /// corpus under the memory ceiling; `k == 1` is the no-spill fast path.
+    fn _get_tiles_partition_count(&self) -> usize {
+        TILES_LAST_PARTITION_COUNT.load(Ordering::Relaxed)
     }
 
     /// WS-C C.2 test probe: read the maximum *actual* resident decoded-fragment
@@ -4335,7 +4434,7 @@ impl StreamingTileGenerator {
         // Pre-simplify per zoom level, then clip each LOD to its zoom
         let fragments = simplify_and_clip_per_zoom(
             &positions, &indices, bb,
-            self.min_zoom, self.max_zoom, self.base_cells, self.buffer,
+            self.min_zoom, self.max_zoom, self.base_cells, self.buffer, true,
         );
         drop(positions);
         drop(indices);
@@ -4379,7 +4478,7 @@ impl StreamingTileGenerator {
     ///   tags_list: List of property dicts (one per file).
     ///
     /// Returns the list of assigned feature IDs.
-    #[pyo3(signature = (paths, bounds, tags_list, ingest_threads=0))]
+    #[pyo3(signature = (paths, bounds, tags_list, ingest_threads=0, simplify=true))]
     fn add_obj_files(
         &mut self,
         py: Python<'_>,
@@ -4387,6 +4486,7 @@ impl StreamingTileGenerator {
         bounds: (f64, f64, f64, f64, f64, f64),
         tags_list: &Bound<'_, PyList>,
         ingest_threads: usize,
+        simplify: bool,
     ) -> PyResult<Vec<u32>> {
         let n_files = paths.len();
         if n_files != tags_list.len() {
@@ -4398,6 +4498,9 @@ impl StreamingTileGenerator {
         let dx = if xmax != xmin { xmax - xmin } else { 1.0 };
         let dy = if ymax != ymin { ymax - ymin } else { 1.0 };
         let dz = if zmax != zmin { zmax - zmin } else { 1.0 };
+        // Capture the param as a local so the rayon closures below capture a bool (not the
+        // `crate::simplify` module, which shares the `simplify` name in value position).
+        let do_simplify = simplify;
 
         // Pre-assign sequential feature IDs
         let base_fid = self.feature_count;
@@ -4601,7 +4704,7 @@ impl StreamingTileGenerator {
                     // Small file: pre-simplify per zoom, clip each LOD
                     let clip_results = simplify_and_clip_per_zoom(
                         &positions, &indices, bb,
-                        min_zoom, max_zoom, base_cells, buffer,
+                        min_zoom, max_zoom, base_cells, buffer, do_simplify,
                     );
 
                     let frag_path = frag_dir.join(format!("frag_{:05}.mjf", i));
@@ -4854,7 +4957,7 @@ impl StreamingTileGenerator {
                         // Simplify + clip per zoom level
                         let fragments = simplify_and_clip_per_zoom(
                             &positions, &indices, bb,
-                            min_zoom, max_zoom, base_cells, buffer,
+                            min_zoom, max_zoom, base_cells, buffer, true,
                         );
 
                         // Write fragments to shard
@@ -5379,21 +5482,30 @@ impl StreamingTileGenerator {
         // distribution) but keeps ONLY the features whose `hash(fid) % k == b`,
         // so per-bucket resident bytes ≈ corpus_bytes / k. We fold the ZSTD
         // decode expansion (`*3`, matching the Parquet chunker at the
-        // `len*3` estimate) into the residency estimate. `k` is capped at the
-        // shard-times-feature granularity implicitly by the loop; a huge ceiling
-        // yields k==1 (whole-corpus-equivalent, byte-identical path).
+        // `len*3` estimate) into the residency estimate. `ng_bucket_count`
+        // applies the SAME 0.8 × 0.4 = 0.32×ceiling per-bucket budget headroom
+        // the 3D-tiles encode planner uses (the NG path formerly divided by the
+        // bare ceiling → 3.125× too few buckets → the 139k-feature OOM). A huge
+        // ceiling still yields k==1 (whole-corpus-equivalent, byte-identical
+        // path).
         let est_resident_bytes: usize = shard_paths
             .iter()
             .map(|p| std::fs::metadata(p).map(|m| m.len() as usize * 3).unwrap_or(0))
             .sum();
-        let budget = max_memory_bytes.max(1);
-        // ceil(est / budget), at least 1. Cap k so a pathologically tiny ceiling
-        // does not spin an unbounded number of full re-read passes (mirrors the
-        // Parquet `read_k <= 16` spirit, but here it bounds re-read PASSES).
-        let k = {
-            let raw = est_resident_bytes.div_ceil(budget).max(1);
-            raw.min(256)
-        };
+        // Cap k so a pathologically tiny ceiling does not spin an unbounded
+        // number of full re-read passes (mirrors the encode planner's K≤256). The
+        // cap is NOT silent: if the ideal exceeds it the per-bucket peak runs
+        // above plan, so warn (matching the encode path) — raise MUDM_MAX_MEMORY_GB.
+        let k_ideal = ng_bucket_count(est_resident_bytes, max_memory_bytes);
+        if k_ideal > 256 {
+            eprintln!(
+                "[ng] WARNING: corpus needs {} feature-buckets for the 0.32×ceiling \
+                 target but K is capped at 256; per-bucket peak (~{} bytes) may \
+                 exceed it. Raise MUDM_MAX_MEMORY_GB if this approaches physical RAM.",
+                k_ideal, est_resident_bytes / 256,
+            );
+        }
+        let k = k_ideal.min(256);
         NG_LAST_BUCKET_COUNT.store(k, Ordering::Relaxed);
         // WS-B: reset the per-bucket peak-resident probe at the START of the
         // generate (mirrors WS-C's reset-before-measure). The bucket loop below
@@ -5494,6 +5606,14 @@ impl StreamingTileGenerator {
             let mut seen_fids: std::collections::BTreeSet<u32> =
                 std::collections::BTreeSet::new();
             let mut segment_count: u32 = 0;
+            // M1 (streaming_review.md): per-shard errors are deduped by message
+            // ACROSS bucket passes instead of being recorded only on bucket 0.
+            // The old `b == 0` gate assumed every pass sees the identical error
+            // set; a TRANSIENT failure on bucket b > 0 (NFS hiccup, fd limit)
+            // was silently swallowed while that bucket's share of the shard's
+            // features went missing — silent data loss with a clean error log.
+            let mut reported_shard_errors: std::collections::BTreeSet<String> =
+                std::collections::BTreeSet::new();
 
             for b in 0..k {
                 let reader = Fragment3DReader::from_paths(shard_paths.clone());
@@ -5534,25 +5654,27 @@ impl StreamingTileGenerator {
                     .sum();
                 observe_ng_resident_bytes(bucket_resident);
 
-                // Fold per-shard parse errors into the ErrorCollector ONCE.
-                // Every bucket reads the identical shard set, so the error set is
-                // identical each pass; report only on bucket 0 to avoid k-fold
-                // double-reporting.
-                if b == 0 {
-                    for msg in &errs {
-                        // Split "<path>: <detail>" back into item / message.
-                        let (item, detail) = match msg.split_once(": ") {
-                            Some((p, d)) => (p, d),
-                            None => (msg.as_str(), msg.as_str()),
-                        };
-                        collector_ref.record_failure(
-                            "neuroglancer",
-                            Severity::NonFatal,
-                            item,
-                            "parse",
-                            detail,
-                        );
+                // Fold per-shard parse errors into the ErrorCollector, deduped
+                // by message across bucket passes: a PERSISTENT corrupt shard is
+                // reported exactly once (its message repeats every pass), while
+                // a TRANSIENT failure unique to a later pass still surfaces
+                // instead of being dropped by the old `b == 0` gate (M1).
+                for msg in &errs {
+                    if !reported_shard_errors.insert(msg.clone()) {
+                        continue; // already reported on an earlier pass
                     }
+                    // Split "<path>: <detail>" back into item / message.
+                    let (item, detail) = match msg.split_once(": ") {
+                        Some((p, d)) => (p, d),
+                        None => (msg.as_str(), msg.as_str()),
+                    };
+                    collector_ref.record_failure(
+                        "neuroglancer",
+                        Severity::NonFatal,
+                        item,
+                        "parse",
+                        detail,
+                    );
                 }
 
                 // WS-B: `bucket_map` is ALREADY restricted to this bucket's
@@ -6078,8 +6200,15 @@ fn write_parquet_native_3d(
     ]);
     let schema_ref = std::sync::Arc::new(schema);
 
+    // PY-1 (streaming_review.md §G): parquet-rs `ZSTD(Default)` is level 1; the
+    // partitioned path (`native_writer_props`) and the Python writers both use
+    // level 3. This legacy 3D path — the one the OBJ/geojson/xenium converters
+    // actually call — silently shipped weaker level-1 compression. Match level 3.
     let comp = match compression {
-        "zstd" => Compression::ZSTD(Default::default()),
+        "zstd" => Compression::ZSTD(
+            parquet::basic::ZstdLevel::try_new(3)
+                .map_err(|e| format!("zstd level: {}", e))?,
+        ),
         "lz4" => Compression::LZ4_RAW,
         "snappy" => Compression::SNAPPY,
         _ => Compression::UNCOMPRESSED,
@@ -6105,8 +6234,20 @@ fn write_parquet_native_3d(
         let zoom_dir = out_path.join(format!("zoom={}", zoom));
         std::fs::create_dir_all(&zoom_dir).map_err(|e| format!("mkdir: {}", e))?;
 
-        // Split tiles into chunks -> each chunk collects rows + writes its own part file in parallel
-        let n_parts = rayon::current_num_threads().max(1);
+        // PY-2 / H1 (streaming_review.md §G): this legacy path — the one the
+        // converters actually use — had the SAME nondeterminism the partitioned
+        // path was fixed for. (1) `zoom_tiles` arrives in ahash iteration order
+        // (the `read_all_grouped().into_iter()` in `generate_parquet_native`),
+        // so part boundaries and row order varied run-to-run; sort by tile key.
+        // (2) `n_parts = current_num_threads()` made the file count/numbering
+        // thread-dependent; use a FIXED grain so output is identical across
+        // hosts (the par_iter below still parallelizes over whatever pool
+        // exists — scheduling is free; the SLICING must be stable).
+        let mut zoom_tiles: Vec<&((u32, u32, u32, u32), Vec<Fragment3D>)> =
+            zoom_tiles.clone();
+        zoom_tiles.sort_by_key(|entry| entry.0);
+        const PART_GRAIN: usize = 64;
+        let n_parts = PART_GRAIN.min(zoom_tiles.len()).max(1);
         let chunk_size = (zoom_tiles.len() + n_parts - 1) / n_parts;
 
         let chunks: Vec<(usize, &[&((u32, u32, u32, u32), Vec<Fragment3D>)])> =
@@ -6114,16 +6255,23 @@ fn write_parquet_native_3d(
         chunks.par_iter().try_for_each(|(part_idx, tile_chunk)| -> Result<(), String> {
             let part_idx = *part_idx;
             // Collect rows for this chunk of tiles
-            let tiles_owned: Vec<((u32, u32, u32, u32), Vec<Fragment3D>)> = tile_chunk
+            let mut tiles_owned: Vec<((u32, u32, u32, u32), Vec<Fragment3D>)> = tile_chunk
                 .iter()
                 .map(|&entry| entry.clone())
                 .collect();
+            // H1a: canonicalize within-tile fragment order (mirrors the
+            // partitioned path's `read_chunk_sorted`), so row order matches
+            // regardless of which reader produced the groups.
+            for (_k, frags) in tiles_owned.iter_mut() {
+                frags.sort_by(crate::fragment::frag_cmp);
+            }
             let rows = collect_parquet_rows(&tiles_owned, world_bounds, max_zoom, base_cells);
             drop(tiles_owned);
 
             if rows.is_empty() { return Ok(()); }
 
-            let file_path = zoom_dir.join(format!("part_{:03}.parquet", part_idx));
+            // muDM tile-geometry parquet (custom schema, NOT GeoParquet) — see mudm-data .mu.parquet convention
+            let file_path = zoom_dir.join(format!("part_{:03}.mu.parquet", part_idx));
             let file = std::fs::File::create(&file_path)
                 .map_err(|e| format!("create {}: {}", file_path.display(), e))?;
             let mut pq_writer = ArrowWriter::try_new(file, schema_ref.clone(), Some(props.clone()))
@@ -6251,6 +6399,41 @@ mod tests {
     use super::*;
 
     #[test]
+    fn rotating_writer_drop_finalizes_open_part() {
+        // Fix-2 regression guard: a RotatingWriterRs dropped WITHOUT close() (the
+        // mid-run-error path) must still leave a COMPLETE, readable parquet (footer
+        // written by the Drop impl) — not a footerless/corrupt file.
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+        use std::collections::HashMap;
+
+        let dir = std::env::temp_dir().join(format!("rwdrop_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let tags: HashMap<u32, Vec<(String, TagValue)>> = HashMap::new();
+        let schema = build_batch_no_zoom(&[], &tags).unwrap().schema();
+        let props = std::sync::Arc::new(native_writer_props("zstd", 3).unwrap());
+        let rows = vec![
+            ParquetRow { zoom: 0, tile_x: 0, tile_y: 0, tile_d: 0, feature_id: 7,
+                         geom_type: 5, positions: vec![1u8; 48], indices: vec![0u8; 12] },
+            ParquetRow { zoom: 0, tile_x: 1, tile_y: 0, tile_d: 0, feature_id: 8,
+                         geom_type: 5, positions: vec![2u8; 48], indices: vec![0u8; 12] },
+        ];
+        {
+            let mut w = RotatingWriterRs::new(dir.clone(), schema, props, 10_000_000_000);
+            w.write(&rows, &tags).unwrap();
+            // intentionally NO close() — exercise the Drop finalizer
+        }
+        let file = std::fs::File::open(dir.join("part_000.mu.parquet")).expect("no part file");
+        let n: usize = ParquetRecordBatchReaderBuilder::try_new(file)
+            .expect("footerless/corrupt parquet — Drop did not finalize the writer")
+            .build()
+            .unwrap()
+            .map(|b| b.unwrap().num_rows())
+            .sum();
+        assert_eq!(n, 2, "expected 2 rows in the Drop-finalized part");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn test_clip_surface_basic() {
         // A single triangle face at x=[0.1, 0.9], should be kept when clipping [0, 0.5)
         let feat = ClipFeature {
@@ -6349,6 +6532,28 @@ mod tests {
         assert!(!encoded.is_empty());
     }
 
+    /// The NG bucket planner must reserve the SAME budget headroom the 3D-tiles
+    /// encode planner uses (0.8 × 0.4 = 0.32 × ceiling per bucket), so it never
+    /// under-buckets the way the bare-ceiling math did (the 139k-feature OOM).
+    /// With ceiling = 1000 the per-bucket target is 320 bytes:
+    ///   - est 1600 → ceil(1600/320) = 5 buckets (the OLD bare-ceiling math gave
+    ///     ceil(1600/1000) = 2 → each bucket ~1.0×ceiling → OOM);
+    ///   - est 1000 → ceil(1000/320) = 4 (OLD gave 1).
+    #[test]
+    fn ng_bucket_count_matches_encode_headroom() {
+        assert_eq!(ng_bucket_count(1600, 1000), 5, "must mirror encode's 0.32×ceiling target");
+        assert_eq!(ng_bucket_count(1000, 1000), 4);
+        assert_eq!(ng_bucket_count(321, 1000), 2);
+        // Edges: empty/sub-target estimate → 1 bucket; zero ceiling must not panic
+        // (partition_target floors at 1).
+        assert_eq!(ng_bucket_count(0, 1000), 1);
+        assert_eq!(ng_bucket_count(10, 1000), 1);
+        assert_eq!(ng_bucket_count(5, 0), 5);
+        // Pathologically large corpus vs ceiling → ideal exceeds the caller's 256
+        // cap (so the cap, not this fn, bounds the re-read passes).
+        assert!(ng_bucket_count(1_000_000_000, 1000) > 256);
+    }
+
     #[test]
     fn test_detect_max_memory_env_override() {
         std::env::set_var("MUDM_MAX_MEMORY_GB", "4");
@@ -6360,15 +6565,16 @@ mod tests {
         assert!(detect_max_memory_bytes(0) >= 1024 * 1024 * 1024);
     }
 
-    /// WS-C C.3 (Option A): `prefetch_advise` must be reachable from the
-    /// `streaming` module (it is the per-zoom read readahead hint) and must be
-    /// a safe best-effort no-op on every platform — including the non-Linux
-    /// (`memmap2` `madvise`) branch this host (macOS) compiles. Asserting it
-    /// compiles + runs here is the cross-module-visibility guard; the
-    /// I/O behavior itself is best-effort and produces no output change (the
-    /// byte-identity gate in `tests/test_tiling3d_3dtiles.py` proves that).
+    /// WS-C C.3 (Option A): `prefetch_advise` (the partition-read readahead hint
+    /// used by `read_all_grouped_parallel(..., fadvise=true)`) must be a safe
+    /// best-effort no-op on every platform — including the non-Linux (`memmap2`
+    /// `madvise`) branch this host (macOS) compiles. Asserting it compiles + runs
+    /// here is the visibility guard; the I/O behavior itself is best-effort and
+    /// produces no output change (the byte-identity gate in
+    /// `tests/test_tiling3d_3dtiles.py` proves that).
     #[test]
     fn test_prefetch_advise_is_callable_from_streaming() {
+        use crate::fragment::prefetch_advise;
         let dir = std::env::temp_dir()
             .join(format!("mudm_prefetch_test_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -6378,6 +6584,99 @@ mod tests {
         // safe no-op; a missing/empty file must also not panic.
         prefetch_advise(&p);
         prefetch_advise(&dir.join("does_not_exist.mjf"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// WS-C spill invariants: `redistribute_fragments_to_buckets(simplify=false)`
+    /// must (1) preserve the exact fragment multiset verbatim (no simplification
+    /// — the encode runs `do_simplify=false`), and (2) route every fragment of a
+    /// given tile key into exactly ONE partition (so per-tile groups are never
+    /// split across partitions). These are the grouping + byte-identity
+    /// guarantees the hash-partition-spill encode relies on.
+    #[test]
+    fn test_redistribute_spill_preserves_multiset_and_routes_tilekey_to_one_bucket() {
+        let dir = std::env::temp_dir().join(format!("mudm_spill_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Assorted fragments across several tile keys + zooms; geom_type 4 (TIN)
+        // at tile_z < max_zoom would hit the simplify gate if simplify were true.
+        let mk = |feature_id: u32, tz: u32, tx: u32, ty: u32, td: u32, v: f32| Fragment3D {
+            feature_id,
+            tile_z: tz,
+            tile_x: tx,
+            tile_y: ty,
+            tile_d: td,
+            geom_type: 4,
+            xy: vec![v, v + 1.0, v + 2.0, v + 3.0, v + 4.0, v + 5.0],
+            z: vec![v, v + 1.0, v + 2.0],
+            ring_lengths: vec![3],
+        };
+        let inputs = vec![
+            mk(0, 0, 0, 0, 0, 1.0),
+            mk(1, 0, 0, 0, 0, 2.0), // same tile key as the previous
+            mk(2, 3, 5, 7, 0, 3.0),
+            mk(3, 3, 5, 7, 0, 4.0),
+            mk(4, 2, 1, 1, 0, 5.0),
+            mk(5, 1, 9, 9, 0, 6.0),
+            mk(6, 3, 0, 0, 0, 7.0),
+        ];
+        // Split across two shards; the (3,5,7,0) key spans both input files.
+        {
+            let mut w0 = Fragment3DWriter::new(&dir.join("frag_00000.mjf")).unwrap();
+            for f in &inputs[..4] {
+                w0.write(f).unwrap();
+            }
+            w0.flush().unwrap();
+            let mut w1 = Fragment3DWriter::new(&dir.join("frag_00001.mjf")).unwrap();
+            for f in &inputs[4..] {
+                w1.write(f).unwrap();
+            }
+            w1.flush().unwrap();
+        }
+
+        let sig = |f: &Fragment3D| {
+            format!(
+                "{}|{},{},{},{}|{}|{:?}|{:?}|{:?}",
+                f.feature_id, f.tile_z, f.tile_x, f.tile_y, f.tile_d,
+                f.geom_type, f.xy, f.z, f.ring_lengths,
+            )
+        };
+
+        let buckets = redistribute_fragments_to_buckets(&dir, 4, 3, 100, false).unwrap();
+
+        let mut out_sigs: Vec<String> = Vec::new();
+        let mut key_sets: Vec<std::collections::HashSet<(u32, u32, u32, u32)>> = Vec::new();
+        for files in &buckets {
+            let mut keys = std::collections::HashSet::new();
+            for p in files {
+                let mut r = Fragment3DReader::new(p).unwrap();
+                while let Some(f) = r.read_next().unwrap() {
+                    keys.insert((f.tile_z, f.tile_x, f.tile_y, f.tile_d));
+                    out_sigs.push(sig(&f));
+                }
+            }
+            key_sets.push(keys);
+        }
+
+        // (1) Multiset preserved verbatim.
+        let mut in_sigs: Vec<String> = inputs.iter().map(sig).collect();
+        in_sigs.sort();
+        out_sigs.sort();
+        assert_eq!(in_sigs, out_sigs, "spill changed the fragment multiset");
+
+        // (2) Each tile key lands in exactly one partition (disjoint key sets).
+        for i in 0..key_sets.len() {
+            for j in (i + 1)..key_sets.len() {
+                let overlap: Vec<_> = key_sets[i].intersection(&key_sets[j]).collect();
+                assert!(
+                    overlap.is_empty(),
+                    "tile key {:?} split across partitions {} and {}",
+                    overlap, i, j
+                );
+            }
+        }
+
         std::fs::remove_dir_all(&dir).ok();
     }
 }

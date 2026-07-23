@@ -77,6 +77,16 @@ pub(crate) fn generate_tileset_json(
 ) -> Value {
     let key_set: HashSet<(u32, u32, u32, u32)> = tile_keys.iter().copied().collect();
 
+    // H3 (streaming_review.md §F): canonicalize the key order. The caller's
+    // `tile_keys` arrive in hash-map iteration order (random per run), and the
+    // root "children" array below is built in that order — so a tileset with
+    // ≥2 min-zoom tiles serialized nondeterministically run-to-run. (Tests
+    // missed it: synthetic corpora have exactly one min-zoom root, taking the
+    // `root_children.len() == 1` branch.) Child recursion below enumerates
+    // octants in fixed order, so sorting here canonicalizes the whole tree.
+    let mut tile_keys: Vec<(u32, u32, u32, u32)> = tile_keys.to_vec();
+    tile_keys.sort_unstable();
+
     let root_error = geometric_error(world_bounds, min_zoom, max_zoom);
     let root_box = box_volume(
         world_bounds.0, world_bounds.1, world_bounds.2,
@@ -85,7 +95,7 @@ pub(crate) fn generate_tileset_json(
 
     // Build root-level tiles
     let mut root_children: Vec<Value> = Vec::new();
-    for &(z, x, y, d) in tile_keys {
+    for &(z, x, y, d) in &tile_keys {
         if z == min_zoom {
             if let Some(node) = build_node(z, x, y, d, &key_set, world_bounds, max_zoom) {
                 root_children.push(node);

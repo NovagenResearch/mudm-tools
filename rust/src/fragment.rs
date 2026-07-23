@@ -27,6 +27,23 @@ use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 
 const MAGIC: &[u8; 4] = b"MJF2";
 const END_MAGIC: &[u8; 4] = b"FEND";
+// S1 (streaming_review.md): end-of-shard trailer = [TRAILER_MAGIC][count u64 LE]
+// [TRAILER_END], written INSIDE the zstd stream immediately before finish().
+// On read, its ABSENCE (clean EOF before the trailer) means the shard was
+// truncated or its zstd frame was finished early — surfaced as an error rather
+// than a silent EOF (the hole M2's panic-Drop fix only partially closed: a
+// frame finished cleanly at a fragment boundary read as graceful EOF).
+pub(crate) const TRAILER_MAGIC: &[u8; 4] = b"TEND";
+pub(crate) const TRAILER_END: &[u8; 4] = b"DEND";
+
+/// Write the S1 end-of-shard count trailer into a finalizing encoder. Shared by
+/// the 2D fragment writer (same format-agnostic trailer).
+pub(crate) fn write_shard_trailer<W: io::Write>(w: &mut W, count: u64) -> io::Result<()> {
+    w.write_all(TRAILER_MAGIC)?;
+    w.write_u64::<LittleEndian>(count)?;
+    w.write_all(TRAILER_END)?;
+    Ok(())
+}
 
 /// A single tile fragment — the clipped portion of one feature in one tile.
 #[derive(Debug, Clone)]
@@ -164,7 +181,8 @@ impl Fragment3DWriter {
     }
 
     pub fn flush(&mut self) -> io::Result<()> {
-        if let Some(encoder) = self.writer.take() {
+        if let Some(mut encoder) = self.writer.take() {
+            write_shard_trailer(&mut encoder, self.count)?; // S1
             encoder.finish()?;
         }
         Ok(())
@@ -179,7 +197,20 @@ impl Fragment3DWriter {
 /// are properly flushed when `for_each_init` drops them.
 impl Drop for Fragment3DWriter {
     fn drop(&mut self) {
-        if let Some(encoder) = self.writer.take() {
+        // M2 (streaming_review.md): if this drop runs during a panic-unwind
+        // (a worker died mid-write), do NOT finalize. Finishing the zstd frame
+        // would make the truncated shard decode as a clean EOF — fragments
+        // silently missing with no error anywhere. Leaving the frame
+        // unfinished makes every subsequent reader surface an error for this
+        // shard instead, which the collectors report.
+        if std::thread::panicking() {
+            return;
+        }
+        if let Some(mut encoder) = self.writer.take() {
+            // S1: a clean (non-panic) drop is a legitimate finalize — write the
+            // count trailer so the shard reads as complete. (A panic skips this
+            // AND finish(), so a crashed worker's shard is detectably truncated.)
+            let _ = write_shard_trailer(&mut encoder, self.count);
             let _ = encoder.finish(); // best-effort; can't propagate errors in Drop
         }
     }
@@ -188,6 +219,8 @@ impl Drop for Fragment3DWriter {
 /// Single-shard reader over one ZSTD-compressed fragment file.
 struct ShardReader3D {
     reader: BufReader<zstd::stream::read::Decoder<'static, BufReader<File>>>,
+    read_count: u64,  // S1: fragments returned so far (verified against the trailer)
+    complete: bool,   // S1: set once the end-of-shard trailer is read+verified
 }
 
 impl ShardReader3D {
@@ -196,6 +229,8 @@ impl ShardReader3D {
         let decoder = zstd::stream::read::Decoder::new(file)?;
         Ok(Self {
             reader: BufReader::with_capacity(1 << 20, decoder),
+            read_count: 0,
+            complete: false,
         })
     }
 
@@ -203,8 +238,42 @@ impl ShardReader3D {
         let mut magic = [0u8; 4];
         match self.reader.read_exact(&mut magic) {
             Ok(()) => {}
-            Err(ref e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+            // S1: clean EOF is legitimate ONLY after the count trailer was read.
+            // Otherwise the shard was truncated / its frame finished early —
+            // surface it instead of silently dropping the missing fragments.
+            Err(ref e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                if self.complete {
+                    return Ok(None);
+                }
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "shard truncated: missing end-of-shard count trailer (incomplete write)",
+                ));
+            }
             Err(e) => return Err(e),
+        }
+        if &magic == TRAILER_MAGIC {
+            // S1: end-of-shard trailer [TEND][count u64 LE][DEND].
+            let count = self.reader.read_u64::<LittleEndian>()?;
+            let mut tend = [0u8; 4];
+            self.reader.read_exact(&mut tend)?;
+            if &tend != TRAILER_END {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "shard trailer corrupt (bad end magic)",
+                ));
+            }
+            if count != self.read_count {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "shard fragment-count mismatch: trailer={} read={}",
+                        count, self.read_count
+                    ),
+                ));
+            }
+            self.complete = true;
+            return Ok(None);
         }
         if &magic != MAGIC {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "Bad fragment magic"));
@@ -217,6 +286,19 @@ impl ShardReader3D {
         let tile_d = self.reader.read_u32::<LittleEndian>()?;
         let geom_type = self.reader.read_u8()?;
         let n_verts = self.reader.read_u32::<LittleEndian>()? as usize;
+
+        // M5 (streaming_review.md): sanity-cap untrusted lengths BEFORE
+        // allocating. A corrupt (but zstd-valid) shard could otherwise request
+        // a multi-GB Vec and abort the process — defeating the non-fatal
+        // collect-errors contract (an OOM abort produces no errors.jsonl).
+        // Any real fragment is orders of magnitude below this cap.
+        const MAX_FRAGMENT_ITEMS: usize = 100_000_000;
+        if n_verts > MAX_FRAGMENT_ITEMS {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("implausible fragment vertex count {}", n_verts),
+            ));
+        }
 
         // XY: read f32
         let mut xy = Vec::with_capacity(n_verts * 2);
@@ -232,6 +314,12 @@ impl ShardReader3D {
 
         // Ring lengths
         let n_rl = self.reader.read_u32::<LittleEndian>()? as usize;
+        if n_rl > MAX_FRAGMENT_ITEMS {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("implausible fragment ring count {}", n_rl),
+            ));
+        }
         let mut ring_lengths = Vec::with_capacity(n_rl);
         for _ in 0..n_rl {
             ring_lengths.push(self.reader.read_u32::<LittleEndian>()?);
@@ -244,6 +332,7 @@ impl ShardReader3D {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "Bad fragment end magic"));
         }
 
+        self.read_count += 1; // S1: counted against the trailer at end-of-shard
         Ok(Some(Fragment3D {
             feature_id, tile_z, tile_x, tile_y, tile_d,
             geom_type, xy, z, ring_lengths,
@@ -541,6 +630,12 @@ impl Fragment3DReader {
                                 .lock()
                                 .unwrap()
                                 .push(format!("{}: {}", p.display(), e));
+                            // M2 (streaming_review.md): skip the WHOLE shard on
+                            // a mid-shard error — matching the documented
+                            // contract and the tile-keyed reader. Merging the
+                            // pre-failure prefix would mix silent partial
+                            // geometry into otherwise-healthy features.
+                            local.clear();
                             break;
                         }
                     }
@@ -580,7 +675,9 @@ impl Fragment3DReader {
     /// Identical par_iter + thread-local-map + `DashMap` merge, keyed by
     /// `feature_id`, but per-shard parse/open errors are **collected and
     /// returned alongside the partial map** instead of aborting the read. The
-    /// healthy shards are still merged; the bad ones are skipped. The caller
+    /// healthy shards are still merged; a failing shard is skipped IN FULL —
+    /// fragments decoded before a mid-shard error are dropped, never merged
+    /// (M2, streaming_review.md), so geometry is all-or-nothing per shard. The caller
     /// (the WS-B feature-bucketed NG read) folds the returned errors into the
     /// `ErrorCollector` and continues — a corrupt shard is reported, not
     /// run-aborting, matching the non-fatal skip contract.
@@ -657,6 +754,11 @@ impl Fragment3DReader {
                                 .lock()
                                 .unwrap()
                                 .push(format!("{}: {}", p.display(), e));
+                            // M2 (streaming_review.md): drop the pre-failure
+                            // prefix so a bad shard is truly SKIPPED (as the
+                            // doc comment promises) instead of contributing
+                            // silent partial geometry alongside its error.
+                            local.clear();
                             break;
                         }
                     }
@@ -689,6 +791,62 @@ impl Fragment3DReader {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// S1: a shard whose zstd frame is cleanly FINISHED but missing the
+    /// end-of-shard count trailer (a truncation at a fragment boundary / early
+    /// finish — the hole M2's panic-Drop fix did not close) must surface an
+    /// error on read, NOT read as a silent EOF with fragments missing.
+    #[test]
+    fn shard_missing_count_trailer_is_detected() {
+        let dir = std::env::temp_dir().join("test_frag_trailer_trunc_v1");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let full = dir.join("full.mjf");
+        let frags: Vec<Fragment3D> = (0..3u32)
+            .map(|i| Fragment3D {
+                feature_id: i, tile_z: 1, tile_x: i, tile_y: 0, tile_d: 0, geom_type: 4,
+                xy: vec![0.0, 0.0, 1.0, 0.0, 0.5, 1.0], z: vec![0.0, 1.0, 2.0],
+                ring_lengths: vec![3],
+            })
+            .collect();
+        {
+            let mut w = Fragment3DWriter::new(&full).unwrap();
+            for f in &frags {
+                w.write(f).unwrap();
+            }
+            w.flush().unwrap(); // writes the S1 trailer
+        }
+        // complete shard reads all fragments, no error
+        let mut r = ShardReader3D::open(&full).unwrap();
+        let mut n = 0;
+        while r.read_next().unwrap().is_some() {
+            n += 1;
+        }
+        assert_eq!(n, frags.len());
+
+        // forge a cleanly-finished frame with the 16-byte trailer stripped
+        let dec = zstd::decode_all(&std::fs::read(&full).unwrap()[..]).unwrap();
+        let strip = TRAILER_MAGIC.len() + 8 + TRAILER_END.len();
+        let trunc = dir.join("trunc.mjf");
+        std::fs::write(&trunc, zstd::encode_all(&dec[..dec.len() - strip], 3).unwrap()).unwrap();
+
+        let mut r2 = ShardReader3D::open(&trunc).unwrap();
+        let mut err = None;
+        loop {
+            match r2.read_next() {
+                Ok(Some(_)) => continue,
+                Ok(None) => break,
+                Err(e) => {
+                    err = Some(e);
+                    break;
+                }
+            }
+        }
+        let err = err.expect("truncated shard (no trailer) must surface an error, not clean EOF");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("truncated"), "unexpected error: {err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn test_roundtrip() {

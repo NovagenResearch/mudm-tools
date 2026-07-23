@@ -714,9 +714,9 @@ def tile_streaming(
             shutil.rmtree(tiles3d_dir)
         tiles3d_dir.mkdir(parents=True, exist_ok=True)
 
-        print(f"\nGenerating 3D Tiles...")
+        print(f"\nGenerating 3D Tiles (meshopt-q14)...")
         t0 = time.perf_counter()
-        n_tiles_3d = gen.generate_3dtiles(str(tiles3d_dir), bounds)
+        n_tiles_3d = gen.generate_3dtiles(str(tiles3d_dir), bounds, compression="meshopt-q14")
         t_gen_3d = time.perf_counter() - t0
         _surface_run_summary(pyramid_dir, "3dtiles")
 

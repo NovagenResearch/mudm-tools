@@ -13,12 +13,16 @@ import { SlicePlanePanel } from './SlicePlanePanel.js';
 import { OverviewPanel } from './OverviewPanel.js';
 import { ScaleBar } from './ScaleBar.js';
 import { AxisGizmo } from './AxisGizmo.js';
+import { TileLoadCounter } from './TileLoadCounter.mjs';
+import { LoadingIndicator } from './LoadingIndicator.js';
 
 // --- Scene setup ---
 const canvas = document.getElementById('canvas');
-const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, preserveDrawingBuffer: true });
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, preserveDrawingBuffer: false });
 // NOTE: Do NOT use setPixelRatio — causes rendering offset on macOS Retina.
 // DPR is handled manually in onResize() instead.
+// preserveDrawingBuffer:false — takeScreenshot() forces a fresh renderer.render()
+// before reading the canvas, so the back buffer never needs to be retained.
 renderer.outputColorSpace = THREE.SRGBColorSpace;
 
 const scene = new THREE.Scene();
@@ -55,6 +59,12 @@ const axisGizmo = new AxisGizmo();
 // --- Tile Manager (baseUrl set after pyramid selection) ---
 let tileManager = new TileManager(scene, '/tiles/default/');
 
+// --- Tile-loading indicator (non-blocking) ---
+const _tileCounter = new TileLoadCounter();
+const _tileIndicator = new LoadingIndicator(document.getElementById('tile-loading'));
+window._tileLoadCounter = _tileCounter;       // exposed for the Playwright gate
+window._tileLoadIndicator = _tileIndicator;
+
 // --- Slice Plane ---
 const sliceContainer = document.getElementById('slice-controls');
 const slicePlanePanel = new SlicePlanePanel(sliceContainer, { renderer, scene });
@@ -65,12 +75,17 @@ infoPanel.slicePanel = slicePlanePanel;
 
 // --- Overview Panel ---
 const overviewPanel = new OverviewPanel({
-    onSelectionChange: (worldCenter, ring) => {
-        // Only apply spatial filter when overview is actually enabled
-        const toggle = document.getElementById('overview-toggle');
-        if (toggle && toggle.checked) {
-            tileManager.setSpatialFilter(worldCenter, ring);
-            // Recenter main camera on clicked position
+    onSelectionChange: (worldCenter, ring, box) => {
+        // Overview is always on — clicking it focuses the main view (spatial
+        // filter) on the clicked region and reframes the camera so the orange
+        // box's midpoint lands at the center of the view.
+        tileManager.setSpatialFilter(worldCenter, ring);
+        if (box) {
+            // Fit + center on the selection box (same framing as frameZoomRegion).
+            // A pure pan that preserved the old oblique offset left the box
+            // visibly translated under the perspective camera.
+            frameBox(box);
+        } else {
             const offset = camera.position.clone().sub(controls.target);
             controls.target.copy(worldCenter);
             camera.position.copy(worldCenter).add(offset);
@@ -79,6 +94,7 @@ const overviewPanel = new OverviewPanel({
     },
 });
 overviewPanel.initDOM();
+overviewPanel.enabled = true;   // overview is always on (no toggle)
 
 // --- Feature Selector ---
 const selectorContainer = document.getElementById('feature-selector');
@@ -98,6 +114,21 @@ const PALETTE_COLORS = [
     '#469990', '#dcbeff', '#9a6324', '#fffac8', '#800000',
     '#aaffc3', '#808000', '#ffd8b1', '#000075', '#a9a9a9',
 ];
+
+/**
+ * Extract the filter schema + facet-store descriptor for the currently loaded pyramid, if any.
+ * Both come from the muDM TileModel (TileManager.descriptor, set in TileManager.init()): the
+ * per-feature filter-field schema lives at vector_layers[0], and the columnar facet-store parquet
+ * is declared as a role="facets" asset. Either/both can be null (older, un-migrated pyramids),
+ * in which case callers fall back to the features.json-derived path.
+ */
+function facetContext(tm) {
+    const desc = tm.descriptor;
+    const schema = desc?.vector_layers?.[0] || null;
+    const fa = (desc?.assets || []).find(a => a.role === 'facets');
+    const facetStore = fa ? { baseUrl: tm.baseUrl, href: fa.href, key: fa.key } : null;
+    return { schema, facetStore };
+}
 
 /**
  * Discover colorable attributes from feature index.
@@ -140,6 +171,45 @@ function discoverAttributes(featureIndex, idFields) {
 }
 
 /**
+ * Colorable attributes straight from the muDM TileModel descriptor schema (vector_layers[0]
+ * fields/fieldenums/fieldranges) — no per-feature scan, so it works even when features.json has been
+ * slimmed to just the spatial index. Mirrors FeatureSelector._discoverFilterAttrs' schema branch.
+ * Numeric attrs get `values: []` here (the distinct values aren't in the schema); the color-by
+ * handler fills them from the facet-store column when the attribute is selected.
+ */
+function discoverAttributesFromSchema(schema) {
+    const fields = schema.fields || {}, enums = schema.fieldenums || {}, ranges = schema.fieldranges || {};
+    const out = [];
+    for (const [key, type] of Object.entries(fields)) {
+        const label = key.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+        if (type === 'number' && ranges[key]) {
+            out.push({ key, label, type: 'numeric', values: [], numericRange: ranges[key] });
+        } else if (enums[key]) {
+            out.push({ key, label, type: 'categorical', values: enums[key], numericRange: null });
+        }
+    }
+    return out.sort((a, b) => a.key.localeCompare(b.key));
+}
+
+// Lazily read one column (keyed by the facet key) from the facet-store parquet via hyparquet and cache
+// it as a name -> value Map. Lets color-by resolve per-feature attribute values when they no longer live
+// in features.json (Phase 5 slim). Cache key includes the pyramid URL so a switch can't serve stale values.
+const _facetColCache = new Map();
+async function loadFacetColumn(facetStore, attr) {
+    const ck = `${facetStore.baseUrl}${facetStore.href}|${attr}`;
+    if (_facetColCache.has(ck)) return _facetColCache.get(ck);
+    const { asyncBufferFromUrl, parquetMetadataAsync, parquetReadObjects } =
+        await import('./vendor/hyparquet.min.js');
+    const file = await asyncBufferFromUrl({ url: facetStore.baseUrl + facetStore.href });
+    const meta = await parquetMetadataAsync(file);
+    const rows = await parquetReadObjects({ file, metadata: meta, columns: [facetStore.key, attr] });
+    const m = new Map();
+    for (const r of rows) m.set(String(r[facetStore.key]), r[attr]);
+    _facetColCache.set(ck, m);
+    return m;
+}
+
+/**
  * Build a color palette for a set of values.
  * Returns Map<string, string> (value → hex color).
  */
@@ -165,7 +235,12 @@ function populateColorByDropdown(featureIndex, idFields) {
     while (colorBySelect.options.length > 1) {
         colorBySelect.remove(1);
     }
-    const attrs = discoverAttributes(featureIndex, idFields);
+    // Prefer the muDM TileModel descriptor schema + facet store (values read by-column from the parquet)
+    // when both are present — this survives a slimmed features.json. Else scan the (fat) feature index.
+    const fc = facetContext(tileManager);
+    _colorByFromSchema = !!(fc.schema && fc.schema.fields && Object.keys(fc.schema.fields).length && fc.facetStore);
+    const attrs = _colorByFromSchema ? discoverAttributesFromSchema(fc.schema)
+                                     : discoverAttributes(featureIndex, idFields);
     for (const attr of attrs) {
         const opt = document.createElement('option');
         opt.value = attr.key;
@@ -177,11 +252,16 @@ function populateColorByDropdown(featureIndex, idFields) {
     _cachedAttributes = attrs;
 }
 let _cachedAttributes = [];
+let _colorByFromSchema = false;   // true when the dropdown was built from the descriptor schema + facet store
 
 // Numeric color-by range controls
 const colorByRangeContainer = document.getElementById('color-by-range');
 const COLOR_MATCH = '#6fdfaf';
 const COLOR_NO_MATCH = '#444444';
+// Continuous value ramp for numeric color-by: blue (low) -> red (high). Replaces the old binary
+// in-range/out-of-range highlight, which painted every mesh one flat color at full range so
+// "color by a numeric feature" looked like it did nothing.
+function _rampColor(t) { t = Math.max(0, Math.min(1, t)); return `hsl(${((1 - t) * 240).toFixed(0)}, 75%, 52%)`; }
 
 function showColorByRange(attrInfo) {
     colorByRangeContainer.innerHTML = '';
@@ -239,12 +319,15 @@ function applyNumericColorBy(attrInfo, rangeMin, rangeMax) {
     const attr = attrInfo.key;
     // Build palette: each unique value → match or no-match color
     const palette = new Map();
+    const [rMin, rMax] = attrInfo.numericRange || [0, 1];
+    const span = (rMax - rMin) || 1;
     for (const val of attrInfo.values) {
         const num = Number(val);
         let matches = true;
         if (rangeMin !== null && num < rangeMin) matches = false;
         if (rangeMax !== null && num > rangeMax) matches = false;
-        palette.set(val, matches ? COLOR_MATCH : COLOR_NO_MATCH);
+        // in filter range -> position on the value ramp; outside -> dimmed
+        palette.set(val, matches ? _rampColor((num - rMin) / span) : COLOR_NO_MATCH);
     }
 
     tileManager.setColorBy(attr, palette);
@@ -257,18 +340,14 @@ function applyNumericColorBy(attrInfo, rangeMin, rangeMax) {
     }
     featureSelector.updateSwatchColors(nameColorMap);
 
-    // Legend: show criteria
+    // Legend: a 5-stop gradient across the data range (matches the mesh ramp), plus a dimmed
+    // "out of range" swatch only when a min/max filter is active.
     const items = new Map();
-    let matchLabel = 'In range';
-    if (rangeMin !== null && rangeMax !== null) {
-        matchLabel = `${rangeMin.toLocaleString()} \u2013 ${rangeMax.toLocaleString()}`;
-    } else if (rangeMin !== null) {
-        matchLabel = `\u2265 ${rangeMin.toLocaleString()}`;
-    } else if (rangeMax !== null) {
-        matchLabel = `\u2264 ${rangeMax.toLocaleString()}`;
+    for (let i = 0; i <= 4; i++) {
+        const t = i / 4;
+        items.set((rMin + t * span).toLocaleString(undefined, { maximumFractionDigits: 2 }), _rampColor(t));
     }
-    items.set(matchLabel, COLOR_MATCH);
-    items.set('Other', COLOR_NO_MATCH);
+    if (rangeMin !== null || rangeMax !== null) items.set('out of range', COLOR_NO_MATCH);
     updateLegend(attr, items);
 }
 
@@ -293,7 +372,7 @@ function updateLegend(attribute, palette) {
     colorLegend.style.display = '';
 }
 
-colorBySelect.addEventListener('change', () => {
+colorBySelect.addEventListener('change', async () => {
     const attr = colorBySelect.value;
     if (!attr) {
         tileManager.setColorBy(null, null);
@@ -304,6 +383,33 @@ colorBySelect.addEventListener('change', () => {
     }
     const attrInfo = _cachedAttributes.find(a => a.key === attr);
     if (!attrInfo) return;
+
+    // When the color-by list came from the descriptor schema, the attribute values live in the facet
+    // store (not the slimmed features.json). Load that column once and inject it into the feature index
+    // so the palette build, the sidebar swatch map, and TileManager.getFeatureColor (which reads
+    // featureIndex[name][attr]) all work unchanged. Idempotent when the values are already present.
+    const fc = facetContext(tileManager);
+    if (_colorByFromSchema && fc.facetStore) {
+        try {
+            const col = await loadFacetColumn(fc.facetStore, attr);
+            for (const [name, feat] of Object.entries(tileManager.featureIndex)) feat[attr] = col.get(name);
+            if (attrInfo.type === 'numeric') {
+                // Distinct values as STRINGS — applyNumericColorBy + TileManager.getFeatureColor key the
+                // palette by String(feat[attr]), so a number-keyed palette would never match (all no-match
+                // grey). The [min,max] range comes from the descriptor schema (fieldranges); do NOT
+                // Math.min(...col)/max spread the whole column — RangeError on the ~176k-arg giants.
+                attrInfo.values = [...new Set([...col.values()]
+                    .filter(v => v != null && !Number.isNaN(Number(v))).map(v => String(v)))]
+                    .sort((a, b) => Number(a) - Number(b));
+            }
+        } catch (err) {
+            console.error(`color-by: failed to read "${attr}" from the facet store`, err);
+        }
+    }
+
+    // A newer color-by selection may have arrived while we awaited the facet column; drop this stale
+    // result so the applied coloring always matches the current dropdown value.
+    if (colorBySelect.value !== attr) return;
 
     if (attrInfo.type === 'numeric') {
         // Numeric: show range controls, default to full range (all match)
@@ -428,10 +534,13 @@ function _updateHover(event) {
     const intersects = _hoverRaycaster.intersectObjects(scene.children, true);
 
     for (const hit of intersects) {
-        if (!hit.object.visible) continue;
         if (hit.object.userData?._isSliceHelper) continue;
         if (slicePlanePanel?.enabled && slicePlanePanel.clipPlane.distanceToPoint(hit.point) < 0) continue;
-        const name = _findFeatureName(hit.object);
+        // BatchedMesh raycast returns the hit instance in hit.batchId and only reports
+        // VISIBLE instances; legacy line/point meshes resolve via the parent userData.
+        const name = hit.object.isBatchedMesh
+            ? hit.object.featureByInstance?.get(hit.batchId)
+            : (hit.object.visible ? _findFeatureName(hit.object) : null);
         if (name) {
             _setHover(name);
             return;
@@ -452,33 +561,17 @@ function _findFeatureName(object) {
 function _setHover(featureName) {
     if (featureName === _hoveredFeature) return;
 
-    // Restore previous
-    if (_hoveredFeature) {
-        _setFeatureEmissive(_hoveredFeature, 0x000000);
-    }
-
+    // Restore previous + highlight new — TileManager owns the batches (per-instance
+    // color brighten/restore), so the highlight lives there now.
+    if (_hoveredFeature) tileManager.setFeatureHighlight(_hoveredFeature, false);
     _hoveredFeature = featureName;
-
-    // Highlight new
     if (_hoveredFeature) {
-        _setFeatureEmissive(_hoveredFeature, 0x333333);
+        tileManager.setFeatureHighlight(_hoveredFeature, true);
         canvas.style.cursor = 'pointer';
     } else {
         canvas.style.cursor = '';
     }
-}
-
-function _setFeatureEmissive(name, color) {
-    for (const node of tileManager.nodeByUri.values()) {
-        if (!node.object3D) continue;
-        const meshes = node.meshByFeature[name];
-        if (!meshes) continue;
-        for (const mesh of meshes) {
-            if (mesh.material) {
-                mesh.material.emissive.set(color);
-            }
-        }
-    }
+    requestRender();   // hover highlight changed → repaint (render-on-demand)
 }
 
 // --- Stats ---
@@ -501,63 +594,40 @@ gpuSlider.addEventListener('input', () => {
     tileManager.maxGpuMB = mb;
 });
 
-// --- LOD Controls ---
-const lodRadios = document.querySelectorAll('input[name="lod-mode"]');
+// --- Zoom level (always a manually-selected level; no dynamic LOD) ---
 const zoomSlider = document.getElementById('zoom-slider');
 const zoomLabel = document.getElementById('zoom-label');
 const zoomDistEl = document.getElementById('zoom-distribution');
+tileManager.lodMode = 'forced';
 
-for (const radio of lodRadios) {
-    radio.addEventListener('change', () => {
-        if (!radio.checked) return;  // ignore the unchecked radio's event
-        tileManager.lodMode = radio.value;
-        zoomSlider.disabled = (radio.value === 'dynamic');
-        if (radio.value === 'forced') {
-            tileManager.forcedZoom = parseInt(zoomSlider.value);
-        }
-        console.log(`[LOD] mode=${radio.value} forcedZoom=${tileManager.forcedZoom}`);
-
-        // Update overview zoom reference
-        if (radio.value === 'forced') {
-            overviewPanel.currentZoom = tileManager.forcedZoom;
-        } else {
-            overviewPanel.currentZoom = tileManager.maxZoom;
-        }
-        syncOverviewRingMax();
-        overviewPanel._updateOverlays();
-    });
-}
 zoomSlider.addEventListener('input', () => {
     const z = parseInt(zoomSlider.value);
     zoomLabel.textContent = z;
     tileManager.forcedZoom = z;
+    // Zoom level = a centered spatial zoom into the orange box at the new zoom: sync the
+    // overview's zoom first, then focus the main view + spatial filter on that box so the
+    // loaded region stays centered (matches the overview-click + initial-load behavior).
     overviewPanel.currentZoom = z;
     syncOverviewRingMax();
     overviewPanel._updateOverlays();
-    overviewPanel._fireSelectionChange();
+    focusOverviewBox();
+    requestRender();
 });
 
-// --- Overview Controls ---
-const overviewToggle = document.getElementById('overview-toggle');
-const overviewOptions = document.getElementById('overview-options');
-const overviewContainer = document.getElementById('overview-container');
+// --- Opacity (main-view neuron transparency) ---
+const opacitySlider = document.getElementById('opacity-slider');
+const opacityLabel = document.getElementById('opacity-label');
+opacitySlider.addEventListener('input', () => {
+    const pct = parseInt(opacitySlider.value);
+    opacityLabel.textContent = pct + '%';
+    tileManager.setOpacity(pct / 100);
+    requestRender();
+});
+
+// --- Overview Controls (overview is always on; selector lives above the panels) ---
 const overviewRingSlider = document.getElementById('overview-ring-slider');
 const overviewRingLabel = document.getElementById('overview-ring-label');
 const overviewAxesRadios = document.querySelectorAll('input[name="overview-axes"]');
-
-overviewToggle.addEventListener('change', () => {
-    overviewPanel.enabled = overviewToggle.checked;
-    overviewOptions.style.display = overviewToggle.checked ? '' : 'none';
-    overviewContainer.style.display = overviewToggle.checked ? '' : 'none';
-
-    if (!overviewToggle.checked) {
-        tileManager.setSpatialFilter(null, 0);
-    } else {
-        overviewPanel._fireSelectionChange();
-    }
-
-    onResize();
-});
 
 for (const radio of overviewAxesRadios) {
     radio.addEventListener('change', () => {
@@ -578,7 +648,9 @@ function onResize() {
     const overviewWidth = overviewPanel.enabled ? 350 : 0;
     const w = window.innerWidth - sidebarWidth - overviewWidth;
     const h = window.innerHeight;
-    const dpr = window.devicePixelRatio || 1;
+    // Cap effective DPR at 1.5 — on a 2x/3x Retina display this cuts fragment
+    // work up to ~4x with negligible visual loss for solid-colored meshes.
+    const dpr = Math.min(window.devicePixelRatio || 1, 1.5);
     camera.aspect = w / h;
     camera.updateProjectionMatrix();
 
@@ -656,29 +728,78 @@ window.addEventListener('keydown', (e) => {
     }
 });
 
-// --- Render loop ---
+// --- Render loop (render-on-demand) ---
+// Idle frames are skipped entirely: the heavy work (tileManager.update +
+// renderer.render + the two overview panels + gizmo) only runs when something
+// actually changed. A 9k–23k-mesh scene that sat at a busy-looping 60fps now
+// costs ~0 when nothing is happening. needsRender is raised by:
+//   • OrbitControls 'change' (orbit / zoom / pan), and damping settles via
+//     controls.update()'s return value;
+//   • any sidebar interaction (sliders, selects, checkboxes, buttons, feature
+//     toggles) via cheap capture-phase document listeners;
+//   • hover-highlight changes (_setHover) and window resize;
+//   • tiles still streaming in (tileManager._pendingLoads) or a just-completed
+//     async load/unload (tileManager._dirty).
 let animating = false;
+let needsRender = true;
+// Set by any camera/zoom change (the OrbitControls 'change' funnel — orbit, wheel, zoom slider,
+// keyboard, and the programmatic frameBox/frameZoomRegion reframes all reach it via
+// controls.update()). Read once per frame by the loading pill to re-baseline its burst on
+// navigation (so a zoom-out can't inflate the tile denominator), then cleared.
+let _viewChanged = false;
+function requestRender() { needsRender = true; }
+function _onViewChange() { _viewChanged = true; needsRender = true; }
+controls.addEventListener('change', _onViewChange);
+window.addEventListener('resize', requestRender);
+// Catch-all for sidebar UI + overview interactions + keyboard shortcuts —
+// these mutate the scene/overview without moving the main camera. Capture phase
+// + a plain boolean flip → negligible cost. ('wheel' covers the overview's own
+// zoom; 'keydown' covers reset/select-all/focus/clear shortcuts.)
+document.addEventListener('input', requestRender, true);
+document.addEventListener('change', requestRender, true);
+document.addEventListener('click', requestRender, true);
+document.addEventListener('wheel', requestRender, true);
+document.addEventListener('keydown', requestRender, true);
+
 function animate() {
     requestAnimationFrame(animate);
-    controls.update();
+    const moved = controls.update();   // true while inertial damping is settling
+    const busy = tileManager._pendingLoads > 0 || tileManager._dirty;
+    if (!(needsRender || moved || busy)) return;   // idle → skip the whole frame
+
+    needsRender = false;
+    tileManager._dirty = false;
+
     tileManager.update(camera);
+
+    // Non-blocking tile-loading pill: outstanding = in-flight + queued GLB tiles, measured AFTER
+    // update() rebuilds this frame's desired set. A camera/zoom change (_viewChanged) re-baselines
+    // the burst so an abandoned view's progress can't inflate the new view's denominator — the
+    // count then reflects only what the current view needs (and shrinks on a zoom-out). Runs only
+    // on active frames; the drain-to-0 frame is active (busy via tileManager._dirty), so the burst
+    // always ends and the indicator's own debounce hides the pill.
+    _tileIndicator.update(_tileCounter.setOutstanding(
+        tileManager._pendingLoads + tileManager._loadQueue.length, _viewChanged));
+    _viewChanged = false;
+
     renderer.render(scene, camera);
 
-    // Render overview panels
-    overviewPanel.render();
+    // Render overview panels (skip when the panel is collapsed/disabled —
+    // it would otherwise cost two extra full-scene renders per frame)
+    if (overviewPanel.enabled) overviewPanel.render();
 
     // Update scale bar and axis gizmo
     scaleBar.update(camera, controls);
     axisGizmo.render(renderer, camera);
 
-    // Stats + FPS
+    // Stats + FPS (counted over rendered frames only)
     frameCount++;
     const now = performance.now();
     if (now - lastTime >= 1000) {
         fps = Math.round(frameCount * 1000 / (now - lastTime));
         frameCount = 0;
         lastTime = now;
-        statFPS.textContent = fps;
+        statFPS.textContent = `${fps} · ${renderer.info.render.calls} draws`;
     }
     statLoaded.textContent = tileManager.loadedCount;
     statVisible.textContent = tileManager.visibleCount;
@@ -690,6 +811,73 @@ function animate() {
 /**
  * Reset camera to frame the tileset bounding volume.
  */
+/**
+ * Frame the main camera so an arbitrary world-space box fills the view, centered.
+ * Uses the same fixed oblique angle as frameZoomRegion so overview clicks and the
+ * zoom slider agree. The box's center projects to screen-center after this.
+ */
+function frameBox(box) {
+    if (!box) return;
+    const center = new THREE.Vector3(); box.getCenter(center);
+    const size = new THREE.Vector3(); box.getSize(size);
+    const maxDim = Math.max(size.x, size.y, size.z) || 1;
+    camera.position.set(
+        center.x + maxDim * 0.6,
+        center.y - maxDim * 0.6,
+        center.z + maxDim * 0.5,
+    );
+    camera.lookAt(center);
+    controls.target.copy(center);
+    controls.update();
+}
+
+/**
+ * Frame the main camera on a CENTERED region sized to a zoom level: the region is
+ * the full volume scaled by 1/2^z (one octree tile's footprint at that zoom). So
+ * z0 frames the whole volume, and each finer level zooms into a centered detail.
+ */
+function frameZoomRegion(z) {
+    const box = tileManager.root?.box3;
+    if (!box) return;
+    const center = new THREE.Vector3(); box.getCenter(center);
+    const size = new THREE.Vector3(); box.getSize(size);
+    const maxDim = Math.max(size.x, size.y, size.z);
+    const ring = parseInt(overviewRingSlider.value) || 0;
+    // Region extent (incl. neighbor ring) as a fraction of the full volume — matches
+    // the overview's selection box: (2*ring+1) tiles at this zoom.
+    const f = (2 * ring + 1) / Math.pow(2, Math.max(0, z));
+    camera.position.set(
+        center.x + maxDim * 0.6 * f,
+        center.y - maxDim * 0.6 * f,
+        center.z + maxDim * 0.5 * f,
+    );
+    camera.lookAt(center);
+    controls.target.copy(center);
+    controls.update();
+}
+
+/**
+ * Focus the main view + spatial filter on the overview's CURRENT selection box (the
+ * orange box) so the loaded tiles land exactly at the center of the view. This is the
+ * single source of truth shared by initial load, the zoom slider, and overview clicks
+ * — framing the raw volume center instead would be off by up to half a tile (the
+ * crosshair snaps to a tile center, which for an even grid is offset from the volume
+ * center). Falls back to the raw volume center only if the overview box isn't ready.
+ */
+function focusOverviewBox() {
+    const ring = parseInt(overviewRingSlider.value) || 0;
+    const box = overviewPanel.bounds ? overviewPanel._computeSelectionBox() : null;
+    if (box) {
+        tileManager.setSpatialFilter(box.getCenter(new THREE.Vector3()), ring);
+        frameBox(box);
+    } else if (tileManager.root?.box3) {
+        const c = new THREE.Vector3();
+        tileManager.root.box3.getCenter(c);
+        tileManager.setSpatialFilter(c, ring);
+        frameZoomRegion(tileManager.forcedZoom);
+    }
+}
+
 function resetCamera() {
     if (!tileManager.root?.box3) return;
     const box = tileManager.root.box3;
@@ -699,19 +887,23 @@ function resetCamera() {
     box.getSize(size);
     const maxDim = Math.max(size.x, size.y, size.z);
 
-    // Adapt clipping planes to dataset scale
+    // Adapt clipping planes + zoom limits to dataset scale. Coordinates range from
+    // nanometers (EM/connectome) to meters (anatomy); a fixed minDistance would clamp
+    // zoom-in on small-coordinate datasets (e.g. a ~1.8-unit HRA body vs the old minDistance 10).
     camera.near = maxDim * 0.0001;
     camera.far = maxDim * 10;
     camera.updateProjectionMatrix();
+    controls.minDistance = maxDim * 0.0005;
 
-    camera.position.set(
-        center.x + maxDim * 0.6,
-        center.y - maxDim * 0.6,
-        center.z + maxDim * 0.5,
-    );
-    camera.lookAt(center);
-    controls.target.copy(center);
-    controls.update();
+    // Scale bar reads real-world units from tilejson3d (meters_per_unit); defaults to nm (EM).
+    scaleBar.setMetersPerUnit(tileManager.metersPerUnit ?? 1e-9);
+    overviewPanel.metersPerUnit = tileManager.metersPerUnit ?? 1e-9;  // overview scale bar too
+
+    // Constrain loading to EXACTLY the centered region the overview's orange box shows,
+    // and frame the camera on that box's center — from the very first frame, not just
+    // after the user touches a control. (Requires overviewPanel.setBounds() to have run
+    // first; loadPyramid/init order this before resetCamera.)
+    focusOverviewBox();
 
     slicePlanePanel.updateBounds(box);
 }
@@ -721,9 +913,13 @@ function resetCamera() {
  */
 function syncZoomSlider() {
     zoomSlider.max = tileManager.maxZoom;
-    zoomSlider.value = tileManager.maxZoom;
-    zoomLabel.textContent = tileManager.maxZoom;
-    tileManager.forcedZoom = tileManager.maxZoom;
+    // Default to a MID zoom (e.g. z2 for a 0-4 pyramid): open on a centered detail,
+    // not the whole volume at the finest level.
+    const mid = Math.round(tileManager.maxZoom / 2);
+    zoomSlider.value = mid;
+    zoomLabel.textContent = mid;
+    tileManager.forcedZoom = mid;
+    overviewPanel.currentZoom = mid;   // keep the overview selection box in sync
 }
 
 function syncOverviewRingMax() {
@@ -744,20 +940,26 @@ async function loadPyramid(pyramid) {
     loadingEl.style.display = '';
     loadingEl.textContent = `Loading ${pyramid.label}...`;
 
+    _facetColCache.clear();   // drop the previous pyramid's cached facet columns (they're keyed by URL and never re-read)
+
     const baseUrl = `/tiles/${pyramid.id}/`;
     const featuresUrl = `/tiles/${pyramid.id}/features.json`;
 
-    await tileManager.switchPyramid(baseUrl);
+    // Fetch + parse features.json ONCE and share it with both consumers
+    // (the payload can be hundreds of MB at 100k+ features).
+    const featuresData = await (await fetch(featuresUrl)).json();
+    await tileManager.switchPyramid(baseUrl, featuresData);
     const idFieldsArr = tileManager.idFields ? [...tileManager.idFields] : [];
-    await featureSelector.init(featuresUrl, idFieldsArr);
+    const { schema, facetStore } = facetContext(tileManager);
+    await featureSelector.init(featuresData, idFieldsArr, schema, facetStore);
     syncZoomSlider();
-    resetCamera();
-
-    // Update overview panel
+    // Set up the overview (bounds + crosshair snapped to the mid-zoom tile center) BEFORE
+    // framing, so resetCamera centers the main view on the overview's selection box.
     overviewPanel.setFeatureIndex(tileManager.featureIndex);
     overviewPanel.setBounds(tileManager.root.box3, tileManager.maxZoom, baseUrl);
-    overviewPanel.loadTiles();
     syncOverviewRingMax();
+    resetCamera();
+    overviewPanel.loadTiles().then(requestRender);   // repaint once z0 tiles arrive (render-on-demand)
     overviewPanel.setSelectedFeatures(featureSelector.selected);
 
     // Reset color-by state for new pyramid
@@ -787,25 +989,36 @@ async function init() {
             // Use the first pyramid from manifest
             baseUrl = `/tiles/${defaultPyramid.id}/`;
             tileManager = new TileManager(scene, baseUrl);
-            await tileManager.init();
+            // Fetch + parse features.json ONCE and share it with both consumers.
+            const featuresData = await (await fetch(`/tiles/${defaultPyramid.id}/features.json`)).json();
+            await tileManager.init(featuresData);
             const idFieldsArr = tileManager.idFields ? [...tileManager.idFields] : [];
-            await featureSelector.init(`/tiles/${defaultPyramid.id}/features.json`, idFieldsArr);
+            const { schema, facetStore } = facetContext(tileManager);
+            await featureSelector.init(featuresData, idFieldsArr, schema, facetStore);
         } else {
             // Fallback: no manifest, try legacy single-pyramid path
             baseUrl = '/tiles/';
             tileManager = new TileManager(scene, baseUrl);
-            await tileManager.init();
-            await featureSelector.init('/tiles/features.json');
+            const featuresData = await (await fetch('/tiles/features.json')).json();
+            await tileManager.init(featuresData);
+            const { schema, facetStore } = facetContext(tileManager);
+            await featureSelector.init(featuresData, [], schema, facetStore);
         }
 
-        syncZoomSlider();
-        resetCamera();
+        // The GPU-budget slider is the single source of truth. Sync the freshly-created
+        // TileManager's maxGpuMB from it on load so the constructor default (1024) can no
+        // longer disagree with the value shown in the UI.
+        tileManager.maxGpuMB = parseInt(gpuSlider.value);
 
-        // Update overview panel
+        syncZoomSlider();
+        // Set up the overview (bounds + crosshair snapped to the mid-zoom tile center)
+        // BEFORE framing, so resetCamera centers the main view on the overview's
+        // selection box rather than the raw volume center.
         overviewPanel.setFeatureIndex(tileManager.featureIndex);
         overviewPanel.setBounds(tileManager.root.box3, tileManager.maxZoom, baseUrl);
-        overviewPanel.loadTiles();
         syncOverviewRingMax();
+        resetCamera();
+        overviewPanel.loadTiles().then(requestRender);   // repaint once z0 tiles arrive (render-on-demand)
 
         // Populate color-by dropdown
         populateColorByDropdown(tileManager.featureIndex, tileManager.idFields);

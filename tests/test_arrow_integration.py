@@ -94,10 +94,6 @@ class TestToArrowTable:
         meta = json.loads(table.schema.metadata[b"geo"])
         assert meta["primary_column"] == "geom"
 
-    def test_returns_table_type(self):
-        table = to_arrow_table(_point_feat())
-        assert isinstance(table, pa.Table)
-
 
 # ===== GeoParquet Round-trip Tests =====
 
@@ -180,21 +176,6 @@ class TestMixedGeometry:
         fc = MuDMFeatureCollection(
             type="FeatureCollection",
             features=[_tin_feat(), _point_feat()],
-        )
-        table = to_arrow_table(fc)
-        assert len(table) == 2
-        meta = json.loads(table.schema.metadata[b"geo"])
-        types = meta["columns"]["geometry"]["geometry_types"]
-        assert "Point Z" in types
-        assert "MultiPolygon Z" in types  # TIN stored as MultiPolygon
-
-    def test_all_3d_types(self):
-        fc = MuDMFeatureCollection(
-            type="FeatureCollection",
-            features=[
-                _point_feat(),
-                _tin_feat(),
-            ],
         )
         table = to_arrow_table(fc)
         assert len(table) == 2

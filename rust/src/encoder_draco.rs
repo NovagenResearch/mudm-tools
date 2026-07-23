@@ -125,14 +125,62 @@ pub fn encode_draco_mesh(
     // Build the Draco mesh directly in memory. The u32 -> f32 cast is exact for
     // values < 2^24 (covers 16-bit quantization), identical to the cast the old
     // OBJ bridge performed when float-formatting each vertex.
-    let pos: Vec<NdVector<3, f32>> = positions
-        .chunks_exact(3)
-        .map(|c| NdVector::from([c[0] as f32, c[1] as f32, c[2] as f32]))
-        .collect();
-    let faces: Vec<[usize; 3]> = indices
-        .chunks_exact(3)
-        .map(|c| [c[0] as usize, c[1] as usize, c[2] as usize])
-        .collect();
+    // Sanitize the mesh so the vendored Draco edgebreaker never sees an unused
+    // vertex (its corner-table panics on those: draco-oxide core/corner_table).
+    // Two ways a vertex gets orphaned: (1) it's simply not referenced by any face;
+    // (2) a triangle has two vertices at the SAME QUANTIZED position — `build()`
+    // dedups coincident positions, collapsing that triangle to a line, and its
+    // degenerate-filter then drops it, freeing the third vertex. The upstream
+    // pre-quantization filter (streaming.rs:is_valid_triangle) can't catch case 2.
+    // So: drop quant-degenerate faces here, then compact the now-unused vertices.
+    let same_pos = |a: usize, b: usize| {
+        positions[a * 3] == positions[b * 3]
+            && positions[a * 3 + 1] == positions[b * 3 + 1]
+            && positions[a * 3 + 2] == positions[b * 3 + 2]
+    };
+    let mut kept: Vec<[usize; 3]> = Vec::with_capacity(indices.len() / 3);
+    for c in indices.chunks_exact(3) {
+        let (a, b, cc) = (c[0] as usize, c[1] as usize, c[2] as usize);
+        if a >= n_verts || b >= n_verts || cc >= n_verts {
+            return Err(format!("index out of range (n_verts={})", n_verts));
+        }
+        // Keep only triangles with three distinct vertices AND three distinct
+        // quantized positions (so they survive build()'s position-dedup).
+        if a != b && b != cc && a != cc && !same_pos(a, b) && !same_pos(b, cc) && !same_pos(a, cc) {
+            kept.push([a, b, cc]);
+        }
+    }
+    if kept.is_empty() {
+        return Err("mesh has no non-degenerate faces after quantization".to_string());
+    }
+    let mut used = vec![false; n_verts];
+    for t in &kept {
+        used[t[0]] = true;
+        used[t[1]] = true;
+        used[t[2]] = true;
+    }
+    let (pos, faces): (Vec<NdVector<3, f32>>, Vec<[usize; 3]>) = if used.iter().all(|&u| u) {
+        let pos = positions
+            .chunks_exact(3)
+            .map(|c| NdVector::from([c[0] as f32, c[1] as f32, c[2] as f32]))
+            .collect();
+        (pos, kept)
+    } else {
+        let mut remap = vec![0usize; n_verts];
+        let mut pos: Vec<NdVector<3, f32>> = Vec::with_capacity(n_verts);
+        for v in 0..n_verts {
+            if used[v] {
+                remap[v] = pos.len();
+                pos.push(NdVector::from([
+                    positions[v * 3] as f32,
+                    positions[v * 3 + 1] as f32,
+                    positions[v * 3 + 2] as f32,
+                ]));
+            }
+        }
+        let faces = kept.iter().map(|t| [remap[t[0]], remap[t[1]], remap[t[2]]]).collect();
+        (pos, faces)
+    };
 
     // A1 LOSSLESS, libdraco-conformant NG path:
     // The positions arrive pre-quantized to the integer grid [0, 2^qbits - 1]
@@ -451,6 +499,43 @@ mod tests {
         assert_eq!(a, b, "encode is non-deterministic (a != b)");
         assert_eq!(b, c, "encode is non-deterministic (b != c)");
         assert_eq!(&a[..5], b"DRACO", "missing DRACO magic");
+    }
+
+    #[test]
+    fn test_encode_draco_mesh_compacts_unused_vertices() {
+        // Vertex 0 is UNUSED — no triangle references it. This mirrors the NG
+        // fragment path, where the degenerate-triangle filter (streaming.rs) can
+        // orphan a vertex while it stays in the position array. The vendored Draco
+        // edgebreaker corner-table panics on unused vertices; encode_draco_mesh must
+        // compact them out and still encode the remaining triangle.
+        let positions: &[u32] = &[
+            500, 500, 500,   // v0 — UNUSED (orphan)
+            0, 0, 0,         // v1
+            100, 0, 0,       // v2
+            50, 100, 0,      // v3
+        ];
+        let indices: &[u32] = &[1, 2, 3]; // references v1,v2,v3 only; v0 orphaned
+        let got = encode_draco_mesh(positions, indices, 10);
+        assert!(
+            got.is_ok(),
+            "encode_draco_mesh must compact unused vertices, got err: {:?}",
+            got.err()
+        );
+        assert_eq!(&got.unwrap()[..5], b"DRACO", "missing DRACO magic");
+
+        // The real NG pathology: a triangle with two vertices at the SAME quantized
+        // position. build()'s position-dedup collapses it to a line, its degenerate-
+        // filter drops it, and the third vertex is orphaned → corner-table panic —
+        // unless we drop the quant-degenerate face first. Here face 0 (v0==v1) is
+        // dropped while the good face 1 still encodes.
+        let mix_pos: &[u32] = &[10, 10, 10, 10, 10, 10, 100, 0, 0, 50, 100, 0, 200, 50, 0];
+        let mix_idx: &[u32] = &[0, 1, 2, 2, 3, 4];
+        let mixed = encode_draco_mesh(mix_pos, mix_idx, 10);
+        assert!(
+            mixed.is_ok(),
+            "must drop quant-degenerate face + keep the good one, got {:?}",
+            mixed.err()
+        );
     }
 
     #[test]

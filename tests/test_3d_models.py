@@ -4,12 +4,9 @@ and new MuDM 3D geometry types."""
 import pytest
 from pydantic import ValidationError
 from geojson_pydantic import (
-    Point,
-    MultiPoint,
     LineString,
-    MultiLineString,
+    Point,
     Polygon,
-    MultiPolygon,
 )
 from mudm.model import (
     MuDM,
@@ -19,43 +16,32 @@ from mudm.model import (
 )
 
 # ---------------------------------------------------------------------------
-# Step 1a: Existing geometry types accept [x, y, z] coordinates
+# Step 1: Dependency tripwires for 3D support on re-used geojson_pydantic types
 # ---------------------------------------------------------------------------
+# muDM re-uses geojson_pydantic's Point/LineString/Polygon/... unmodified, so 3D
+# coordinate acceptance, the 6-element bbox, the has_z property, and 3D JSON
+# round-trip are all third-party behavior, not muDM code. These few cases are
+# kept as tripwires that fail loudly if the dependency ever drops 3D support.
+# (This block was consolidated from 18 near-identical per-type/per-property
+# assertions to 6 representative cases.) muDM's OWN 3D geometry is exercised by
+# TestPolyhedralSurface / TestTIN / TestMuDM3DIntegration below.
 
 
-class TestExistingTypes3DCoords:
-    """Verify geojson_pydantic geometry types accept 3D coordinates."""
+class TestDependency3DSupport:
+    """Tripwires: geojson_pydantic (re-used by mudm.model) must keep 3D support."""
 
-    def test_point_3d(self):
+    def test_point_accepts_3d_coords(self):
         p = Point(type="Point", coordinates=(1.0, 2.0, 3.0))
         assert p.coordinates[2] == 3.0
 
-    def test_multipoint_3d(self):
-        mp = MultiPoint(
-            type="MultiPoint",
-            coordinates=[(1.0, 2.0, 3.0), (4.0, 5.0, 6.0)],
-        )
-        assert len(mp.coordinates) == 2
-        assert mp.coordinates[0][2] == 3.0
-
-    def test_linestring_3d(self):
+    def test_linestring_accepts_3d_coords(self):
         ls = LineString(
             type="LineString",
             coordinates=[(0.0, 0.0, 0.0), (10.0, 10.0, 5.0)],
         )
         assert ls.coordinates[1][2] == 5.0
 
-    def test_multilinestring_3d(self):
-        mls = MultiLineString(
-            type="MultiLineString",
-            coordinates=[
-                [(0.0, 0.0, 0.0), (1.0, 1.0, 1.0)],
-                [(2.0, 2.0, 2.0), (3.0, 3.0, 3.0)],
-            ],
-        )
-        assert mls.coordinates[1][0][2] == 2.0
-
-    def test_polygon_3d(self):
+    def test_polygon_accepts_3d_coords(self):
         ring = [
             (0.0, 0.0, 1.0),
             (10.0, 0.0, 1.0),
@@ -65,26 +51,11 @@ class TestExistingTypes3DCoords:
         poly = Polygon(type="Polygon", coordinates=[ring])
         assert poly.coordinates[0][0][2] == 1.0
 
-    def test_multipolygon_3d(self):
-        ring = [
-            (0.0, 0.0, 5.0),
-            (10.0, 0.0, 5.0),
-            (10.0, 10.0, 5.0),
-            (0.0, 0.0, 5.0),
-        ]
-        mp = MultiPolygon(type="MultiPolygon", coordinates=[[ring]])
-        assert mp.coordinates[0][0][0][2] == 5.0
+    def test_has_z_detects_2d_vs_3d(self):
+        assert Point(type="Point", coordinates=(1.0, 2.0)).has_z is False
+        assert Point(type="Point", coordinates=(1.0, 2.0, 3.0)).has_z is True
 
-
-# ---------------------------------------------------------------------------
-# Step 1b: 3D bounding box support
-# ---------------------------------------------------------------------------
-
-
-class TestBBox3D:
-    """Verify 3D bbox [minx, miny, minz, maxx, maxy, maxz] works."""
-
-    def test_point_3d_bbox(self):
+    def test_3d_bbox_accepted(self):
         p = Point(
             type="Point",
             coordinates=(5.0, 10.0, 15.0),
@@ -93,104 +64,12 @@ class TestBBox3D:
         assert len(p.bbox) == 6
         assert p.bbox == (0.0, 0.0, 0.0, 100.0, 100.0, 50.0)
 
-    def test_polygon_3d_bbox(self):
-        ring = [
-            (0.0, 0.0, 1.0),
-            (10.0, 0.0, 1.0),
-            (10.0, 10.0, 1.0),
-            (0.0, 0.0, 1.0),
-        ]
-        poly = Polygon(
-            type="Polygon",
-            coordinates=[ring],
-            bbox=(0.0, 0.0, 1.0, 10.0, 10.0, 1.0),
-        )
-        assert len(poly.bbox) == 6
-
-    def test_linestring_3d_bbox(self):
+    def test_3d_coords_survive_json_roundtrip(self):
         ls = LineString(
             type="LineString",
             coordinates=[(0.0, 0.0, 0.0), (10.0, 10.0, 5.0)],
-            bbox=(0.0, 0.0, 0.0, 10.0, 10.0, 5.0),
         )
-        assert ls.bbox[5] == 5.0
-
-
-# ---------------------------------------------------------------------------
-# Step 1c: has_z property detection
-# ---------------------------------------------------------------------------
-
-
-class TestHasZ:
-    """Verify has_z property detects 3D coordinates."""
-
-    def test_point_2d_has_z_false(self):
-        p = Point(type="Point", coordinates=(1.0, 2.0))
-        assert p.has_z is False
-
-    def test_point_3d_has_z_true(self):
-        p = Point(type="Point", coordinates=(1.0, 2.0, 3.0))
-        assert p.has_z is True
-
-    def test_linestring_3d_has_z_true(self):
-        ls = LineString(
-            type="LineString",
-            coordinates=[(0.0, 0.0, 0.0), (1.0, 1.0, 1.0)],
-        )
-        assert ls.has_z is True
-
-    def test_polygon_2d_has_z_false(self):
-        ring = [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 0.0)]
-        poly = Polygon(type="Polygon", coordinates=[ring])
-        assert poly.has_z is False
-
-    def test_polygon_3d_has_z_true(self):
-        ring = [
-            (0.0, 0.0, 1.0),
-            (1.0, 0.0, 1.0),
-            (1.0, 1.0, 1.0),
-            (0.0, 0.0, 1.0),
-        ]
-        poly = Polygon(type="Polygon", coordinates=[ring])
-        assert poly.has_z is True
-
-    def test_multipoint_3d_has_z_true(self):
-        mp = MultiPoint(
-            type="MultiPoint",
-            coordinates=[(1.0, 2.0, 3.0), (4.0, 5.0, 6.0)],
-        )
-        assert mp.has_z is True
-
-
-# ---------------------------------------------------------------------------
-# Step 1 (extra): Round-trip serialization with 3D coords
-# ---------------------------------------------------------------------------
-
-
-class TestRoundTrip3D:
-    """Verify 3D geometries survive JSON round-trip."""
-
-    def test_point_3d_roundtrip(self):
-        data = {"type": "Point", "coordinates": [1.0, 2.0, 3.0]}
-        p = Point.model_validate(data)
-        dumped = p.model_dump()
-        assert dumped["coordinates"][2] == 3.0
-
-    def test_polygon_3d_roundtrip(self):
-        ring = [[0, 0, 1], [10, 0, 1], [10, 10, 1], [0, 0, 1]]
-        data = {"type": "Polygon", "coordinates": [ring]}
-        poly = Polygon.model_validate(data)
-        dumped = poly.model_dump()
-        assert dumped["coordinates"][0][0][2] == 1.0
-
-    def test_linestring_3d_json_roundtrip(self):
-        data = {
-            "type": "LineString",
-            "coordinates": [[0, 0, 0], [10, 10, 5]],
-        }
-        ls = LineString.model_validate(data)
-        json_str = ls.model_dump_json()
-        ls2 = LineString.model_validate_json(json_str)
+        ls2 = LineString.model_validate_json(ls.model_dump_json())
         assert ls2.coordinates[1][2] == 5.0
 
 

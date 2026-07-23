@@ -13,6 +13,7 @@ Usage:
 
 import argparse
 import gzip as _gzip
+import mimetypes
 import os
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
@@ -23,6 +24,10 @@ try:
     _HAS_BROTLI = True
 except ImportError:
     _HAS_BROTLI = False
+
+# Serve .mjs as JavaScript — browsers reject ES module scripts with a non-JS MIME, which would blank the
+# viewer (both viewers top-level `import` a .mjs). Python 3.11+ maps it; register explicitly for robustness.
+mimetypes.add_type("text/javascript", ".mjs")
 
 _VIEWERS_DIR = Path(__file__).resolve().parent / "viewers"
 
@@ -171,7 +176,7 @@ class TileHandler(SimpleHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Origin", "*")
         if self.path.endswith(".glb"):
             self.send_header("Cache-Control", "public, max-age=86400")
-        elif self.path.endswith((".js", ".html", ".json", ".css")):
+        elif self.path.endswith((".js", ".mjs", ".html", ".json", ".css")):
             self.send_header("Cache-Control", "no-cache")
         super().end_headers()
 

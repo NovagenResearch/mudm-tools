@@ -12,14 +12,22 @@ import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { DRACOLoader } from 'three/addons/loaders/DRACOLoader.js';
 import { MeshoptDecoder } from 'three/addons/libs/meshopt_decoder.module.js';
 
-// "Nice" numbers for scale bar labels
-const NICE = [1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000,
-              10000, 20000, 50000, 100000, 200000, 500000, 1000000];
+// "Nice" lengths in METERS, 1 nm \u2026 50 m (decade \u00D7 {1,2,5}) \u2014 matches ScaleBar.js.
+const NICE_M = [];
+for (let e = -9; e <= 1; e++) for (const m of [1, 2, 5]) NICE_M.push(m * Math.pow(10, e));
 
-function formatDistance(val) {
-    if (val >= 1000000) return (val / 1000000).toFixed(val % 1000000 === 0 ? 0 : 1) + ' mm';
-    if (val >= 1000) return (val / 1000).toFixed(val % 1000 === 0 ? 0 : 1) + ' \u00B5m';
-    return val + ' nm';
+function _nn(v) {
+    const r = Math.round(v * 10) / 10;
+    return (r % 1 === 0) ? r.toFixed(0) : r.toFixed(1);
+}
+
+// Format a length in METERS to a human-readable string (nm/\u00B5m/mm/cm/m).
+function formatDistance(m) {
+    if (m >= 1) return _nn(m) + ' m';
+    if (m >= 1e-2) return _nn(m * 1e2) + ' cm';
+    if (m >= 1e-3) return _nn(m * 1e3) + ' mm';
+    if (m >= 1e-6) return _nn(m * 1e6) + ' \u00B5m';
+    return _nn(m * 1e9) + ' nm';
 }
 
 /** Axis configuration per projection plane. */
@@ -50,6 +58,13 @@ export class OverviewPanel {
         this.bounds = null;       // THREE.Box3
         this.maxZoom = 3;
         this.baseUrl = '';
+        // GLB tiles live under <baseUrl>/3dtiles/ (converter layout + the root tileset's prefixed
+        // content URIs). features.json lists tiles by BARE "z/x/y/d", so prepend this so the
+        // overview resolves on a plain static origin (CloudFront) — not just via mudm-serve's
+        // /tiles→3dtiles fallback. Mirrors how TileManager loads via the (prefixed) node.uri.
+        this.tilePath = '3dtiles';
+        // World-unit → meters (from tilejson3d meters_per_unit; set by main.js). nm default.
+        this.metersPerUnit = 1e-9;
 
         // Crosshair world position (center of selection)
         this.crosshairPos = new THREE.Vector3();
@@ -91,6 +106,15 @@ export class OverviewPanel {
 
         // Track loaded state
         this._tilesLoaded = false;
+
+        // Static projection posters (the scalable overview path). When a dataset
+        // ships <baseUrl>overview/{xy,xz,yz}.png we display those on world-space
+        // quads instead of loading + live-rendering all z0 neuron geometry — so
+        // the overview cost is constant (3 images) at any neuron count. Live z0
+        // rendering remains as a fallback for legacy datasets without posters.
+        this._postersAvailable = false;
+        this._posterTex = {};       // plane ('xy'|'xz'|'yz') -> THREE.Texture
+        this._posterGroup = null;   // holds the per-panel textured quads
 
         // Scale bar elements (set in initDOM)
         this._scaleBars = [null, null];
@@ -218,6 +242,7 @@ export class OverviewPanel {
         this._updateLabels();
         this._updateCameras();
         this._updateOverlays();
+        this._buildPosterQuads();   // no-op unless posters are loaded
     }
 
     /**
@@ -248,14 +273,27 @@ export class OverviewPanel {
     }
 
     /**
-     * Load zoom-0 GLBs from the feature index into the overview scene.
+     * Populate the overview. Prefers pre-rendered static projection posters
+     * (constant cost, scales to any neuron count); falls back to loading the
+     * zoom-0 GLBs and rendering geometry live for legacy datasets.
      */
     async loadTiles() {
-        if (!this._featureIndex || !this.baseUrl) return;
+        if (!this.baseUrl) return;
 
-        // Clear existing tile meshes
+        // Clear existing tile meshes + posters
         this._clearTiles();
 
+        // Preferred path: static XY/XZ/YZ posters.
+        const ok = await this.loadPosters();
+        if (ok) {
+            this._tilesLoaded = true;
+            console.log('[OverviewPanel] Using static projection posters');
+            return;
+        }
+
+        if (!this._featureIndex) return;
+
+        // Fallback: load zoom-0 GLBs and render geometry live.
         // Collect all unique zoom-0 URIs across all features
         const uris = new Set();
         for (const feat of Object.values(this._featureIndex)) {
@@ -276,6 +314,101 @@ export class OverviewPanel {
         this._tilesLoaded = true;
         this._applyFeatureVisibility();
         console.log(`[OverviewPanel] Loaded. Features: ${Object.keys(this._meshByFeature).length}`);
+    }
+
+    /**
+     * Try to load static projection posters from <baseUrl>overview/overview.json.
+     * Returns true if at least one plane poster loaded (then quads are built).
+     */
+    async loadPosters() {
+        try {
+            const res = await fetch(this.baseUrl + 'overview/overview.json');
+            if (!res.ok) return false;
+            const meta = await res.json();
+            const planes = meta.planes || {};
+            const loader = new THREE.TextureLoader();
+            this._posterTex = {};
+            await Promise.all(Object.entries(planes).map(([plane, fname]) =>
+                new Promise(resolve => {
+                    loader.load(this.baseUrl + 'overview/' + fname, tex => {
+                        tex.colorSpace = THREE.SRGBColorSpace;
+                        tex.minFilter = THREE.LinearFilter;   // posters are NPOT — no mipmaps
+                        tex.generateMipmaps = false;
+                        this._posterTex[plane] = tex;
+                        resolve();
+                    }, undefined, () => resolve());   // missing/failed plane -> skip
+                })
+            ));
+            this._postersAvailable = Object.keys(this._posterTex).length > 0;
+            if (this._postersAvailable) this._buildPosterQuads();
+            return this._postersAvailable;
+        } catch (e) {
+            return false;
+        }
+    }
+
+    /**
+     * (Re)build the two textured poster quads for the current axis pair. Each
+     * quad spans the world bounds in its plane and lives on the panel's layer
+     * (i+1) so only that panel's camera renders it.
+     */
+    _buildPosterQuads() {
+        if (!this._postersAvailable || !this.bounds) return;
+        if (!this._posterGroup) {
+            this._posterGroup = new THREE.Group();
+            this._scene.add(this._posterGroup);
+        }
+        while (this._posterGroup.children.length > 0) {
+            const c = this._posterGroup.children[0];
+            c.geometry?.dispose();   // textures are reused across rebuilds — keep them
+            this._posterGroup.remove(c);
+        }
+        const axes = AXIS_PAIRS[this._axisPair];
+        if (!axes) return;
+        for (let i = 0; i < 2; i++) {
+            const tex = this._posterTex[axes[i]];
+            if (!tex) continue;
+            this._posterGroup.add(this._planeQuad(axes[i], tex, i + 1));
+        }
+    }
+
+    /**
+     * Build a world-space quad spanning the bounds in `plane`, textured with
+     * `texture`, on layer `layer`. UV (0,0) maps to (hMin, vMin); with the
+     * default texture flipY this aligns the poster (rendered top=vMax,
+     * left=hMin) to each panel camera (right=+hAxis, up=+vAxis).
+     */
+    _planeQuad(plane, texture, layer) {
+        const cfg = AXIS_CFG[plane];
+        const lim = {
+            x: [this.bounds.min.x, this.bounds.max.x],
+            y: [this.bounds.min.y, this.bounds.max.y],
+            z: [this.bounds.min.z, this.bounds.max.z],
+        };
+        const h = cfg.hAxis, v = cfg.vAxis;
+        const third = ['x', 'y', 'z'].find(a => a !== h && a !== v);
+        const mid = (lim[third][0] + lim[third][1]) / 2;
+        const corner = (hv, vv) => {
+            const p = { x: 0, y: 0, z: 0 };
+            p[h] = hv; p[v] = vv; p[third] = mid;
+            return [p.x, p.y, p.z];
+        };
+        const [h0, h1] = lim[h], [v0, v1] = lim[v];
+        const positions = new Float32Array([
+            ...corner(h0, v0), ...corner(h1, v0), ...corner(h1, v1), ...corner(h0, v1),
+        ]);
+        const uvs = new Float32Array([0, 0, 1, 0, 1, 1, 0, 1]);
+        const geo = new THREE.BufferGeometry();
+        geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+        geo.setAttribute('uv', new THREE.BufferAttribute(uvs, 2));
+        geo.setIndex([0, 1, 2, 0, 2, 3]);
+        const mat = new THREE.MeshBasicMaterial({
+            map: texture, side: THREE.DoubleSide, depthWrite: false,
+        });
+        const mesh = new THREE.Mesh(geo, mat);
+        mesh.renderOrder = -1;     // behind the crosshair/selection overlays
+        mesh.layers.set(layer);
+        return mesh;
     }
 
     /**
@@ -309,10 +442,19 @@ export class OverviewPanel {
     }
 
     /**
-     * Fire the selection change callback with current crosshair + ring.
+     * Fire the selection change callback with the selection box's true 3D
+     * center + ring + the box itself.
+     *
+     * We pass the SELECTION-BOX center (not the raw crosshair): for a symmetric
+     * unclamped ring they coincide, but at the volume edge the box is clamped, so
+     * its center is the point that actually centers the orange box in the main
+     * view. The box is forwarded so the caller can reframe (fit + center) onto it
+     * instead of panning with a stale camera offset.
      */
     _fireSelectionChange() {
-        this.onSelectionChange(this.crosshairPos.clone(), this._ring);
+        const box = this._computeSelectionBox();
+        const center = box ? box.getCenter(new THREE.Vector3()) : this.crosshairPos.clone();
+        this.onSelectionChange(center, this._ring, box);
     }
 
     // ---------------------------------------------------------------
@@ -538,20 +680,19 @@ export class OverviewPanel {
         const widthPx = rect.width;
         if (widthPx === 0) return;
 
-        // World units visible across the canvas width
+        // World units visible across the canvas width → real meters per pixel.
         const worldWidth = cam.right - cam.left;
-        const worldPerPx = worldWidth / widthPx;
-        const targetPx = 100;
-        const targetWorld = worldPerPx * targetPx;
+        const metersPerPx = (worldWidth / widthPx) * this.metersPerUnit;
+        const targetMeters = metersPerPx * 100;  // ~100 px target bar
 
-        // Find largest nice number <= targetWorld
-        let best = NICE[0];
-        for (const n of NICE) {
-            if (n <= targetWorld) best = n;
+        // Largest "nice" length (meters) that fits the target pixel width.
+        let best = NICE_M[0];
+        for (const n of NICE_M) {
+            if (n <= targetMeters) best = n;
             else break;
         }
 
-        const barPx = best / worldPerPx;
+        const barPx = best / metersPerPx;
         el.querySelector('.scale-bar-line').style.width = barPx + 'px';
         el.querySelector('.scale-bar-label').textContent = formatDistance(best);
     }
@@ -728,6 +869,18 @@ export class OverviewPanel {
         }
         this._meshByFeature = {};
         this._tilesLoaded = false;
+
+        // Tear down static posters too (pyramid switch reloads them).
+        if (this._posterGroup) {
+            while (this._posterGroup.children.length > 0) {
+                const c = this._posterGroup.children[0];
+                c.geometry?.dispose();
+                this._posterGroup.remove(c);
+            }
+        }
+        for (const tex of Object.values(this._posterTex)) tex.dispose?.();
+        this._posterTex = {};
+        this._postersAvailable = false;
     }
 
     /**
@@ -735,7 +888,9 @@ export class OverviewPanel {
      */
     async _loadGLB(uri) {
         try {
-            const tileUri = uri.includes('.') ? uri : uri + '.glb';
+            const leaf = uri.includes('.') ? uri : uri + '.glb';
+            const tileUri = (this.tilePath && !leaf.startsWith(this.tilePath + '/'))
+                ? this.tilePath + '/' + leaf : leaf;
             const url = this.baseUrl + tileUri + '?v=' + Date.now();
             const gltf = await this._loader.loadAsync(url);
             const group = gltf.scene;

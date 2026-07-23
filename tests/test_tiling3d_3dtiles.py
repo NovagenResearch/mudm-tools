@@ -762,19 +762,20 @@ def _generate_3dtiles_spread(
 
 
 def test_glb_back_pressure_keeps_peak_within_budget(tmp_path):
-    """WS-C C.2 gate: a tiny ceiling that under-estimates with the disk*3.0
-    guess must force >1 batch via re-split, keeping peak resident decoded
-    bytes within budget — AND the GLB output stays byte-identical to the
-    default-budget (C.1) run (the feature_id sort is preserved)."""
+    """WS-C gate: a tiny ceiling forces the hash-partition spill to split the
+    corpus into K>1 partitions (K = ceil(disk*3 / 0.4*budget)), keeping per-
+    partition resident decoded bytes within budget — AND the GLB output stays
+    byte-identical to the default-budget (single-partition) run (the feature_id
+    sort is preserved, and the spill routes fragments unchanged)."""
     pytest.importorskip("mudm_tools._rs")
 
-    # Baseline: default (large) ceiling — the C.1 byte-identity reference.
+    # Baseline: default (large) ceiling — the byte-identity reference (K==1).
     baseline, _ = _generate_3dtiles_spread(tmp_path, "bp_baseline", io_threads=1)
     assert baseline, "no GLB tiles produced"
 
-    # Tiny ceiling forces the per-zoom resident set to be split into batches and
-    # re-split when a batch overshoots. 64 KiB is far below one zoom's resident
-    # set for this fixture but above any single tile's floor.
+    # Tiny ceiling forces the corpus to be hash-partitioned into K>1 partitions,
+    # each read and encoded in isolation. 64 KiB is far below the whole corpus's
+    # resident set for this fixture but above any single tile's floor.
     tiny = 64 * 1024
     bounded, peak = _generate_3dtiles_spread(
         tmp_path, "bp_bounded", io_threads=1, max_memory_bytes=tiny, probe=True
@@ -798,6 +799,41 @@ def test_glb_back_pressure_keeps_peak_within_budget(tmp_path):
     assert peak <= tiny, (
         f"peak resident bytes {peak} exceeded ceiling {tiny} — back-pressure "
         f"re-split did not bound the batch"
+    )
+
+
+def test_glb_partition_count_reflects_ceiling(tmp_path):
+    """WS-C spill gate: the hash-partition-spill encode picks K from the on-disk
+    estimate vs the memory ceiling. A large (default) ceiling fits the corpus in
+    ONE partition (k==1, no spill); a tiny ceiling forces k>1 (spill engaged).
+    Proven via the `_get_tiles_partition_count` probe (mirrors the NG
+    `_get_ng_bucket_count` gate). The byte-identity of both paths is covered by
+    `test_glb_back_pressure_keeps_peak_within_budget`."""
+    pytest.importorskip("mudm_tools._rs")
+    from mudm_tools._rs import StreamingTileGenerator
+
+    obj_dir = tmp_path / "spread_objs"
+    paths = _make_spread_obj_shards(obj_dir)
+    bounds = (0.0, 0.0, 0.0, 100.0, 100.0, 100.0)
+    tags = [{"idx": str(i)} for i in range(len(paths))]
+
+    # Default (large) ceiling → corpus fits one partition, no spill.
+    g_big = StreamingTileGenerator(min_zoom=0, max_zoom=3, base_cells=100)
+    g_big._set_io_threads(1)
+    g_big.add_obj_files(paths, bounds, tags, 0)
+    g_big.generate_3dtiles(str(tmp_path / "big"), bounds)
+    assert (
+        g_big._get_tiles_partition_count() == 1
+    ), f"large ceiling should use 1 partition, got {g_big._get_tiles_partition_count()}"
+
+    # Tiny ceiling → hash-partition spill into >1 partition.
+    g_tiny = StreamingTileGenerator(min_zoom=0, max_zoom=3, base_cells=100)
+    g_tiny._set_io_threads(1)
+    g_tiny._set_max_memory(64 * 1024)
+    g_tiny.add_obj_files(paths, bounds, tags, 0)
+    g_tiny.generate_3dtiles(str(tmp_path / "tiny"), bounds)
+    assert g_tiny._get_tiles_partition_count() > 1, (
+        "tiny ceiling should spill into >1 partition, got " f"{g_tiny._get_tiles_partition_count()}"
     )
 
 

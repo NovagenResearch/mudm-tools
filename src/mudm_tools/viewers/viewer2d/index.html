@@ -20,7 +20,7 @@
         <div class="panel-title">Layers</div>
         <div id="layer-toggles"></div>
         <div class="panel-divider"></div>
-        <div class="panel-title">Gene Filter</div>
+        <div class="panel-title" id="gene-filter-title">Gene Filter</div>
         <select id="gene-filter">
             <option value="">All genes</option>
         </select>
@@ -33,6 +33,12 @@
         <div id="info-content">
             <span class="info-placeholder">Hover over a feature</span>
         </div>
+    </div>
+
+    <!-- Tile loading indicator (non-blocking) -->
+    <div id="tile-loading" class="loading-pill" hidden>
+        <span class="loading-pill__spinner" aria-hidden="true"></span>
+        <span class="loading-pill__count">0 of 0 loaded</span>
     </div>
 
     <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>

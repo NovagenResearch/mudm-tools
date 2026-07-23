@@ -15,6 +15,7 @@ mod streaming;
 mod morton;
 mod encoder_draco;
 mod encoder_meshopt;
+mod codec_mmc;
 mod ng_sharded;
 mod types2d;
 mod projector2d;
@@ -54,6 +55,11 @@ fn _rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(encoder_draco::draco_encode_mesh, m)?)?;
     // Test-only: direct NG (u32) Draco path for lossless round-trip tests.
     m.add_function(wrap_pyfunction!(encoder_draco::draco_encode_ng_u32, m)?)?;
+
+    // MMC experimental mesh codec (encode f32 / encode NG u32 / decode)
+    m.add_function(wrap_pyfunction!(codec_mmc::mmc_encode_mesh, m)?)?;
+    m.add_function(wrap_pyfunction!(codec_mmc::mmc_encode_ng_u32, m)?)?;
+    m.add_function(wrap_pyfunction!(codec_mmc::mmc_decode, m)?)?;
 
     // 2D tiling pipeline
     m.add_class::<projector2d::CartesianProjector2D>()?;

@@ -158,10 +158,10 @@ def main():
     t_ingest = time.perf_counter() - t0
     print(f"Ingest: {_fmt_time(t_ingest)}")
 
-    # Generate meshopt 3D Tiles
-    print("Encoding 3D Tiles with meshopt...")
+    # Generate meshopt-q14 3D Tiles
+    print("Encoding 3D Tiles with meshopt-q14...")
     t0 = time.perf_counter()
-    n_tiles = gen.generate_3dtiles(str(tiles3d_dir), bounds, compression="meshopt")
+    n_tiles = gen.generate_3dtiles(str(tiles3d_dir), bounds, compression="meshopt-q14")
     t_gen = time.perf_counter() - t0
     del gen
 

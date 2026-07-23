@@ -68,7 +68,24 @@ def extract_features(glb_json: dict) -> list[dict]:
     return features
 
 
+# Structural extras handled elsewhere (color -> its own entry; name -> the feature id; tile_ids ->
+# accumulated separately), so they are not copied into the property bag.
+_NON_PROPERTY_EXTRAS = ("color", "name", "tile_ids")
+
+
+def feature_properties(extras: dict) -> dict:
+    """Scalar feature properties kept from glTF node extras for viewer color-by / filter / hover.
+
+    Keeps EVERY scalar field (str/int/float/bool) rather than a hardcoded allowlist — otherwise any
+    custom per-feature attribute (e.g. a segmentation's volume/sphericity, an EMT score) is silently
+    dropped. Subsumes the old connectome allowlist (acronym/ccf_id/body_id/… are all scalars, still
+    captured). Nested/list values are skipped (the viewer's color-by only handles scalars)."""
+    return {k: v for k, v in extras.items()
+            if k not in _NON_PROPERTY_EXTRAS and isinstance(v, (str, int, float, bool))}
+
+
 def build_index(tiles_dir: Path, id_fields: list[str] | None = None,
+                unique_by: str | None = None,
                 ) -> tuple[dict, dict[int, int], int]:
     """Build feature index from all .glb files.
 
@@ -76,6 +93,12 @@ def build_index(tiles_dir: Path, id_fields: list[str] | None = None,
         tiles_dir: Path to the 3D tiles directory.
         id_fields: List of metadata keys that are identifiers (excluded from
             filter/color-by in the viewer). Passed through to build_tilejson().
+        unique_by: If set (e.g. "body_id"), group features by a UNIQUE key
+            synthesized as "{base_name} ({feat[unique_by]})" instead of by bare
+            name. Needed when the baked display name is NOT unique per feature
+            (e.g. hemibrain's neuPrint `instance` is shared across bodies, which
+            silently collapsed 25000 neurons → 12552). Mirrors flywire's baked
+            "{label} ({root_id})" convention, applied at index time (no re-tile).
 
     Returns:
         A tuple of (collection_dict, zoom_counts, max_zoom) where:
@@ -114,17 +137,20 @@ def build_index(tiles_dir: Path, id_fields: list[str] | None = None,
                     or str(feat.get("body_id", "")))
             if not name:
                 continue
+            # Force per-feature uniqueness when the baked name is shared across
+            # features (e.g. hemibrain's `instance`). Synthesize "{base} ({uid})".
+            if unique_by is not None and feat.get(unique_by) is not None:
+                uid = feat[unique_by]
+                name = name if str(uid) in name else f"{name} ({uid})"
 
             if name not in feature_map:
                 entry: dict = {
                     "color": feat.get("color", "#888888"),
                     "tile_ids": set(),
                 }
-                # Include whichever metadata fields are present
-                for key in ("acronym", "ccf_id", "body_id", "cell_type", "instance",
-                           "brain_regions", "status", "status_label", "pre", "post"):
-                    if feat.get(key) is not None:
-                        entry[key] = feat[key]
+                # Keep every scalar extra as a property (no hardcoded allowlist) so custom color-by
+                # fields survive; see feature_properties().
+                entry.update(feature_properties(feat))
                 feature_map[name] = entry
 
             feature_map[name]["tile_ids"].add(tile_id)
