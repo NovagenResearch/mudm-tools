@@ -75,9 +75,7 @@ def _geom_signature(pbf: bytes) -> list[str]:
     """Order-independent signature of every feature's decoded geometry."""
     t = _mvt_decode(pbf)
     return sorted(
-        json.dumps(f["geometry"], sort_keys=True)
-        for layer in t.values()
-        for f in layer["features"]
+        json.dumps(f["geometry"], sort_keys=True) for layer in t.values() for f in layer["features"]
     )
 
 
@@ -185,9 +183,7 @@ def _read_all_cells_partition(parquet_dir: Path) -> tuple[list[dict], list[str]]
 # Resolve the faceted marker set ONCE — used for BOTH the facet build and the
 # tile strip, so every faceted key is stripped and nothing else is.
 # --------------------------------------------------------------------------- #
-def _resolve_facet_keys(
-    policy: FacetPolicy, tag_keys: list[str], markers: list[str]
-) -> list[str]:
+def _resolve_facet_keys(policy: FacetPolicy, tag_keys: list[str], markers: list[str]) -> list[str]:
     """Apply the policy (include/exclude globs, keep_inline, key) to the ACTUAL
     tag keys present and return the single, authoritative faceted-key set.
 

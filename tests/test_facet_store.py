@@ -17,7 +17,6 @@ import gzip
 import json
 from pathlib import Path
 
-import numpy as np
 import pytest
 
 # Exercises the optional [xenium] extra + scipy/pyarrow for the facet store.
@@ -29,7 +28,6 @@ import polars as pl
 import pyarrow.parquet as pq
 
 from mudm_tools.converters.xenium import XeniumConverter
-
 
 # ---------------------------------------------------------------------------
 # Tiny bundle: 3 closed-square cells + a 4-gene MEX matrix (nnz == 4)
@@ -163,7 +161,7 @@ def test_metadata_facets_block(converted):
     assert facets["key"] == "cell_id"
     assert facets["layer"] == "cells"
     assert facets["fieldenums"]["gene"] == GENES
-    assert "expr_tier" not in facets["fieldenums"]   # synthetic categorical dropped
+    assert "expr_tier" not in facets["fieldenums"]  # synthetic categorical dropped
     assert facets["fields"] == {"gene": "vector<int>"}
     # Assets: only the numeric-vector (gene) parquet facet, href relative to dataset dir.
     by_href = {a["href"]: a for a in facets["assets"]}
@@ -179,7 +177,8 @@ def test_metadata_facets_block(converted):
 
 def test_no_categorical_parquet(converted):
     """(d) the synthetic expr_tier categorical was dropped — only the numeric-vector (gene) facet is
-    emitted. A categorical facet returns when a dataset carries a REAL one (cell type / cluster / etc.)."""
+    emitted. A categorical facet returns when a dataset carries a REAL one (cell type / cluster / etc.).
+    """
     assert not (converted / "facets" / "categorical.parquet").exists()
 
 

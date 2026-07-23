@@ -64,9 +64,7 @@ def test_index_written_even_when_neuroglancer_raises(tmp_path, monkeypatch):
     def _boom(self, *args, **kwargs):
         raise RuntimeError("simulated NG OOM")
 
-    monkeypatch.setattr(
-        rs.StreamingTileGenerator, "generate_neuroglancer_multilod", _boom
-    )
+    monkeypatch.setattr(rs.StreamingTileGenerator, "generate_neuroglancer_multilod", _boom)
 
     # The run must NOT propagate the NG failure.
     df.tile_meshopt(

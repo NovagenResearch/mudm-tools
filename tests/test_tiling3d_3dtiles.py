@@ -822,9 +822,9 @@ def test_glb_partition_count_reflects_ceiling(tmp_path):
     g_big._set_io_threads(1)
     g_big.add_obj_files(paths, bounds, tags, 0)
     g_big.generate_3dtiles(str(tmp_path / "big"), bounds)
-    assert g_big._get_tiles_partition_count() == 1, (
-        f"large ceiling should use 1 partition, got {g_big._get_tiles_partition_count()}"
-    )
+    assert (
+        g_big._get_tiles_partition_count() == 1
+    ), f"large ceiling should use 1 partition, got {g_big._get_tiles_partition_count()}"
 
     # Tiny ceiling → hash-partition spill into >1 partition.
     g_tiny = StreamingTileGenerator(min_zoom=0, max_zoom=3, base_cells=100)
@@ -833,8 +833,7 @@ def test_glb_partition_count_reflects_ceiling(tmp_path):
     g_tiny.add_obj_files(paths, bounds, tags, 0)
     g_tiny.generate_3dtiles(str(tmp_path / "tiny"), bounds)
     assert g_tiny._get_tiles_partition_count() > 1, (
-        "tiny ceiling should spill into >1 partition, got "
-        f"{g_tiny._get_tiles_partition_count()}"
+        "tiny ceiling should spill into >1 partition, got " f"{g_tiny._get_tiles_partition_count()}"
     )
 
 

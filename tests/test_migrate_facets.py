@@ -38,22 +38,26 @@ def codex_fixture(tmp_path):
 def _geom_signature(pbf_bytes):
     t = mvt.decode(pbf_bytes)
     return sorted(
-        json.dumps(f["geometry"], sort_keys=True)
-        for L in t.values()
-        for f in L["features"]
+        json.dumps(f["geometry"], sort_keys=True) for L in t.values() for f in L["features"]
     )
 
 
-def test_transcode_preserves_geometry_strips_markers(codex_fixture):  # fixture: a small copied dataset dir
+def test_transcode_preserves_geometry_strips_markers(
+    codex_fixture,
+):  # fixture: a small copied dataset dir
     ds = codex_fixture
-    before = {p.relative_to(ds): _geom_signature(p.read_bytes()) for p in (ds / "vectors").rglob("*.pbf")}
+    before = {
+        p.relative_to(ds): _geom_signature(p.read_bytes()) for p in (ds / "vectors").rglob("*.pbf")
+    }
     pol = FacetPolicy.from_config({"select": {"include": ["m_*"]}, "keep_inline": ["cell_type"]})
     report = tile_from_features_parquet(str(ds), pol, markers=["m_CD8", "m_CD4"])
     assert report["geometry_ok"] is True
-    after = {p.relative_to(ds): _geom_signature(p.read_bytes()) for p in (ds / "vectors").rglob("*.pbf")}
-    assert before == after                                  # geometry byte-faithful
+    after = {
+        p.relative_to(ds): _geom_signature(p.read_bytes()) for p in (ds / "vectors").rglob("*.pbf")
+    }
+    assert before == after  # geometry byte-faithful
     raw = next((ds / "vectors").rglob("*.pbf")).read_bytes()
-    assert b"m_CD8" not in raw                               # markers stripped
+    assert b"m_CD8" not in raw  # markers stripped
     assert (ds / "facets" / "markers.parquet").is_file()
     meta = json.loads((ds / "metadata.json").read_text())
     assert meta["facets"]["layout"] == "wide"
@@ -74,12 +78,30 @@ def test_transcode_preserves_geometry_strips_markers(codex_fixture):  # fixture:
 # stray m_* keys must survive in the tiles (only the dataset's own markers go).
 _G_KEYS = ["g_VIM", "g_B2M"]
 _CELLS = [
-    {"cell": "c_1", "cell_type": "a", "g_VIM": "3", "g_B2M": "0", "m_Stray": "x",
-     "ring": [[10, 10], [10, 20], [20, 20], [20, 10], [10, 10]]},
-    {"cell": "c_2", "cell_type": "b", "g_VIM": "7", "g_B2M": "5", "m_Stray": "y",
-     "ring": [[30, 30], [30, 45], [45, 45], [45, 30], [30, 30]]},
-    {"cell": "c_3", "cell_type": "a", "g_VIM": "0", "g_B2M": "9", "m_Stray": "z",
-     "ring": [[50, 5], [50, 15], [60, 15], [60, 5], [50, 5]]},
+    {
+        "cell": "c_1",
+        "cell_type": "a",
+        "g_VIM": "3",
+        "g_B2M": "0",
+        "m_Stray": "x",
+        "ring": [[10, 10], [10, 20], [20, 20], [20, 10], [10, 10]],
+    },
+    {
+        "cell": "c_2",
+        "cell_type": "b",
+        "g_VIM": "7",
+        "g_B2M": "5",
+        "m_Stray": "y",
+        "ring": [[30, 30], [30, 45], [45, 45], [45, 30], [30, 30]],
+    },
+    {
+        "cell": "c_3",
+        "cell_type": "a",
+        "g_VIM": "0",
+        "g_B2M": "9",
+        "m_Stray": "z",
+        "ring": [[50, 5], [50, 15], [60, 15], [60, 5], [50, 5]],
+    },
 ]
 _TAG_KEYS = ["cell", "cell_type", *_G_KEYS, "m_Stray"]
 
@@ -114,11 +136,18 @@ def _build_gstar_cell_dataset(root: Path) -> Path:
     )
 
     # metadata.json with a single cells layer; markers = the g_* keys.
-    (ds / "metadata.json").write_text(json.dumps({
-        "name": "cosmx-synth",
-        "vectors": {"path": "vectors", "markers": _G_KEYS,
-                    "layers": [{"id": "cells", "min_zoom": 0}]},
-    }))
+    (ds / "metadata.json").write_text(
+        json.dumps(
+            {
+                "name": "cosmx-synth",
+                "vectors": {
+                    "path": "vectors",
+                    "markers": _G_KEYS,
+                    "layers": [{"id": "cells", "min_zoom": 0}],
+                },
+            }
+        )
+    )
     return ds
 
 

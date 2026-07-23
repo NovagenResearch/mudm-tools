@@ -90,9 +90,7 @@ class GeoJsonConverter:
             columns, cardinality = self._scan_properties(features)
             facet_keys, _inline_keys = select_facet_keys(policy, columns, cardinality)
             if facet_keys:
-                cell_ids, facet_attrs = self._collect_facet_attrs(
-                    features, facet_keys, policy.key
-                )
+                cell_ids, facet_attrs = self._collect_facet_attrs(features, facet_keys, policy.key)
                 # Write a properties-stripped GeoJSON (facet keys removed) to feed
                 # the tiler. One combined file keeps the single-file ingest path.
                 stripped = {
@@ -153,9 +151,7 @@ class GeoJsonConverter:
 
             print("Encoding facet store...", end=" ", flush=True)
             t0 = time.time()
-            facets_block = emit_facet_store(
-                str(out_dir), cell_ids, facet_attrs, policy
-            )
+            facets_block = emit_facet_store(str(out_dir), cell_ids, facet_attrs, policy)
             print(f"{len(facet_keys)} field(s) ({time.time() - t0:.1f}s)", flush=True)
 
             metadata = {

@@ -829,12 +829,18 @@ class TestParquetPartitioned:
             g = StreamingTileGenerator(min_zoom=0, max_zoom=3, base_cells=100)
             g.add_obj_files(paths, bounds, tags, 0)
             return g.generate_parquet_native_partitioned(
-                str(out), bounds, "zstd", 3, max_batch_bytes, max_file_bytes, False,
+                str(out),
+                bounds,
+                "zstd",
+                3,
+                max_batch_bytes,
+                max_file_bytes,
+                False,
             )
 
-        out_many = tmp_path / "manychunks"          # 1-byte budget -> one chunk per shard
-        n_many = _gen(out_many, 1, 500_000_000)      # large file budget -> coalesce
-        out_ref = tmp_path / "ref"                   # single chunk, no split (reference)
+        out_many = tmp_path / "manychunks"  # 1-byte budget -> one chunk per shard
+        n_many = _gen(out_many, 1, 500_000_000)  # large file budget -> coalesce
+        out_ref = tmp_path / "ref"  # single chunk, no split (reference)
         n_ref = _gen(out_ref, 10**18, 10**18)
         assert n_many == n_ref > 0
 
@@ -847,10 +853,19 @@ class TestParquetPartitioned:
 
         def _canon2(rows):
             return sorted(
-                (r["zoom"], r["tile_x"], r["tile_y"], r["tile_d"], r["feature_id"],
-                 r["geom_type"], r["positions"].tobytes(), r["indices"].tobytes())
+                (
+                    r["zoom"],
+                    r["tile_x"],
+                    r["tile_y"],
+                    r["tile_d"],
+                    r["feature_id"],
+                    r["geom_type"],
+                    r["positions"].tobytes(),
+                    r["indices"].tobytes(),
+                )
                 for r in rows
             )
+
         assert _canon2(read_parquet(out_many)) == _canon2(read_parquet(out_ref))
 
     def test_native_partitioned_bounds_row_group_by_bytes(self, tmp_path, monkeypatch):
@@ -861,11 +876,15 @@ class TestParquetPartitioned:
         1 row group per part regardless of byte size."""
         import pyarrow.parquet as pq
 
-        def _run(out, mbb=10**18, mfb=10**18):  # 1 chunk + no file rotation -> isolate row-group flush
+        def _run(
+            out, mbb=10**18, mfb=10**18
+        ):  # 1 chunk + no file rotation -> isolate row-group flush
             gen, _ = _build_generator_with_features(
-                [_make_dense_tin_feature(300)], min_zoom=0, max_zoom=2)
+                [_make_dense_tin_feature(300)], min_zoom=0, max_zoom=2
+            )
             return gen.generate_parquet_native_partitioned(
-                str(out), WORLD_BOUNDS, "zstd", 3, mbb, mfb, False)
+                str(out), WORLD_BOUNDS, "zstd", 3, mbb, mfb, False
+            )
 
         # Reference: default target -> ~1 row group/part (no byte flush).
         out_ref = tmp_path / "ref"
@@ -876,17 +895,28 @@ class TestParquetPartitioned:
         n = _run(out)
         assert n == n_ref > 0
 
-        max_rg = max((pq.ParquetFile(p).metadata.num_row_groups for p in out.rglob("*.parquet")), default=0)
+        max_rg = max(
+            (pq.ParquetFile(p).metadata.num_row_groups for p in out.rglob("*.parquet")), default=0
+        )
         assert max_rg > 1, f"max row groups per part = {max_rg}; byte-target flush not applied"
 
         # Content must be IDENTICAL while flushing (row groups are within-file; the
         # flush must not drop/duplicate/reorder rows the reader returns).
         def _c(rows):
             return sorted(
-                (r["zoom"], r["tile_x"], r["tile_y"], r["tile_d"], r["feature_id"],
-                 r["geom_type"], r["positions"].tobytes(), r["indices"].tobytes())
+                (
+                    r["zoom"],
+                    r["tile_x"],
+                    r["tile_y"],
+                    r["tile_d"],
+                    r["feature_id"],
+                    r["geom_type"],
+                    r["positions"].tobytes(),
+                    r["indices"].tobytes(),
+                )
                 for r in rows
             )
+
         assert _c(read_parquet(out)) == _c(read_parquet(out_ref))
 
 

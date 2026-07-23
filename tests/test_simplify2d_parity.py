@@ -57,9 +57,7 @@ def test_floor_reduces_not_reverts():
     # Rust test_floor_reduces_not_reverts: a 20-vertex ring with a collapsing
     # epsilon must reduce TO the floor, never revert to the full ring.
     nv = 20
-    ring = [
-        (math.cos(i / nv * math.tau), math.sin(i / nv * math.tau)) for i in range(nv)
-    ]
+    ring = [(math.cos(i / nv * math.tau), math.sin(i / nv * math.tau)) for i in range(nv)]
     out = simplify_polygon_ring(ring, 1e9, 6)
     assert len(out) == 6, "must reduce to the floor, not revert to full"
 
@@ -101,9 +99,7 @@ def test_legacy_simplify_never_reverts():
     # The historical simplify() no longer reverts to the full ring: a 20-vertex
     # ring under a huge squared tolerance reduces to the floor (min_vertices).
     nv = 20
-    ring = [
-        (math.cos(i / nv * math.tau), math.sin(i / nv * math.tau)) for i in range(nv)
-    ]
+    ring = [(math.cos(i / nv * math.tau), math.sin(i / nv * math.tau)) for i in range(nv)]
     out = simplify(ring, 1e18, min_vertices=5)
     assert len(out) == 5
 
@@ -242,8 +238,11 @@ def test_mudmvt_polygon_only():
     data = {
         "type": "FeatureCollection",
         "features": [
-            {"type": "Feature", "properties": {"id": 0},
-             "geometry": {"type": "LineString", "coordinates": line}},
+            {
+                "type": "Feature",
+                "properties": {"id": 0},
+                "geometry": {"type": "LineString", "coordinates": line},
+            },
         ],
     }
     opts = _opts(poly_simplify_tolerances=[0.4, 0.1, 0.05, 0.02, 0.01, 0.005], poly_min_edges=6)

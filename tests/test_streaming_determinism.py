@@ -84,7 +84,9 @@ def test_legacy_parquet_byte_identical_run_to_run(tmp_path):
     assert na == nb > 0
     sa, sb = _sig(a), _sig(b)
     # meaningful only if there are multiple parts per zoom (else ordering is moot)
-    assert sum(1 for k in sa if k.startswith("zoom=1/")) >= 2, f"too few parts to test ordering: {sorted(sa)}"
+    assert (
+        sum(1 for k in sa if k.startswith("zoom=1/")) >= 2
+    ), f"too few parts to test ordering: {sorted(sa)}"
     differing = [k for k in sa if k in sb and sa[k] != sb[k]]
     assert sa == sb, (
         f"non-deterministic parquet bytes: only_a={sorted(set(sa) - set(sb))} "
@@ -130,6 +132,7 @@ def test_legacy_parquet_byte_identical_across_thread_counts(tmp_path):
 
 # ---- 2D (streaming_review.md §T2 #2): H2 deterministic fids + 2D PY-2 ----
 
+
 def _write_geojson_points(path: Path, points, key="k") -> Path:
     fc = {
         "type": "FeatureCollection",
@@ -155,8 +158,12 @@ def test_2d_geojson_parquet_byte_identical_run_to_run(tmp_path):
     from mudm_tools._rs import StreamingTileGenerator2D
 
     bounds = (0.0, 0.0, 100.0, 100.0)
-    f1 = _write_geojson_points(tmp_path / "a.geojson", [(5 + i * 4, 10 + (i % 5) * 15) for i in range(20)])
-    f2 = _write_geojson_points(tmp_path / "b.geojson", [(50 + i * 2, 30 + (i % 7) * 8) for i in range(20)])
+    f1 = _write_geojson_points(
+        tmp_path / "a.geojson", [(5 + i * 4, 10 + (i % 5) * 15) for i in range(20)]
+    )
+    f2 = _write_geojson_points(
+        tmp_path / "b.geojson", [(50 + i * 2, 30 + (i % 7) * 8) for i in range(20)]
+    )
 
     def run(out: Path):
         tmp = tmp_path / ("frag_" + out.name)
@@ -179,6 +186,7 @@ def test_2d_geojson_parquet_byte_identical_run_to_run(tmp_path):
 
 # ---- G1-2D (streaming_review.md §G): bounded 2D Parquet path ----
 
+
 def _read_rowset_2d(d: Path):
     """Multiset of (zoom, tile_x, tile_y, feature_id, geom_type, positions, indices)
     across all part files — layout/part-numbering-independent content signature."""
@@ -189,10 +197,17 @@ def _read_rowset_2d(d: Path):
         zoom = int(p.parent.name.split("=")[1])
         cols = pq.read_table(p).to_pydict()
         for i in range(len(cols["feature_id"])):
-            out.append((
-                zoom, cols["tile_x"][i], cols["tile_y"][i], cols["feature_id"][i],
-                cols["geom_type"][i], bytes(cols["positions"][i]), bytes(cols["indices"][i]),
-            ))
+            out.append(
+                (
+                    zoom,
+                    cols["tile_x"][i],
+                    cols["tile_y"][i],
+                    cols["feature_id"][i],
+                    cols["geom_type"][i],
+                    bytes(cols["positions"][i]),
+                    bytes(cols["indices"][i]),
+                )
+            )
     return sorted(out)
 
 
@@ -203,8 +218,12 @@ def test_2d_partitioned_content_equivalent_to_legacy_and_bounded(tmp_path):
     from mudm_tools._rs import StreamingTileGenerator2D
 
     bounds = (0.0, 0.0, 100.0, 100.0)
-    f1 = _write_geojson_points(tmp_path / "a.geojson", [(5 + i * 4, 10 + (i % 5) * 15) for i in range(30)])
-    f2 = _write_geojson_points(tmp_path / "b.geojson", [(50 + i * 2, 30 + (i % 7) * 8) for i in range(30)])
+    f1 = _write_geojson_points(
+        tmp_path / "a.geojson", [(5 + i * 4, 10 + (i % 5) * 15) for i in range(30)]
+    )
+    f2 = _write_geojson_points(
+        tmp_path / "b.geojson", [(50 + i * 2, 30 + (i % 7) * 8) for i in range(30)]
+    )
 
     def ingest(name):
         tmp = tmp_path / ("frag_" + name)
@@ -221,7 +240,9 @@ def test_2d_partitioned_content_equivalent_to_legacy_and_bounded(tmp_path):
     n_part = g2.generate_parquet_native_partitioned(str(part_out), bounds, True, "zstd", 1)
 
     assert n_legacy == n_part > 0
-    assert _read_rowset_2d(legacy_out) == _read_rowset_2d(part_out), "bounded path changed row content"
+    assert _read_rowset_2d(legacy_out) == _read_rowset_2d(
+        part_out
+    ), "bounded path changed row content"
     # the bounded path actually chunked (else it's not testing the bounded loop)
     assert len(list(part_out.rglob("*.mu.parquet"))) >= 2
 
@@ -237,8 +258,12 @@ def test_2d_partitioned_content_stable_run_to_run(tmp_path):
     from mudm_tools._rs import StreamingTileGenerator2D
 
     bounds = (0.0, 0.0, 100.0, 100.0)
-    f1 = _write_geojson_points(tmp_path / "a.geojson", [(5 + i * 4, 10 + (i % 5) * 15) for i in range(30)])
-    f2 = _write_geojson_points(tmp_path / "b.geojson", [(50 + i * 2, 30 + (i % 7) * 8) for i in range(30)])
+    f1 = _write_geojson_points(
+        tmp_path / "a.geojson", [(5 + i * 4, 10 + (i % 5) * 15) for i in range(30)]
+    )
+    f2 = _write_geojson_points(
+        tmp_path / "b.geojson", [(50 + i * 2, 30 + (i % 7) * 8) for i in range(30)]
+    )
 
     def run(name):
         tmp = tmp_path / ("frag_" + name)

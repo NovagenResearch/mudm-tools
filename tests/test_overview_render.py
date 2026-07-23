@@ -4,6 +4,7 @@ The viewer's OverviewPanel drops each poster onto a world-space quad spanning th
 octree-root bounds, so the world<->pixel mapping must be linear with a specific
 orientation: column 0 = h_min (left), row 0 = v_max (top), axes NOT inverted.
 """
+
 import json
 
 import numpy as np
@@ -29,9 +30,7 @@ def _write_pyramid(tmp_path, color="#ff0000"):
     meshes.mkdir()
     # OBJ stem "1" matches body_id 1. Verts at center + two opposite corners.
     verts = [(0, 0, 0), (10, 10, 10), (-10, -10, -10)]
-    (meshes / "1.obj").write_text(
-        "\n".join(f"v {x} {y} {z}" for x, y, z in verts) + "\nf 1 2 3\n"
-    )
+    (meshes / "1.obj").write_text("\n".join(f"v {x} {y} {z}" for x, y, z in verts) + "\nf 1 2 3\n")
     return meshes, pyr
 
 
@@ -52,10 +51,10 @@ def test_overview_structure_and_orientation(tmp_path):
     img = np.asarray(Image.open(pyr / "overview" / "xy.png").convert("RGB"))
     assert img.shape[:2] == (5, 5)
     red = (255, 0, 0)
-    assert tuple(img[2, 2]) == red          # center vertex -> center pixel
-    assert tuple(img[0, 4]) == red          # (x=+10, y=+10) -> top-right (row0=v_max, col_max=h_max)
-    assert tuple(img[4, 0]) == red          # (x=-10, y=-10) -> bottom-left
-    assert tuple(img[0, 0]) != red          # empty corner -> background, not the feature color
+    assert tuple(img[2, 2]) == red  # center vertex -> center pixel
+    assert tuple(img[0, 4]) == red  # (x=+10, y=+10) -> top-right (row0=v_max, col_max=h_max)
+    assert tuple(img[4, 0]) == red  # (x=-10, y=-10) -> bottom-left
+    assert tuple(img[0, 0]) != red  # empty corner -> background, not the feature color
 
 
 def test_overview_accepts_inmemory_bounds(tmp_path):
@@ -63,7 +62,11 @@ def test_overview_accepts_inmemory_bounds(tmp_path):
     meshes, pyr = _write_pyramid(tmp_path)
     (pyr / "tileset.json").unlink()
     meta = render_overview(
-        meshes, pyr, target_px=5, supersample=1, workers=1,
+        meshes,
+        pyr,
+        target_px=5,
+        supersample=1,
+        workers=1,
         bounds=[-10, -10, -10, 10, 10, 10],
     )
     assert meta["bounds"] == [-10, -10, -10, 10, 10, 10]

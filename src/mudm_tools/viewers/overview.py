@@ -27,6 +27,7 @@ Implemented with numpy + Pillow only (no matplotlib): each plane is a vectorised
 point-splat into a uint8 buffer, optionally supersampled and Lanczos-downscaled
 for anti-aliasing.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -142,7 +143,7 @@ def _rasterize(P, C, bounds, h, v, target_px, ss):
     vmin, vmax = lims[v]
     ext_h = max(hmax - hmin, 1e-6)
     ext_v = max(vmax - vmin, 1e-6)
-    scale = target_px / max(ext_h, ext_v)        # isotropic world->pixel
+    scale = target_px / max(ext_h, ext_v)  # isotropic world->pixel
     W = max(1, round(ext_h * scale))
     H = max(1, round(ext_v * scale))
     Ws, Hs = W * ss, H * ss
@@ -152,15 +153,24 @@ def _rasterize(P, C, bounds, h, v, target_px, ss):
     if len(P):
         cols = np.clip(np.floor((P[:, h] - hmin) / ext_h * (Ws - 1)).astype(np.int64), 0, Ws - 1)
         rows = np.clip(np.floor((vmax - P[:, v]) / ext_v * (Hs - 1)).astype(np.int64), 0, Hs - 1)
-        buf[rows, cols] = C   # shuffled beforehand -> duplicate-pixel winner is unbiased
+        buf[rows, cols] = C  # shuffled beforehand -> duplicate-pixel winner is unbiased
 
     if ss > 1:
         buf = np.asarray(Image.fromarray(buf, "RGB").resize((W, H), Image.Resampling.LANCZOS))
     return buf, [W, H]
 
 
-def render_overview(meshes_dir, pyramid_dir, *, max_neurons=8000, cap_verts=1500,
-                    target_px=1024, supersample=2, workers=None, bounds=None) -> dict:
+def render_overview(
+    meshes_dir,
+    pyramid_dir,
+    *,
+    max_neurons=8000,
+    cap_verts=1500,
+    target_px=1024,
+    supersample=2,
+    workers=None,
+    bounds=None,
+) -> dict:
     """Render the three overview posters + overview.json under <pyramid_dir>/overview/.
 
     Args:
@@ -200,7 +210,7 @@ def render_overview(meshes_dir, pyramid_dir, *, max_neurons=8000, cap_verts=1500
     if pts:
         P = np.vstack(pts).astype(np.float32)
         C = np.vstack(cols).astype(np.uint8)
-        order = np.random.default_rng(0).permutation(len(P))   # avoid draw-order colour bias
+        order = np.random.default_rng(0).permutation(len(P))  # avoid draw-order colour bias
         P, C = P[order], C[order]
     else:
         P = np.zeros((0, 3), np.float32)
@@ -225,21 +235,33 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="Render overview projection posters for a 3D pyramid")
     ap.add_argument("meshes_dir", help="directory of source *.obj meshes")
     ap.add_argument("pyramid_dir", help="pyramid dir (tileset.json + features.json)")
-    ap.add_argument("--max-neurons", type=int, default=8000, help="sample at most this many neurons")
-    ap.add_argument("--cap-verts", type=int, default=1500, help="subsample at most this many verts/neuron")
+    ap.add_argument(
+        "--max-neurons", type=int, default=8000, help="sample at most this many neurons"
+    )
+    ap.add_argument(
+        "--cap-verts", type=int, default=1500, help="subsample at most this many verts/neuron"
+    )
     ap.add_argument("--target-px", type=int, default=1024, help="longest poster edge in pixels")
-    ap.add_argument("--supersample", type=int, default=2, help="render scale for anti-aliasing (1=off)")
+    ap.add_argument(
+        "--supersample", type=int, default=2, help="render scale for anti-aliasing (1=off)"
+    )
     ap.add_argument("--workers", type=int, default=None, help="OBJ-read processes (<=1 = serial)")
     args = ap.parse_args()
 
     meta = render_overview(
-        args.meshes_dir, args.pyramid_dir,
-        max_neurons=args.max_neurons, cap_verts=args.cap_verts,
-        target_px=args.target_px, supersample=args.supersample, workers=args.workers,
+        args.meshes_dir,
+        args.pyramid_dir,
+        max_neurons=args.max_neurons,
+        cap_verts=args.cap_verts,
+        target_px=args.target_px,
+        supersample=args.supersample,
+        workers=args.workers,
     )
     out = Path(args.pyramid_dir) / "overview"
-    print(f"Wrote {out}/overview.json + {', '.join(meta['planes'].values())} "
-          f"(image_px={meta['image_px']}, bounds={meta['bounds']})")
+    print(
+        f"Wrote {out}/overview.json + {', '.join(meta['planes'].values())} "
+        f"(image_px={meta['image_px']}, bounds={meta['bounds']})"
+    )
 
 
 if __name__ == "__main__":

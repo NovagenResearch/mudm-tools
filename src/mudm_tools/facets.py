@@ -1,4 +1,5 @@
 """General, format-agnostic facet store: per-cell attributes -> facets/*.parquet + metadata block."""
+
 from __future__ import annotations
 import fnmatch
 from pathlib import Path
@@ -35,15 +36,18 @@ def _matches(name: str, globs: list[str]) -> bool:
     return any(fnmatch.fnmatch(name, g) for g in globs)
 
 
-def select_facet_keys(policy: FacetPolicy, columns: dict[str, Any],
-                      cardinality: dict[str, int]) -> tuple[list[str], list[str]]:
+def select_facet_keys(
+    policy: FacetPolicy, columns: dict[str, Any], cardinality: dict[str, int]
+) -> tuple[list[str], list[str]]:
     """Return (facet_keys, inline_keys). Heuristic: high-card numeric -> facet; plus include/exclude globs."""
     facet, inline = [], []
     for name, dtype in columns.items():
         if name == policy.key or name in policy.keep_inline:
-            inline.append(name); continue
+            inline.append(name)
+            continue
         if _matches(name, policy.exclude):
-            inline.append(name); continue
+            inline.append(name)
+            continue
         forced = _matches(name, policy.include)
         is_num = np.issubdtype(np.dtype(dtype), np.number)
         high = cardinality.get(name, 0) > policy.card_threshold
@@ -51,19 +55,39 @@ def select_facet_keys(policy: FacetPolicy, columns: dict[str, Any],
     return facet, inline
 
 
-def emit_facet_store(out_dir, cell_ids, attributes, policy: FacetPolicy, *, long_table=None) -> dict:
+def emit_facet_store(
+    out_dir, cell_ids, attributes, policy: FacetPolicy, *, long_table=None
+) -> dict:
     facets_dir = Path(out_dir) / "facets"
     facets_dir.mkdir(parents=True, exist_ok=True)
     if long_table is not None:  # sparse long form (Xenium genes)
         href = "facets/expression.parquet"
-        pq.write_table(long_table, facets_dir / "expression.parquet",
-                       compression=policy.codec, row_group_size=_RG)
+        pq.write_table(
+            long_table,
+            facets_dir / "expression.parquet",
+            compression=policy.codec,
+            row_group_size=_RG,
+        )
         rows = long_table.num_rows
-        asset = {"role": "facets", "href": href, "media_type": "application/vnd.apache.parquet",
-                 "facet": "gene", "layout": "long", "key": policy.key,
-                 "columns": ["cell_id", "gene", "count"], "sorted_by": "gene", "rows": int(rows)}
-        block = {"layer": "cells", "key": policy.key, "storage": "asset", "layout": "long",
-                 "fields": {"gene": "vector<int>"}, "assets": [asset]}
+        asset = {
+            "role": "facets",
+            "href": href,
+            "media_type": "application/vnd.apache.parquet",
+            "facet": "gene",
+            "layout": "long",
+            "key": policy.key,
+            "columns": ["cell_id", "gene", "count"],
+            "sorted_by": "gene",
+            "rows": int(rows),
+        }
+        block = {
+            "layer": "cells",
+            "key": policy.key,
+            "storage": "asset",
+            "layout": "long",
+            "fields": {"gene": "vector<int>"},
+            "assets": [asset],
+        }
         return block
     # wide form (markers): one float column per attribute
     names = list(attributes.keys())
@@ -77,12 +101,34 @@ def emit_facet_store(out_dir, cell_ids, attributes, policy: FacetPolicy, *, long
             cols[k] = pa.array(a.astype("float32"))
     table = pa.table(cols)
     href = "facets/markers.parquet"
-    bss = [k for k in names if pa.types.is_floating(table.schema.field(k).type)] if policy.byte_stream_split else False
-    pq.write_table(table, facets_dir / "markers.parquet", compression=policy.codec,
-                   row_group_size=_RG, use_dictionary=False, use_byte_stream_split=bss)
+    bss = (
+        [k for k in names if pa.types.is_floating(table.schema.field(k).type)]
+        if policy.byte_stream_split
+        else False
+    )
+    pq.write_table(
+        table,
+        facets_dir / "markers.parquet",
+        compression=policy.codec,
+        row_group_size=_RG,
+        use_dictionary=False,
+        use_byte_stream_split=bss,
+    )
     size_mb = (facets_dir / "markers.parquet").stat().st_size / 1e6
-    asset = {"role": "facets", "href": href, "media_type": "application/vnd.apache.parquet",
-             "layout": "wide", "key": policy.key, "columns": ["cell_id"] + names}
-    return {"layer": "cells", "key": policy.key, "storage": "asset", "layout": "wide",
-            "fields": {k: "scalar<float>" for k in names}, "assets": [asset],
-            "prefetch": bool(size_mb <= policy.prefetch_max_mb)}
+    asset = {
+        "role": "facets",
+        "href": href,
+        "media_type": "application/vnd.apache.parquet",
+        "layout": "wide",
+        "key": policy.key,
+        "columns": ["cell_id"] + names,
+    }
+    return {
+        "layer": "cells",
+        "key": policy.key,
+        "storage": "asset",
+        "layout": "wide",
+        "fields": {k: "scalar<float>" for k in names},
+        "assets": [asset],
+        "prefetch": bool(size_mb <= policy.prefetch_max_mb),
+    }

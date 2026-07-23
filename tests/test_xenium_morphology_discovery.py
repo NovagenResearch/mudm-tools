@@ -5,6 +5,7 @@ Regression guard: XOA 2.0/3.0 bundles ship numbered per-channel files
 ``ch0000_dapi.ome.tif`` (XOA 4.0). The converter previously only knew the named/single-file layouts and
 silently produced an empty raster for the numbered layout.
 """
+
 from __future__ import annotations
 
 from mudm_tools.converters.xenium import _find_morphology_image

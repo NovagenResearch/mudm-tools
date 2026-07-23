@@ -1,11 +1,12 @@
-import numpy as np, pyarrow.parquet as pq
+import numpy as np
+import pyarrow.parquet as pq
 from mudm_tools.facets import FacetPolicy, emit_facet_store
+
 
 def test_wide_store_bss_applied(tmp_path):
     n = 1000
     cids = [f"c{i}" for i in range(n)]
-    attrs = {"m_A": np.random.rand(n).astype("float32"),
-             "m_B": np.random.rand(n).astype("float32")}
+    attrs = {"m_A": np.random.rand(n).astype("float32"), "m_B": np.random.rand(n).astype("float32")}
     pol = FacetPolicy.from_config({"layout": "wide", "encoding": {"byte_stream_split": True}})
     block = emit_facet_store(tmp_path, cids, attrs, pol)
     p = tmp_path / "facets" / "markers.parquet"
