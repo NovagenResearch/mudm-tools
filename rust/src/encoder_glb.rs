@@ -441,6 +441,9 @@ pub(crate) fn encode_glb_meshopt(
     let mut nodes: Vec<Value> = Vec::new();
     let mut scene_nodes: Vec<Value> = Vec::new();
     let mut any_meshopt = false;
+    // EXT_meshopt_compression: compressed bufferViews describe their DECODED
+    // layout in a data-less fallback buffer (index 1); running decoded offset.
+    let mut fallback_len: usize = 0;
 
     for feat in features {
         if feat.positions.is_empty() {
@@ -494,10 +497,13 @@ pub(crate) fn encode_glb_meshopt(
             bin_data.extend(std::iter::repeat(0u8).take(pad));
 
             let pos_bv_idx = buffer_views.len();
+            let pos_decoded = encoded.vertex_count * 12;
+            let pos_fb_off = fallback_len;
+            fallback_len += pos_decoded + (4 - (pos_decoded % 4)) % 4;
             buffer_views.push(json!({
-                "buffer": 0,
-                "byteOffset": pos_comp_offset,
-                "byteLength": pos_comp_size,
+                "buffer": 1,
+                "byteOffset": pos_fb_off,
+                "byteLength": pos_decoded,
                 "byteStride": 12,
                 "target": ARRAY_BUFFER,
                 "extensions": {
@@ -532,11 +538,14 @@ pub(crate) fn encode_glb_meshopt(
             bin_data.extend(std::iter::repeat(0u8).take(pad));
 
             let idx_bv_idx = buffer_views.len();
+            let idx_decoded = encoded.indices.len() * 4;
+            let idx_fb_off = fallback_len;
+            fallback_len += idx_decoded + (4 - (idx_decoded % 4)) % 4;
             // glTF forbids byteStride on ELEMENT_ARRAY_BUFFER — only inner extension has it
             buffer_views.push(json!({
-                "buffer": 0,
-                "byteOffset": idx_comp_offset,
-                "byteLength": idx_comp_size,
+                "buffer": 1,
+                "byteOffset": idx_fb_off,
+                "byteLength": idx_decoded,
                 "target": ELEMENT_ARRAY_BUFFER,
                 "extensions": {
                     "EXT_meshopt_compression": {
@@ -670,6 +679,14 @@ pub(crate) fn encode_glb_meshopt(
         "doubleSided": true,
     });
 
+    let mut buffers = vec![json!({"byteLength": bin_data.len()})];
+    if any_meshopt {
+        buffers.push(json!({
+            "byteLength": fallback_len,
+            "extensions": {"EXT_meshopt_compression": {"fallback": true}}
+        }));
+    }
+
     let mut gltf_json = json!({
         "asset": {"version": "2.0", "generator": "mudm-rs"},
         "scene": 0,
@@ -678,7 +695,7 @@ pub(crate) fn encode_glb_meshopt(
         "meshes": meshes,
         "accessors": accessors,
         "bufferViews": buffer_views,
-        "buffers": [{"byteLength": bin_data.len()}],
+        "buffers": buffers,
         "materials": [material],
     });
 
@@ -714,6 +731,9 @@ pub(crate) fn encode_glb_meshopt_quantized(
     let mut nodes: Vec<Value> = Vec::new();
     let mut scene_nodes: Vec<Value> = Vec::new();
     let mut any_meshopt = false;
+    // EXT_meshopt_compression: compressed bufferViews describe their DECODED
+    // layout in a data-less fallback buffer (index 1); running decoded offset.
+    let mut fallback_len: usize = 0;
     let mut any_quantized = false;
 
     for feat in features {
@@ -754,10 +774,13 @@ pub(crate) fn encode_glb_meshopt_quantized(
             bin_data.extend(std::iter::repeat(0u8).take(pad));
 
             let pos_bv = buffer_views.len();
+            let pos_decoded = enc.vertex_count * 8;
+            let pos_fb_off = fallback_len;
+            fallback_len += pos_decoded + (4 - (pos_decoded % 4)) % 4;
             buffer_views.push(json!({
-                "buffer": 0,
-                "byteOffset": pos_off,
-                "byteLength": pos_size,
+                "buffer": 1,
+                "byteOffset": pos_fb_off,
+                "byteLength": pos_decoded,
                 "byteStride": 8,
                 "target": ARRAY_BUFFER,
                 "extensions": {
@@ -798,10 +821,13 @@ pub(crate) fn encode_glb_meshopt_quantized(
             bin_data.extend(std::iter::repeat(0u8).take(pad));
 
             let idx_bv = buffer_views.len();
+            let idx_decoded = enc.indices.len() * (idx_stride as usize);
+            let idx_fb_off = fallback_len;
+            fallback_len += idx_decoded + (4 - (idx_decoded % 4)) % 4;
             buffer_views.push(json!({
-                "buffer": 0,
-                "byteOffset": idx_off,
-                "byteLength": idx_size,
+                "buffer": 1,
+                "byteOffset": idx_fb_off,
+                "byteLength": idx_decoded,
                 "target": ELEMENT_ARRAY_BUFFER,
                 "extensions": {
                     "EXT_meshopt_compression": {
@@ -956,6 +982,14 @@ pub(crate) fn encode_glb_meshopt_quantized(
         "doubleSided": true,
     });
 
+    let mut buffers = vec![json!({"byteLength": bin_data.len()})];
+    if any_meshopt {
+        buffers.push(json!({
+            "byteLength": fallback_len,
+            "extensions": {"EXT_meshopt_compression": {"fallback": true}}
+        }));
+    }
+
     let mut gltf_json = json!({
         "asset": {"version": "2.0", "generator": "mudm-rs"},
         "scene": 0,
@@ -964,7 +998,7 @@ pub(crate) fn encode_glb_meshopt_quantized(
         "meshes": meshes,
         "accessors": accessors,
         "bufferViews": buffer_views,
-        "buffers": [{"byteLength": bin_data.len()}],
+        "buffers": buffers,
         "materials": [material],
     });
 
@@ -1446,6 +1480,60 @@ mod tests {
         let used = gltf["extensionsUsed"].as_array().unwrap();
         assert!(used.iter().any(|e| e=="KHR_mesh_quantization"));
         assert!(!used.iter().any(|e| e=="EXT_meshopt_compression"));
+    }
+
+    /// EXT_meshopt_compression spec: the parent bufferView describes the DECODED
+    /// data (`byteLength == count * byteStride`) and references a fallback buffer
+    /// (`extensions.EXT_meshopt_compression.fallback == true`); only the extension
+    /// object points at the compressed stream in the GLB BIN buffer.
+    fn assert_meshopt_bufferviews_conform(json: &Value) {
+        let buffers = json["buffers"].as_array().unwrap();
+        let bvs = json["bufferViews"].as_array().unwrap();
+        let mut n_ext = 0;
+        for bv in bvs {
+            let ext = &bv["extensions"]["EXT_meshopt_compression"];
+            if !ext.is_object() {
+                assert_eq!(bv["buffer"].as_u64().unwrap(), 0, "plain bufferView must live in the BIN buffer");
+                continue;
+            }
+            n_ext += 1;
+            let count = ext["count"].as_u64().unwrap();
+            let stride = ext["byteStride"].as_u64().unwrap();
+            let bv_off = bv["byteOffset"].as_u64().unwrap();
+            assert_eq!(
+                bv["byteLength"].as_u64().unwrap(),
+                count * stride,
+                "bufferView.byteLength must equal count*byteStride (decoded size)"
+            );
+            assert_eq!(bv_off % 4, 0, "decoded bufferView offset must be 4-byte aligned");
+            let fb = bv["buffer"].as_u64().unwrap() as usize;
+            assert_eq!(
+                buffers[fb]["extensions"]["EXT_meshopt_compression"]["fallback"], true,
+                "bufferView must reference a fallback buffer"
+            );
+            assert!(buffers[fb]["byteLength"].as_u64().unwrap() >= bv_off + count * stride);
+            assert_eq!(ext["buffer"].as_u64().unwrap(), 0, "compressed stream must live in the BIN buffer");
+            assert!(
+                ext["byteOffset"].as_u64().unwrap() + ext["byteLength"].as_u64().unwrap()
+                    <= buffers[0]["byteLength"].as_u64().unwrap()
+            );
+        }
+        assert!(n_ext > 0, "expected at least one compressed bufferView");
+    }
+
+    #[test]
+    fn test_meshopt_f32_bufferviews_follow_ext_spec() {
+        // 120-vert + 180-vert compressed meshes plus a 30-vert raw fallback.
+        let feats = vec![make_large_triangle_mesh(40), make_large_triangle_mesh(60), make_large_triangle_mesh(10)];
+        let glb = encode_glb_meshopt(&feats, 50);
+        assert_meshopt_bufferviews_conform(&parse_glb_json(&glb));
+    }
+
+    #[test]
+    fn test_meshopt_q_bufferviews_follow_ext_spec() {
+        let feats = vec![make_large_triangle_mesh(40), make_large_triangle_mesh(60), make_large_triangle_mesh(10)];
+        let glb = encode_glb_meshopt_quantized(&feats, 50, 14);
+        assert_meshopt_bufferviews_conform(&parse_glb_json(&glb));
     }
 
     #[test]
