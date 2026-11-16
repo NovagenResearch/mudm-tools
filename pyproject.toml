@@ -58,6 +58,9 @@ labelmask = [
     "scikit-image>=0.22",
     "tifffile>=2026.3.3",
 ]
+harness = [
+    "tifffile>=2026.3.3",
+]
 
 [project.scripts]
 mudm-serve = "mudm_tools.serve:main"
